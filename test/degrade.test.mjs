@@ -110,6 +110,7 @@ async function loadWith(dbPath) {
   const { query } = await loadWith(dbPath);
   const r = query(SID);
   assert.equal(r.history.length, 7, "history 应返回窗口外全部记录");
+  assert.ok(r.history[0].completedAt > r.history[r.history.length - 1].completedAt, "history[0] 应为最新(按时间倒序)");
   assert.equal(r.session.samples, 5, "均值/峰值统计窗口应为最近 5 条");
   assert.equal(r.latest.outputTokens, 106, "latest 应是最新一条");
 }

@@ -157,7 +157,7 @@ function query(sessionId) {
       }
     }
 
-    return { sessionId: sid, scoped, latest, session, turn, usage, cacheHit, history: items.slice().reverse() };
+    return { sessionId: sid, scoped, latest, session, turn, usage, cacheHit, history: items };
   } finally {
     db.close();
   }
