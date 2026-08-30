@@ -8,10 +8,10 @@ description: 查看 token 速率与用量报表(tok/s、TTFT、本轮、会话�
 node "$(ls -td ~/.zcode/cli/plugins/cache/*/zcode-tps-plus/*/scripts/token-rate.mjs 2>/dev/null | head -1)" --json
 ```
 
-若上一命令找不到文件(插件未通过市场安装、而是克隆了仓库),回退为搜索用户目录:
+若上一命令找不到文件(插件未通过市场安装、而是克隆了仓库),回退为搜索用户目录(-maxdepth 9 可同时覆盖插件缓存 ~/.zcode/cli/plugins/cache/<市场>/<插件>/<版本>/scripts 的完整深度):
 
 ```
-node "$(find "$HOME" -maxdepth 8 -type f -path "*zcode-tps-plus/scripts/token-rate.mjs" 2>/dev/null | head -1)" --json
+node "$(find "$HOME" -maxdepth 9 -type f -path "*zcode-tps-plus/scripts/token-rate.mjs" 2>/dev/null | head -1)" --json
 ```
 
 仍找不到则运行 `/tps-doctor` 自检。把 JSON 结果整理为中文报表,包含:
