@@ -6,7 +6,7 @@
     "en": "Token rate & usage monitor: appends real tok/s, TTFT, per-turn tokens, session totals and cache hit rate to each reply (from ZCode usage DB); /tps report and /tps-doctor included."
   },
   "author": {
-    "name": "KDB (fork of shy3130/zcode-tps-monitor, MIT)"
+    "name": "KDB-Wind (fork of shy3130/zcode-tps-monitor, MIT)"
   },
   "license": "MIT",
   "keywords": [

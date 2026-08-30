@@ -1,8 +1,8 @@
 {
-  "name": "kdb-local",
+  "name": "zcode-tps-marketplace",
   "description": "本地插件市场:自建/改造的 ZCode 插件。",
   "owner": {
-    "name": "KDB"
+    "name": "KDB-Wind"
   },
   "plugins": [
     {
@@ -11,7 +11,7 @@
       "description": "Token 速率与用量监控:每轮回复末尾显示真实 tok/s、TTFT、本轮 token、会话累计、缓存命中率;/tps 报表 + /tps-doctor 自检。",
       "version": "0.1.5",
       "author": {
-        "name": "KDB"
+        "name": "KDB-Wind"
       },
       "category": "monitoring",
       "keywords": [
