@@ -76,31 +76,34 @@ function query(sessionId) {
         completedAt: r.completed_at,
       };
     });
-    // 统计窗口:只取最近 N 条;history 返回全部 HIST 条
-    const rows = items.slice(0, N);
-    const rated = rows.filter((i) => i.tokPerSec != null);
     // 展示用 latest 优先取最近一条"有效"记录,避免在途/缺字段行顶掉头条
     const latest = (items.find((i) => i.tokPerSec != null)) ?? items[0] ?? null;
-    // 会话累计用独立 SUM(不受展示窗口限制);速率均值/峰值仍用近 N 窗口
+    // 会话累计 token 用独立 SUM(不受流式有效性限制)
     const sumRow = db
       .prepare(
         "SELECT COUNT(*) n, SUM(output_tokens) o, SUM(reasoning_tokens) r," +
         " SUM(input_tokens) i, SUM(cache_read_input_tokens) c FROM (" + scopeSql + ")"
       )
       .get(...args);
-    const session = rated.length
-      ? {
-          samples: rated.length,
-          requests: sumRow.n ?? 0,
-          avg: Math.round((rated.reduce((s, i) => s + i.tokPerSec, 0) / rated.length) * 10) / 10,
-          max: Math.max(...rated.map((i) => i.tokPerSec)),
-          min: Math.min(...rated.map((i) => i.tokPerSec)),
-          totalOutput: sumRow.o ?? 0,
-          totalReasoning: sumRow.r ?? 0,
-          totalInput: sumRow.i ?? 0,
-          totalCacheRead: sumRow.c ?? 0,
-        }
-      : null;
+    // 会话级加权速率:Σ(输出+思考) ÷ Σ(纯生成时长),只统计有效请求,覆盖全量行(不受 HIST 窗口限制)
+    const aggrRow = db
+      .prepare(
+        "SELECT COUNT(*) n, SUM(output_tokens + reasoning_tokens) tok," +
+        " SUM(completed_at - first_token_at) gen FROM (" + scopeSql + ")" +
+        " WHERE first_token_at IS NOT NULL AND completed_at > first_token_at" +
+        " AND (completed_at - first_token_at) BETWEEN " + MIN_GEN_MS + " AND " + MAX_GEN_MS +
+        " AND (output_tokens + reasoning_tokens) > 0"
+      )
+      .get(...args);
+    const session = {
+      requests: sumRow.n ?? 0,
+      samples: aggrRow?.n ?? 0,
+      avgTps: aggrRow?.n ? Math.round((aggrRow.tok / aggrRow.gen) * 10000) / 10 : null,
+      totalOutput: sumRow.o ?? 0,
+      totalReasoning: sumRow.r ?? 0,
+      totalInput: sumRow.i ?? 0,
+      totalCacheRead: sumRow.c ?? 0,
+    };
 
     // ---- turn_usage:上一轮与会话累计(输入含缓存读,computed_total = 输入 + 输出) ----
     // 独立降级边界:表缺失/列变更只影响这三项,tok/s 等核心指标不受影响
@@ -132,6 +135,17 @@ function query(sessionId) {
           completedAt: t.completed_at,
           cacheHit: t.i ? Math.round(((t.cr ?? 0) / t.i) * 1000) / 10 : null,
         };
+        // 轮次级加权速率:该轮全部有效请求的 Σ(输出+思考) ÷ Σ(纯生成时长)
+        const ta = db
+          .prepare(
+            "SELECT COUNT(*) n, SUM(output_tokens + reasoning_tokens) tok," +
+            " SUM(completed_at - first_token_at) gen FROM (" + base + " AND session_id = ? AND turn_id = ?)" +
+            " WHERE first_token_at IS NOT NULL AND completed_at > first_token_at" +
+            " AND (completed_at - first_token_at) BETWEEN " + MIN_GEN_MS + " AND " + MAX_GEN_MS +
+            " AND (output_tokens + reasoning_tokens) > 0"
+          )
+          .get(sid, t.turn_id);
+        if (ta?.n) turn.avgTps = Math.round((ta.tok / ta.gen) * 10000) / 10;
       }
       const u = db
         .prepare(
@@ -175,10 +189,12 @@ function formatLine(r) {
   const l = r.latest;
   if (!l) return "暂无已完成的模型请求";
   const t = new Date(l.completedAt).toLocaleTimeString("zh-CN", { hour12: false });
-  const parts = [
-    // 采样发生在发送消息的瞬间,头条描述的是上一条已完成回复
-    `⚡ ${l.tokPerSec ?? "-"} tok/s(上轮${r.session ? `·均 ${r.session.avg}` : ""})`,
-  ];
+  // 三级加权速率:请求级(最近一次) / 轮次级(上一轮全部有效请求) / 会话级(全部有效请求)
+  const rates = [];
+  if (l.tokPerSec != null) rates.push(`最近 ${l.tokPerSec}`);
+  if (r.turn?.avgTps != null) rates.push(`上轮均 ${r.turn.avgTps}`);
+  if (r.session?.avgTps != null) rates.push(`会话均 ${r.session.avgTps}`);
+  const parts = [`⚡ ${rates.length ? rates.join(" · ") : "-"} tok/s`];
   if (l.ttftMs != null) parts.push(`首字 ${(l.ttftMs / 1000).toFixed(1)}s`);
   if (r.turn) parts.push(`上轮 ${fmtK(r.turn.total)} tok(出 ${fmtK(r.turn.output)})`);
   if (r.usage) {

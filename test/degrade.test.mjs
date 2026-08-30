@@ -17,16 +17,16 @@ const SID = "sess_test";
 
 function createModelUsage(db) {
   db.exec(`CREATE TABLE model_usage (
-    session_id TEXT, status TEXT, query_source TEXT, model_id TEXT,
+    turn_id TEXT, session_id TEXT, status TEXT, query_source TEXT, model_id TEXT,
     output_tokens INTEGER, reasoning_tokens INTEGER, input_tokens INTEGER,
     cache_read_input_tokens INTEGER, first_token_at INTEGER,
     completed_at INTEGER, time_to_first_token_ms INTEGER)`);
 }
 
-function insertRequest(db, { t0, out = 100, ttft = 200, gen = 1000, input = 1000, cacheRead = 900 }) {
+function insertRequest(db, { t0, out = 100, ttft = 200, gen = 1000, input = 1000, cacheRead = 900, turnId = null }) {
   db.prepare(
-    `INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?)`
-  ).run(SID, "completed", "main_turn", "test-model", out, 0, input, cacheRead,
+    `INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(turnId, SID, "completed", "main_turn", "test-model", out, 0, input, cacheRead,
         gen == null ? null : t0, gen == null ? t0 + 5000 : t0 + gen, ttft);
 }
 
@@ -62,7 +62,7 @@ async function loadWith(dbPath) {
   const dbPath = path.join(tmp, "with-turn-usage.sqlite");
   const db = new DatabaseSync(dbPath);
   createModelUsage(db);
-  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, input: 800, cacheRead: 700 });
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, input: 800, cacheRead: 700, turnId: "turn_test" });
   db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
     input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
     cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
@@ -75,9 +75,11 @@ async function loadWith(dbPath) {
   const r = query(SID);
   assert.equal(r.turn.total, 900);
   assert.equal(r.turn.cacheHit, 87.5);
+  assert.equal(r.turn.avgTps, 100, "轮级速率应为 Σtok÷Σgen = 100/1s");
   assert.equal(r.usage.turns, 1);
   assert.equal(r.usage.total, 900);
   assert.equal(r.cacheHit, 87.5);
+  assert.equal(r.session.avgTps, 100, "会话级速率应为加权口径");
 }
 
 // ---- 用例 3:turn_usage 存在但列结构变更 → 仍只降级三项,不抛异常 ----
@@ -111,7 +113,7 @@ async function loadWith(dbPath) {
   const r = query(SID);
   assert.equal(r.history.length, 7, "history 应返回窗口外全部记录");
   assert.ok(r.history[0].completedAt > r.history[r.history.length - 1].completedAt, "history[0] 应为最新(按时间倒序)");
-  assert.equal(r.session.samples, 5, "均值/峰值统计窗口应为最近 5 条");
+  assert.ok(Math.abs(r.session.avgTps - 103) < 0.01, "会话级速率应为加权口径 (100+…+106)/7s = 103");
   assert.equal(r.latest.outputTokens, 106, "latest 应是最新一条");
 }
 
