@@ -55,8 +55,7 @@ function query(sessionId) {
       : base.replace(" AND query_source = 'main_turn'", "") + (sid ? " AND session_id = ?" : "");
     // 曲线历史(大窗口)与统计(小窗口)分别查询,刷新/重开不丢
     const histRows = db.prepare(scopeSql + " ORDER BY completed_at DESC LIMIT ?").all(...args, HIST);
-    const rows = histRows.slice(0, N);
-    const items = rows.map((r) => {
+    const items = histRows.map((r) => {
       const tok = r.output_tokens ?? 0;
       const reasoning = r.reasoning_tokens ?? 0;
       // 部分行(如非流式/中断请求)缺 first_token_at,须判无效
@@ -77,9 +76,11 @@ function query(sessionId) {
         completedAt: r.completed_at,
       };
     });
-    const rated = items.filter((i) => i.tokPerSec != null);
+    // 统计窗口:只取最近 N 条;history 返回全部 HIST 条
+    const rows = items.slice(0, N);
+    const rated = rows.filter((i) => i.tokPerSec != null);
     // 展示用 latest 优先取最近一条"有效"记录,避免在途/缺字段行顶掉头条
-    const latest = rated[0] ?? items[0] ?? null;
+    const latest = (items.find((i) => i.tokPerSec != null)) ?? items[0] ?? null;
     // 会话累计用独立 SUM(不受展示窗口限制);速率均值/峰值仍用近 N 窗口
     const sumRow = db
       .prepare(
@@ -102,11 +103,13 @@ function query(sessionId) {
       : null;
 
     // ---- turn_usage:上一轮与会话累计(输入含缓存读,computed_total = 输入 + 输出) ----
+    // 独立降级边界:表缺失/列变更只影响这三项,tok/s 等核心指标不受影响
     let turn = null;
     let usage = null;
     let cacheHit = null;
     if (sid) {
-      const t = db
+      try {
+        const t = db
         .prepare(
           "SELECT turn_id, input_tokens i, output_tokens o, reasoning_tokens r," +
           " cache_creation_input_tokens cc, cache_read_input_tokens cr, computed_total_tokens total," +
@@ -148,6 +151,9 @@ function query(sessionId) {
           total: u.total ?? 0,
         };
         cacheHit = usage.input ? Math.round((usage.cacheRead / usage.input) * 1000) / 10 : null;
+      }
+      } catch {
+        // turn_usage 表缺失或结构变更:仅放弃本轮/会话累计/缓存命中率三项,核心速率不受影响
       }
     }
 
