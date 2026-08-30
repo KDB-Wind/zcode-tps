@@ -29,7 +29,16 @@ ZCode 插件:每轮回复末尾自动显示**真实** token 速率与用量行,�
 
 ## 安装
 
-Settings → Plugin Management → Discover → **+** → 添加本目录(`zcode-plugins` 根,含 `marketplace.json`)→ 安装 `zcode-tps` → **重开会话**(钩子需新会话才注册)。
+方式一(推荐):在 ZCode 输入框依次执行
+
+```
+/plugin marketplace add KDB-Wind/zcode-tps
+/plugin install zcode-tps@zcode-tps-marketplace
+```
+
+方式二:克隆本仓库后,Settings → Plugin Management → Discover → **+** → 添加仓库根目录(含 `marketplace.json`)→ 安装 `zcode-tps`。
+
+安装后**重开会话**(钩子需新会话才注册)。
 
 ## 关闭/开启速率行
 
