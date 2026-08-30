@@ -1,0 +1,36 @@
+{
+  "description": "zcode-tps-plus: 会话初始化提示 + 每次发消息时注入 token 速率/用量行",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|clear",
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/session-start.mjs"
+            ],
+            "timeoutMs": 3000,
+            "statusMessage": "zcode-tps-plus: 初始化…"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/prompt-submit.mjs"
+            ],
+            "timeoutMs": 8000,
+            "statusMessage": "zcode-tps-plus: 采集 token 速率…"
+          }
+        ]
+      }
+    ]
+  }
+}
