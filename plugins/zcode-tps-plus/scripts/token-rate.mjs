@@ -21,8 +21,7 @@ import path from "node:path";
 const DB_PATH =
   process.env.ZCODE_USAGE_DB ||
   path.join(os.homedir(), ".zcode", "cli", "db", "db.sqlite");
-const N = Number(process.env.TOKEN_RATE_WINDOW) || 5;           // 统计窗口(均/峰)
-const HIST = Number(process.env.TOKEN_RATE_HIST) || 60;         // 曲线历史点数
+const HIST = Number(process.env.TOKEN_RATE_HIST) || 60;         // history 曲线点数(最近请求明细)
 const MIN_GEN_MS = Number(process.env.TOKEN_RATE_MIN_MS) || 200;      // 有效样本:最短生成耗时
 const MAX_GEN_MS = Number(process.env.TOKEN_RATE_MAX_MS) || 3_600_000; // 有效样本:最长生成耗时(1h)
 
@@ -86,15 +85,16 @@ function query(sessionId) {
       )
       .get(...args);
     // 会话级加权速率:Σ(输出+思考) ÷ Σ(纯生成时长),只统计有效请求,覆盖全量行(不受 HIST 窗口限制)
+    // 有效性边界与 JS 端保持同一半开区间 [MIN_GEN_MS, MAX_GEN_MS),参数化传入
     const aggrRow = db
       .prepare(
         "SELECT COUNT(*) n, SUM(output_tokens + reasoning_tokens) tok," +
         " SUM(completed_at - first_token_at) gen FROM (" + scopeSql + ")" +
         " WHERE first_token_at IS NOT NULL AND completed_at > first_token_at" +
-        " AND (completed_at - first_token_at) BETWEEN " + MIN_GEN_MS + " AND " + MAX_GEN_MS +
+        " AND (completed_at - first_token_at) >= ? AND (completed_at - first_token_at) < ?" +
         " AND (output_tokens + reasoning_tokens) > 0"
       )
-      .get(...args);
+      .get(...args, MIN_GEN_MS, MAX_GEN_MS);
     const session = {
       requests: sumRow.n ?? 0,
       samples: aggrRow?.n ?? 0,
@@ -136,15 +136,16 @@ function query(sessionId) {
           cacheHit: t.i ? Math.round(((t.cr ?? 0) / t.i) * 1000) / 10 : null,
         };
         // 轮次级加权速率:该轮全部有效请求的 Σ(输出+思考) ÷ Σ(纯生成时长)
+        // 复用 scopeSql 以继承"无 main_turn 数据时回退全部请求"的策略
         const ta = db
           .prepare(
             "SELECT COUNT(*) n, SUM(output_tokens + reasoning_tokens) tok," +
-            " SUM(completed_at - first_token_at) gen FROM (" + base + " AND session_id = ? AND turn_id = ?)" +
+            " SUM(completed_at - first_token_at) gen FROM (" + scopeSql + " AND turn_id = ?)" +
             " WHERE first_token_at IS NOT NULL AND completed_at > first_token_at" +
-            " AND (completed_at - first_token_at) BETWEEN " + MIN_GEN_MS + " AND " + MAX_GEN_MS +
+            " AND (completed_at - first_token_at) >= ? AND (completed_at - first_token_at) < ?" +
             " AND (output_tokens + reasoning_tokens) > 0"
           )
-          .get(sid, t.turn_id);
+          .get(...args, t.turn_id, MIN_GEN_MS, MAX_GEN_MS);
         if (ta?.n) turn.avgTps = Math.round((ta.tok / ta.gen) * 10000) / 10;
       }
       const u = db

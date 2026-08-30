@@ -23,10 +23,10 @@ function createModelUsage(db) {
     completed_at INTEGER, time_to_first_token_ms INTEGER)`);
 }
 
-function insertRequest(db, { t0, out = 100, ttft = 200, gen = 1000, input = 1000, cacheRead = 900, turnId = null }) {
+function insertRequest(db, { t0, out = 100, ttft = 200, gen = 1000, input = 1000, cacheRead = 900, turnId = null, qs = "main_turn" }) {
   db.prepare(
     `INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).run(turnId, SID, "completed", "main_turn", "test-model", out, 0, input, cacheRead,
+  ).run(turnId, SID, "completed", qs, "test-model", out, 0, input, cacheRead,
         gen == null ? null : t0, gen == null ? t0 + 5000 : t0 + gen, ttft);
 }
 
@@ -57,12 +57,13 @@ async function loadWith(dbPath) {
   assert.ok(formatLine(r).includes("⚡"), "降级时速率行仍可格式化");
 }
 
-// ---- 用例 2:turn_usage 存在 → 本轮/会话累计/缓存命中率正常计算 ----
+// ---- 用例 2:turn_usage 存在 → 本轮/会话累计/缓存命中率正常计算,且区分加权与算术平均 ----
 {
   const dbPath = path.join(tmp, "with-turn-usage.sqlite");
   const db = new DatabaseSync(dbPath);
   createModelUsage(db);
   insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, input: 800, cacheRead: 700, turnId: "turn_test" });
+  insertRequest(db, { t0: 3_000_000, out: 100, ttft: 100, gen: 9000, input: 800, cacheRead: 700, turnId: "turn_test" });
   db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
     input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
     cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
@@ -75,11 +76,14 @@ async function loadWith(dbPath) {
   const r = query(SID);
   assert.equal(r.turn.total, 900);
   assert.equal(r.turn.cacheHit, 87.5);
-  assert.equal(r.turn.avgTps, 100, "轮级速率应为 Σtok÷Σgen = 100/1s");
+  // 100tok/1s + 100tok/9s → 加权 = 200/10s = 20;算术平均会是 (11.1+11.1)/2? 不,两条速率不同,
+  // 算术平均 = (100+11.1)/2 ≈ 55.6 —— 用 20 断言可区分两种算法
+  assert.equal(r.turn.avgTps, 20, "轮级速率应为加权口径 200tok÷10s=20,而非算术平均≈55.6");
   assert.equal(r.usage.turns, 1);
   assert.equal(r.usage.total, 900);
   assert.equal(r.cacheHit, 87.5);
-  assert.equal(r.session.avgTps, 100, "会话级速率应为加权口径");
+  assert.equal(r.session.avgTps, 20, "会话级速率应为加权口径");
+  assert.ok(Math.abs(r.latest.tokPerSec - 11.1) < 0.1, "最近应为最新请求的瞬时速率 100/9s");
 }
 
 // ---- 用例 3:turn_usage 存在但列结构变更 → 仍只降级三项,不抛异常 ----
@@ -117,5 +121,41 @@ async function loadWith(dbPath) {
   assert.equal(r.latest.outputTokens, 106, "latest 应是最新一条");
 }
 
+// ---- 用例 5:纯生成时长恰为 MAX_GEN_MS → JS 与 SQL 用同一半开区间,一致排除 ----
+{
+  const dbPath = path.join(tmp, "max-boundary.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 3600, ttft: 100, gen: 3_600_000 }); // == MAX_GEN_MS
+  db.close();
+
+  const { query } = await loadWith(dbPath);
+  const r = query(SID);
+  assert.equal(r.latest.tokPerSec, null, "请求级:gen == MAX_GEN_MS 应判无效(JS 半开区间)");
+  assert.equal(r.session.avgTps, null, "会话聚合:边界行不得计入(SQL 半开区间,与请求级一致)");
+  assert.equal(r.session.samples, 0);
+}
+
+// ---- 用例 6:会话无 main_turn 请求 → 轮级聚合应继承回退策略 ----
+{
+  const dbPath = path.join(tmp, "fallback.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, turnId: "turn_x", qs: "session_title" });
+  db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
+    input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
+    cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
+    computed_total_tokens INTEGER, duration_ms INTEGER, model_request_count INTEGER)`);
+  db.prepare(`INSERT INTO turn_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run("turn_x", SID, "completed", 2_000_000, 100, 100, 0, 0, 0, 200, 1000, 1);
+  db.close();
+
+  const { query } = await loadWith(dbPath);
+  const r = query(SID);
+  assert.equal(r.latest.tokPerSec, 100, "回退后应统计非 main_turn 请求");
+  assert.equal(r.turn.avgTps, 100, "轮级聚合应继承回退策略(旧实现固定 main_turn 会得到 undefined)");
+  assert.equal(r.session.avgTps, 100, "会话聚合同样走回退");
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log("全部 4 个用例通过 ✅");
+console.log("全部 6 个用例通过 ✅(降级边界 / 加权口径 / 顺序 / 回退策略)");
