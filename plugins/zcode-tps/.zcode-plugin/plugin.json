@@ -1,5 +1,5 @@
 {
-  "name": "zcode-tps-plus",
+  "name": "zcode-tps",
   "version": "0.1.5",
   "description": "Token 速率与用量监控:每轮回复末尾显示真实 tok/s、TTFT、本轮 token、会话累计、缓存命中率(读取 ZCode usage 数据库),另有 /tps 报表与 /tps-doctor 自检。",
   "description_i18n": {

@@ -2,7 +2,7 @@
 // UserPromptSubmit hook: 每次用户发消息时
 // 1) 记录"用户最后所处的会话"到状态文件(切会话后第一条消息即跟随)
 // 2) 从 ZCode usage 数据库读取真实 token 速率/用量,注入为上下文。输出必须为严格 JSON。
-// 可选配置 ~/.zcode/tps-plus.config.json:{"tokenRateLine": false} 可关闭速率行注入。
+// 可选配置 ~/.zcode/zcode-tps.config.json:{"tokenRateLine": false} 可关闭速率行注入。
 
 import fs from "node:fs";
 import os from "node:os";
@@ -12,7 +12,7 @@ import { query, formatLine } from "../scripts/token-rate.mjs";
 const sid = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || "";
 if (sid) {
   try {
-    const file = path.join(os.homedir(), ".zcode", "tps-plus.last-session.json");
+    const file = path.join(os.homedir(), ".zcode", "zcode-tps.last-session.json");
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(
       file,
@@ -27,7 +27,7 @@ const QUOTE_HINT =
 function readConfig() {
   try {
     return JSON.parse(
-      fs.readFileSync(path.join(os.homedir(), ".zcode", "tps-plus.config.json"), "utf8")
+      fs.readFileSync(path.join(os.homedir(), ".zcode", "zcode-tps.config.json"), "utf8")
     );
   } catch {
     return {};

@@ -8,10 +8,10 @@ import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { pathToFileURL } from "node:url";
 
-const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-tps-plus-test-"));
+const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-tps-test-"));
 const SCRIPT = path.join(
   path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")),
-  "..", "plugins", "zcode-tps-plus", "scripts", "token-rate.mjs"
+  "..", "plugins", "zcode-tps", "scripts", "token-rate.mjs"
 );
 const SID = "sess_test";
 

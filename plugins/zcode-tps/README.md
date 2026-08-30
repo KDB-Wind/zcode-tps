@@ -1,4 +1,4 @@
-# zcode-tps-plus
+# zcode-tps
 
 ZCode 插件:每轮回复末尾自动显示**真实** token 速率与用量行,另有 `/tps` 报表与 `/tps-doctor` 自检。
 
@@ -29,11 +29,11 @@ ZCode 插件:每轮回复末尾自动显示**真实** token 速率与用量行,�
 
 ## 安装
 
-Settings → Plugin Management → Discover → **+** → 添加本目录(`zcode-plugins` 根,含 `marketplace.json`)→ 安装 `zcode-tps-plus` → **重开会话**(钩子需新会话才注册)。
+Settings → Plugin Management → Discover → **+** → 添加本目录(`zcode-plugins` 根,含 `marketplace.json`)→ 安装 `zcode-tps` → **重开会话**(钩子需新会话才注册)。
 
 ## 关闭/开启速率行
 
-`~/.zcode/tps-plus.config.json` → `{"tokenRateLine": false}`(改回 true 或删除文件即恢复;需重开会话)。
+`~/.zcode/zcode-tps.config.json` → `{"tokenRateLine": false}`(改回 true 或删除文件即恢复;需重开会话)。
 
 ## 命令
 

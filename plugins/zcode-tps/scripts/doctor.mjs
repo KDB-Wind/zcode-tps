@@ -15,8 +15,8 @@ process.on("warning", () => {});
 const HOME = os.homedir();
 const DB_PATH =
   process.env.ZCODE_USAGE_DB || path.join(HOME, ".zcode", "cli", "db", "db.sqlite");
-const STATE_FILE = path.join(HOME, ".zcode", "tps-plus.last-session.json");
-const CONFIG_FILE = path.join(HOME, ".zcode", "tps-plus.config.json");
+const STATE_FILE = path.join(HOME, ".zcode", "zcode-tps.last-session.json");
+const CONFIG_FILE = path.join(HOME, ".zcode", "zcode-tps.config.json");
 
 // 钩子查询依赖的列(model_usage 表)
 const REQUIRED_COLS = [
