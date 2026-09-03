@@ -1,6 +1,6 @@
 {
   "name": "zcode-tps",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "description": "Token 速率与用量监控:每轮回复末尾显示真实 tok/s、TTFT、本轮 token、会话累计、缓存命中率(读取 ZCode usage 数据库),另有 /tps 报表与 /tps-doctor 自检。",
   "description_i18n": {
     "en": "Token rate & usage monitor: appends real tok/s, TTFT, per-turn tokens, session totals and cache hit rate to each reply (from ZCode usage DB); /tps report and /tps-doctor included."

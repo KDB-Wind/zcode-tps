@@ -2,6 +2,7 @@
 // 运行:node test/degrade.test.mjs(需要 Node >= 22.5,零第三方依赖)
 
 import assert from "node:assert";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -213,5 +214,126 @@ async function loadWith(dbPath) {
   assert.equal(r.session.requests, 1);
 }
 
+// ---- 用例 9:auto 识别优先 main_turn,不被更新的子代理行劫持(S1) ----
+{
+  const dbPath = path.join(tmp, "auto-main.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, trace: "T1" });
+  insertRequest(db, { t0: 2_000_000, out: 200, ttft: 100, gen: 1000, trace: "T1",
+                      qs: "subagent", sess: "sess_sub_1" }); // 更新但非主会话
+  db.close();
+
+  process.env.ZCODE_TPS_LAST_SESSION = path.join(tmp, "no-such-file.json");
+  const { query } = await loadWith(dbPath);
+  const r = query(null);
+  assert.equal(r.sessionId, SID, "auto 应选中最新 main_turn 会话,而非更新的子代理会话");
+  assert.equal(r.scoped, "auto-main");
+  delete process.env.ZCODE_TPS_LAST_SESSION;
+}
+
+// ---- 用例 10:last-session 文件回退(S1):新会话(新鲜无数据)采用文件,陈旧文件回退 DB ----
+{
+  const dbPath = path.join(tmp, "auto-file.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000 });
+  db.close();
+
+  const { query } = await loadWith(dbPath);
+  const fresh = path.join(tmp, "fresh.json");
+  fs.writeFileSync(fresh, JSON.stringify({ sessionId: "sess_NEW", ts: Date.now(), source: "test" }));
+  let r = query(null, { lastSessionFile: fresh });
+  assert.equal(r.sessionId, "sess_NEW", "新鲜文件(新会话)应优先采用,即使库中无该会话数据");
+  assert.equal(r.scoped, "file");
+
+  const stale = path.join(tmp, "stale.json");
+  fs.writeFileSync(stale, JSON.stringify({ sessionId: "sess_GONE", ts: Date.now() - 30 * 86400 * 1000, source: "test" }));
+  r = query(null, { lastSessionFile: stale });
+  assert.equal(r.sessionId, SID, "陈旧无数据文件应回退到最新 main_turn 会话");
+  assert.equal(r.scoped, "auto-main");
+}
+
+// ---- 用例 11:子代理并入时口径对齐(S2):samples 含子有效请求,展示标注主对话口径 ----
+{
+  const dbPath = path.join(tmp, "scope.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, input: 800, cacheRead: 700, turnId: "turn_s", trace: "T1" });
+  insertRequest(db, { t0: 2_000_000, out: 200, ttft: 100, gen: 1000, input: 900, cacheRead: 800, trace: "T1",
+                      qs: "subagent", sess: "sess_sub_1" });
+  db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
+    input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
+    cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
+    computed_total_tokens INTEGER, duration_ms INTEGER, model_request_count INTEGER)`);
+  db.prepare(`INSERT INTO turn_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run("turn_s", SID, "completed", 3_000_000, 800, 100, 0, 0, 700, 900, 5000, 1);
+  db.close();
+
+  const { query, formatLine } = await loadWith(dbPath);
+  const r = query(SID);
+  assert.equal(r.session.includesSubagents, true);
+  assert.equal(r.session.samples, 2, "samples 应与 avgTps 口径一致(含子代理有效请求)");
+  assert.equal(r.usage.scope, "main_turn", "turn_usage 无子代理归因,恒为主对话口径");
+  const line = formatLine(r);
+  assert.ok(line.includes("tok(主)"), "并入子代理时会话 tok 须标注主对话口径");
+  assert.ok(line.includes("缓存") && line.includes("%(主)"), "并入子代理时缓存命中率须标注主对话口径");
+
+  const pure = query(SID, { includeSubagents: false });
+  assert.ok(!formatLine(pure).includes("(主)"), "纯主对话口径时展示应与旧版一致(无标注)");
+}
+
+// ---- 用例 12:openDb 设置 busy_timeout(S3),读不因短暂写锁直接失败 ----
+{
+  const dbPath = path.join(tmp, "busy.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  db.close();
+
+  process.env.ZCODE_USAGE_DB = dbPath;
+  const { openDb } = await import(pathToFileURL(SCRIPT).href + "?case=busy" + Math.random());
+  const odb = openDb();
+  try {
+    const row = odb.prepare("PRAGMA busy_timeout").get();
+    assert.equal(row.timeout, 2000, "只读连接应设置 2s 锁等待");
+  } finally {
+    odb.close();
+  }
+}
+
+// ---- 用例 13:withBusyRetry 遇 BUSY/LOCKED 重试一次,非忙错误直抛(S3) ----
+{
+  const { withBusyRetry } = await import(pathToFileURL(SCRIPT).href + "?case=retry" + Math.random());
+  let calls = 0;
+  const r = withBusyRetry(() => {
+    calls++;
+    if (calls === 1) { const e = new Error("database is locked"); e.code = "SQLITE_BUSY"; throw e; }
+    return "ok";
+  });
+  assert.equal(r, "ok");
+  assert.equal(calls, 2, "忙时应等待后重试一次");
+
+  let otherCalls = 0;
+  assert.throws(() => withBusyRetry(() => { otherCalls++; throw new Error("no such table: x"); }), /no such table/);
+  assert.equal(otherCalls, 1, "非忙错误不应重试");
+}
+
+// ---- 用例 14:CLI 库不可用时 --json 输出 error 对象而非堆栈(S3) ----
+{
+  let out = "";
+  try {
+    out = execFileSync(process.execPath, [SCRIPT, "--json"], {
+      env: { ...process.env, ZCODE_USAGE_DB: path.join(tmp, "no-such-dir", "db.sqlite") },
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+  } catch (e) {
+    out = (e.stdout || "").toString(); // 非零退出码时从异常对象取 stdout
+  }
+  const j = JSON.parse(out);
+  assert.ok(j.error, "--json 失败时 stdout 应为含 error 的 JSON");
+  assert.ok(j.db, "错误对象应带出数据库路径以便排查");
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log("全部 8 个用例通过 ✅(降级边界 / 加权口径 / 顺序 / 回退策略 / 子代理归因)");
+console.log("全部 14 个用例通过 ✅(降级边界 / 加权口径 / 顺序 / 回退策略 / 子代理归因 / auto 识别 / 口径对齐 / 锁等待与优雅错误)");

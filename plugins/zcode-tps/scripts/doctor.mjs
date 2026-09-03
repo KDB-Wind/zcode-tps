@@ -56,6 +56,7 @@ async function dbCheck() {
     // 动态加载,避免不支持 node:sqlite 的 Node 在 import 阶段就崩
     const { DatabaseSync } = await import("node:sqlite");
     db = new DatabaseSync(DB_PATH, { readOnly: true });
+    try { db.exec("PRAGMA busy_timeout = 2000"); } catch {}
   } catch (e) {
     return {
       name: "usage 数据库",
@@ -97,6 +98,7 @@ async function turnTableCheck() {
   try {
     const { DatabaseSync } = await import("node:sqlite");
     db = new DatabaseSync(DB_PATH, { readOnly: true });
+    try { db.exec("PRAGMA busy_timeout = 2000"); } catch {}
   } catch {
     return { name: "turn_usage 表", ok: true, detail: "跳过(数据库不可读,上一项已报错)", hint: null };
   }
