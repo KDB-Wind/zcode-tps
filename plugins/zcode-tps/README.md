@@ -58,5 +58,6 @@ Node ≥ 22.5(内置 `node:sqlite`)。跨平台。
 - 注入发生在你发送消息的瞬间,因此速率行显示的是**上一轮**数据(当前轮回复完成后的数字,下一条消息才能看到);
 - 三个速率均为加权平均(Σtoken ÷ Σ时长),"最近"除外(单请求瞬时值);
 - 缓存命中率 = 缓存读 ÷ 总输入;`cache_creation_input_tokens`(缓存写入)不计入命中;
-- 会话 `input_tokens` 为该会话所有 main_turn 请求的输入(含缓存读),不含子代理请求;
-- 回归测试:`node test/degrade.test.mjs`(覆盖 turn_usage 缺失/结构变更的降级路径与指标口径)。
+- 会话 `input_tokens` 为该会话所有 main_turn 请求的输入(含缓存读);
+- **子代理归因**:默认开启——与主会话共享 `trace_id` 的子代理(subagent)请求会并入会话级统计(实测约占输出 token 的两成);`~/.zcode/zcode-tps.config.json` → `{"includeSubagents": false}` 切回纯主对话口径(需重开会话);
+- 回归测试:`node test/degrade.test.mjs`(覆盖 turn_usage 缺失/结构变更的降级路径、子代理归因与指标口径)。

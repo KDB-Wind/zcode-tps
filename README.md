@@ -31,7 +31,7 @@ ZCode 插件:每轮回复末尾自动显示一行**真实** token 速率与用�
 
 ## 原理
 
-数据取自 ZCode CLI 自带的 SQLite 用量库(`~/.zcode/cli/db/db.sqlite`,只读),`UserPromptSubmit` 钩子在你发送消息的瞬间计算上一轮的真实数据并注入上下文,由模型以引用块附在回复末尾——**非模型自述、非估算**,且不产生任何额外模型调用。
+数据取自 ZCode CLI 自带的 SQLite 用量库(`~/.zcode/cli/db/db.sqlite`,只读),`UserPromptSubmit` 钩子在你发送消息的瞬间计算上一轮的真实数据并注入上下文,由模型以引用块附在回复末尾——**非模型自述、非估算**,且不产生任何额外模型调用。子代理(Agent 工具)的请求通过 `trace_id` 归因并入会话统计(可用配置关闭),详见 [plugins/zcode-tps/README.md](plugins/zcode-tps/README.md)。
 
 ## 致谢
 

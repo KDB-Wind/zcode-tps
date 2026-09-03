@@ -14,6 +14,7 @@ process.removeAllListeners("warning");
 process.on("warning", () => {});
 
 const { DatabaseSync } = await import("node:sqlite");
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -25,7 +26,10 @@ const HIST = Number(process.env.TOKEN_RATE_HIST) || 60;         // history 曲�
 const MIN_GEN_MS = Number(process.env.TOKEN_RATE_MIN_MS) || 200;      // 有效样本:最短生成耗时
 const MAX_GEN_MS = Number(process.env.TOKEN_RATE_MAX_MS) || 3_600_000; // 有效样本:最长生成耗时(1h)
 
-function query(sessionId) {
+function query(sessionId, opts = {}) {
+  // includeSubagents:把主会话派生的子代理(subagent)请求并入会话级统计,默认开启。
+  // 归因键为 trace_id(主回复与其全部子代理共享同一 trace;parent/turn 字段经验证不指向主会话)。
+  const includeSub = opts.includeSubagents !== false;
   const db = new DatabaseSync(DB_PATH, { readOnly: true });
   try {
     // 未显式指定会话时,取最近一次完成请求所属的会话 = 当前会话
@@ -95,15 +99,73 @@ function query(sessionId) {
         " AND (output_tokens + reasoning_tokens) > 0"
       )
       .get(...args, MIN_GEN_MS, MAX_GEN_MS);
+
+    // ---- 子代理归因:trace_id 与主会话 main_turn 请求相同的 subagent 请求 ----
+    // 独立降级边界:trace 列缺失等情况只影响子代理口径,主对话统计不受影响
+    let subAggr = null;
+    let subSum = null;
+    if (includeSub && sid) {
+      try {
+        // 注意:不能用 base 包裹子查询(base 的列清单不含 trace_id),直接过滤 model_usage
+        const traceListSql =
+          "SELECT DISTINCT trace_id FROM model_usage" +
+          " WHERE status = 'completed' AND query_source = 'main_turn'" +
+          " AND session_id = ? AND trace_id IS NOT NULL";
+        subAggr = db
+          .prepare(
+            "SELECT COUNT(*) n, SUM(output_tokens + reasoning_tokens) tok," +
+            " SUM(completed_at - first_token_at) gen FROM model_usage" +
+            " WHERE status = 'completed' AND query_source = 'subagent' AND trace_id IS NOT NULL" +
+            " AND trace_id IN (" + traceListSql + ")" +
+            " AND first_token_at IS NOT NULL AND completed_at > first_token_at" +
+            " AND (completed_at - first_token_at) >= ? AND (completed_at - first_token_at) < ?" +
+            " AND (output_tokens + reasoning_tokens) > 0"
+          )
+          .get(sid, MIN_GEN_MS, MAX_GEN_MS);
+        if (subAggr?.n) {
+          subSum = db
+            .prepare(
+              "SELECT COUNT(*) n, SUM(output_tokens) o, SUM(reasoning_tokens) r," +
+              " SUM(input_tokens) i, SUM(cache_read_input_tokens) c FROM model_usage" +
+              " WHERE status = 'completed' AND query_source = 'subagent' AND trace_id IS NOT NULL" +
+              " AND trace_id IN (" + traceListSql + ")"
+            )
+            .get(sid);
+        }
+      } catch {
+        subAggr = null;
+        subSum = null; // trace 归因不可用时静默降级
+      }
+    }
+    const useSub = !!(includeSub && subAggr?.n && subSum);
+
     const session = {
-      requests: sumRow.n ?? 0,
+      requests: (sumRow.n ?? 0) + (useSub ? subSum.n : 0),
       samples: aggrRow?.n ?? 0,
-      avgTps: aggrRow?.n ? Math.round((aggrRow.tok / aggrRow.gen) * 10000) / 10 : null,
-      totalOutput: sumRow.o ?? 0,
-      totalReasoning: sumRow.r ?? 0,
-      totalInput: sumRow.i ?? 0,
-      totalCacheRead: sumRow.c ?? 0,
+      avgTps: null,
+      includesSubagents: useSub,
+      subagent: useSub
+        ? {
+            requests: subSum.n ?? 0,
+            output: subSum.o ?? 0,
+            reasoning: subSum.r ?? 0,
+            input: subSum.i ?? 0,
+            cacheRead: subSum.c ?? 0,
+            avgTps: subAggr.gen ? Math.round((subAggr.tok / subAggr.gen) * 10000) / 10 : null,
+          }
+        : null,
+      totalOutput: (sumRow.o ?? 0) + (useSub ? subSum.o ?? 0 : 0),
+      totalReasoning: (sumRow.r ?? 0) + (useSub ? subSum.r ?? 0 : 0),
+      totalInput: (sumRow.i ?? 0) + (useSub ? subSum.i ?? 0 : 0),
+      totalCacheRead: (sumRow.c ?? 0) + (useSub ? subSum.c ?? 0 : 0),
     };
+    {
+      // 会话均:主对话 + (可选)子代理,统一加权口径
+      const tok = (aggrRow?.tok ?? 0) + (useSub ? subAggr.tok : 0);
+      const gen = (aggrRow?.gen ?? 0) + (useSub ? subAggr.gen : 0);
+      const n = (aggrRow?.n ?? 0) + (useSub ? subAggr.n : 0);
+      if (n) session.avgTps = Math.round((tok / gen) * 10000) / 10;
+    }
 
     // ---- turn_usage:上一轮与会话累计(输入含缓存读,computed_total = 输入 + 输出) ----
     // 独立降级边界:表缺失/列变更只影响这三项,tok/s 等核心指标不受影响
@@ -214,7 +276,14 @@ function formatLine(r) {
 if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
   const json = process.argv.includes("--json");
   const sid = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || null;
-  const r = query(sid);
+  const cfg = (() => {
+    try {
+      return JSON.parse(fs.readFileSync(path.join(os.homedir(), ".zcode", "zcode-tps.config.json"), "utf8"));
+    } catch {
+      return {};
+    }
+  })();
+  const r = query(sid, { includeSubagents: cfg.includeSubagents !== false });
   if (json) {
     console.log(JSON.stringify(r, null, 2));
   } else {
@@ -229,6 +298,9 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
     }
     if (r.usage) {
       console.log(`会话用量(已完成轮):${r.usage.turns} 轮 · 总计 ${fmtK(r.usage.total)} tok(输入 ${fmtK(r.usage.input)} / 输出 ${fmtK(r.usage.output)}${r.usage.reasoning ? ` / 思考 ${fmtK(r.usage.reasoning)}` : ""}) · 缓存命中率 ${r.cacheHit ?? "-"}%`);
+    }
+    if (r.session.subagent) {
+      console.log(`子代理归因:并入 ${r.session.subagent.requests} 次请求 / 输出 ${fmtK(r.session.subagent.output)} tok(子代理均 ${r.session.subagent.avgTps ?? "-"} tok/s) · 配置 includeSubagents:false 可切回纯主对话口径`);
     }
   }
 }

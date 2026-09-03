@@ -22,7 +22,7 @@ const CONFIG_FILE = path.join(HOME, ".zcode", "zcode-tps.config.json");
 const REQUIRED_COLS = [
   "session_id", "status", "query_source", "model_id",
   "output_tokens", "reasoning_tokens", "input_tokens", "cache_read_input_tokens",
-  "first_token_at", "completed_at", "time_to_first_token_ms",
+  "first_token_at", "completed_at", "time_to_first_token_ms", "trace_id",
 ];
 // 本轮/会话用量依赖的列(turn_usage 表)
 const TURN_COLS = [

@@ -41,10 +41,12 @@ function emit(ctx) {
 }
 
 try {
-  if (readConfig().tokenRateLine === false) {
+  const cfg = readConfig();
+  if (cfg.tokenRateLine === false) {
     emit("");
   } else {
-    emit(formatLine(query(sid || null)) + QUOTE_HINT);
+    // includeSubagents 默认开启(缺省视为 true):trace 归因把主会话派生的子代理请求并入会话统计
+    emit(formatLine(query(sid || null, { includeSubagents: cfg.includeSubagents !== false })) + QUOTE_HINT);
   }
 } catch {
   emit("");
