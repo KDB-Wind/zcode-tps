@@ -83,7 +83,7 @@ async function loadWith(dbPath) {
   assert.equal(r.usage.turns, 1);
   assert.equal(r.usage.total, 900);
   assert.equal(r.cacheHit, 87.5);
-  const line = formatLine(r);
+  const line = formatLine(r, "all");
   assert.ok(line.includes("ctx 800"), "首字后应附上下文规模");
   assert.ok(line.includes("读 800"), "上轮应使用'读'口径标注输入(避免误读为消耗)");
   assert.ok(line.includes("(出 100)"), "上轮应标注生成量");
@@ -362,7 +362,56 @@ async function loadWith(dbPath) {
   assert.ok(j.db, "错误对象应带出数据库路径以便排查");
 }
 
-// ---- 用例 16:turn_id 为 NULL 的轮次仍可聚合轮均(O6,IS 而非 =) ----
+// ---- 用例 17:字段名单解析(F1) ----
+{
+  const { resolveRateFields } = await import(pathToFileURL(SCRIPT).href + "?case=fields" + Math.random());
+  const eq = (a, b) => assert.deepEqual(a, b);
+  eq(resolveRateFields(undefined), ["rates", "session", "cache"]);
+  eq(resolveRateFields(null), ["rates", "session", "cache"]);
+  eq(resolveRateFields("all"), ["rates", "ttft", "turn", "session", "cache", "time"]);
+  eq(resolveRateFields("ALL"), ["rates", "ttft", "turn", "session", "cache", "time"]);
+  eq(resolveRateFields(["time", "rates"]), ["time", "rates"]);
+  eq(resolveRateFields(["all"]), ["rates", "ttft", "turn", "session", "cache", "time"]);
+  eq(resolveRateFields(["rates", "ALL"]), ["rates", "ttft", "turn", "session", "cache", "time"]);
+  eq(resolveRateFields(["rates", "nope", "rates"]), ["rates"]);
+  eq(resolveRateFields([]), ["rates", "session", "cache"]);
+  eq(resolveRateFields(42), ["rates", "session", "cache"]);
+}
+
+// ---- 用例 18:默认三段 + 自定义顺序/回落(F1) ----
+{
+  const dbPath = path.join(tmp, "fields.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, input: 800, cacheRead: 700, turnId: "turn_f" });
+  db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
+    input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
+    cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
+    computed_total_tokens INTEGER, duration_ms INTEGER, model_request_count INTEGER)`);
+  db.prepare(`INSERT INTO turn_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run("turn_f", SID, "completed", 2_000_000, 800, 100, 0, 0, 700, 900, 5000, 1);
+  db.close();
+
+  const { query, formatLine } = await loadWith(dbPath);
+  const r = query(SID);
+  const def = formatLine(r);
+  assert.ok(def.includes("⚡") && def.includes("会话 900 tok") && def.includes("缓存 87.5%"));
+  assert.ok(!def.includes("首字") && !def.includes("上轮 读") && !def.includes("⏱") && !def.includes("ctx"));
+
+  const custom = formatLine(r, ["time", "rates"]);
+  assert.ok(custom.startsWith("⏱"), "应尊重自定义顺序");
+  assert.ok(custom.includes("⚡") && !custom.includes("会话 "), "未选字段不应出现(注意速率组内的会话均不算)");
+
+  const all = formatLine(r, "all");
+  for (const s of ["⚡", "首字", "上轮 读", "会话 900 tok", "缓存 87.5%", "⏱"]) {
+    assert.ok(all.includes(s), `"all" 应含 ${s}`);
+  }
+  // 无数据的字段被跳过至空时回落默认名单,行恒非空
+  const empty = formatLine({ ...r, latest: { ...r.latest, ttftMs: null }, turn: null, usage: null, cacheHit: null }, ["ttft", "turn"]);
+  assert.ok(empty.includes("⚡"), "所选字段无数据时应回落默认渲染");
+}
+
+// ---- 用例 19:turn_id 为 NULL 的轮次仍可聚合轮均(O6,IS 而非 =) ----
 {
   const dbPath = path.join(tmp, "null-turn.sqlite");
   const db = new DatabaseSync(dbPath);
@@ -383,4 +432,4 @@ async function loadWith(dbPath) {
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log("全部 16 个用例通过 ✅(降级边界 / 加权口径 / 顺序 / 回退策略 / 子代理归因 / auto 识别 / 口径对齐 / 锁等待与优雅错误 / 布尔归一化 / NULL 轮次)");
+console.log("全部 18 个用例通过 ✅(降级边界 / 加权口径 / 顺序 / 回退策略 / 子代理归因 / auto 识别 / 口径对齐 / 锁等待与优雅错误 / 布尔归一化 / 字段名单 / NULL 轮次)");

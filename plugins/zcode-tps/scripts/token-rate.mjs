@@ -351,29 +351,65 @@ function fmtK(n) {
   return String(n);
 }
 
-function formatLine(r) {
+// F1:速率行字段名单。默认三段(rates/session/cache);配置 rateLineFields 自定义顺序与组合,
+// "all" 展开全部六段(标准顺序)。未知字段忽略,空名单/非法值回落默认,保证行恒非空。
+const RATE_SEGMENTS = ["rates", "ttft", "turn", "session", "cache", "time"];
+const DEFAULT_RATE_FIELDS = ["rates", "session", "cache"];
+
+function resolveRateFields(v) {
+  if (v === undefined || v === null) return DEFAULT_RATE_FIELDS.slice();
+  if (typeof v === "string") {
+    if (v.trim().toLowerCase() === "all") return RATE_SEGMENTS.slice();
+    return DEFAULT_RATE_FIELDS.slice();
+  }
+  if (Array.isArray(v)) {
+    const names = v.map((x) => String(x).trim().toLowerCase());
+    if (names.includes("all")) return RATE_SEGMENTS.slice();
+    const known = [...new Set(names.filter((x) => RATE_SEGMENTS.includes(x)))];
+    return known.length ? known : DEFAULT_RATE_FIELDS.slice();
+  }
+  return DEFAULT_RATE_FIELDS.slice();
+}
+
+function formatLine(r, fields) {
   const l = r.latest;
   if (!l) return "暂无已完成的模型请求";
   const t = new Date(l.completedAt).toLocaleTimeString("zh-CN", { hour12: false });
-  // 三级加权速率:请求级(最近一次) / 轮次级(上一轮全部有效请求) / 会话级(全部有效请求)
-  const rates = [];
-  if (l.tokPerSec != null) rates.push(`最近 ${l.tokPerSec}`);
-  if (r.turn?.avgTps != null) rates.push(`上轮均 ${r.turn.avgTps}`);
-  if (r.session?.avgTps != null) rates.push(`会话均 ${r.session.avgTps}`);
-  const parts = [`⚡ ${rates.length ? rates.join(" · ") : "-"} tok/s`];
-  if (l.ttftMs != null) {
-    // 附上最后请求的上下文规模:首字延迟与它强相关,帮助区分"模型慢"和"上下文大"
-    const ctx = l.inputTokens ? `·ctx ${fmtK(l.inputTokens)}` : "";
-    parts.push(`首字 ${(l.ttftMs / 1000).toFixed(1)}s${ctx}`);
+  const list = resolveRateFields(fields);
+  const parts = [];
+  for (const id of list) {
+    if (id === "rates") {
+      // 三级加权速率:请求级(最近一次) / 轮次级(上一轮全部有效请求) / 会话级(全部有效请求)
+      const rates = [];
+      if (l.tokPerSec != null) rates.push(`最近 ${l.tokPerSec}`);
+      if (r.turn?.avgTps != null) rates.push(`上轮均 ${r.turn.avgTps}`);
+      if (r.session?.avgTps != null) rates.push(`会话均 ${r.session.avgTps}`);
+      parts.push(`⚡ ${rates.length ? rates.join(" · ") : "-"} tok/s`);
+    } else if (id === "ttft") {
+      if (l.ttftMs != null) {
+        // 附上最后请求的上下文规模:首字延迟与它强相关,帮助区分"模型慢"和"上下文大"
+        const ctx = l.inputTokens ? `·ctx ${fmtK(l.inputTokens)}` : "";
+        parts.push(`首字 ${(l.ttftMs / 1000).toFixed(1)}s${ctx}`);
+      }
+    } else if (id === "turn") {
+      if (r.turn) parts.push(`上轮 读 ${fmtK(r.turn.input)}(出 ${fmtK(r.turn.output)})`);
+    } else if (id === "session") {
+      if (r.usage) {
+        // S2:会话均已并入子代理时,会话 tok 仍是主对话口径,须标注避免误导
+        const scopeSuffix = r.session?.includesSubagents ? "(主)" : "";
+        parts.push(`会话 ${fmtK(r.usage.total)} tok${scopeSuffix}`);
+      }
+    } else if (id === "cache") {
+      if (r.usage && r.cacheHit != null) {
+        const scopeSuffix = r.session?.includesSubagents ? "(主)" : "";
+        parts.push(`缓存 ${r.cacheHit}%${scopeSuffix}`);
+      }
+    } else if (id === "time") {
+      parts.push(`⏱ ${t}`);
+    }
   }
-  if (r.turn) parts.push(`上轮 读 ${fmtK(r.turn.input)}(出 ${fmtK(r.turn.output)})`);
-  if (r.usage) {
-    // S2:会话均已并入子代理时,会话 tok/缓存仍是主对话口径,须标注避免误导
-    const scopeSuffix = r.session?.includesSubagents ? "(主)" : "";
-    parts.push(`会话 ${fmtK(r.usage.total)} tok${scopeSuffix}`);
-    if (r.cacheHit != null) parts.push(`缓存 ${r.cacheHit}%${scopeSuffix}`);
-  }
-  parts.push(`⏱ ${t}`);
+  // 所选字段无数据时回落默认名单,保证注入行恒有内容可引用
+  if (!parts.length && list.join() !== DEFAULT_RATE_FIELDS.join()) return formatLine(r, DEFAULT_RATE_FIELDS);
   return parts.join(" · ");
 }
 
@@ -409,7 +445,7 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
     if (json) {
       console.log(JSON.stringify(q, null, 2));
     } else {
-      console.log(formatLine(q));
+      console.log(formatLine(q, resolveRateFields(cfg.rateLineFields)));
       const s = q.session;
       if (s) {
         console.log(`请求累计(含进行中轮):输出 ${s.totalOutput}${s.totalReasoning ? `(+${s.totalReasoning} 思考)` : ""} tok · 输入 ${fmtK(s.totalInput)} tok(其中缓存读 ${fmtK(s.totalCacheRead)}) · 请求 ${s.requests} 次`);
@@ -429,4 +465,4 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
   }
 }
 
-export { query, formatLine, openDb, withBusyRetry, parseBool };
+export { query, formatLine, openDb, withBusyRetry, parseBool, resolveRateFields, RATE_SEGMENTS, DEFAULT_RATE_FIELDS };
