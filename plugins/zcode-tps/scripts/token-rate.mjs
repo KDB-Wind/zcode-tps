@@ -23,8 +23,21 @@ const DB_PATH =
   process.env.ZCODE_USAGE_DB ||
   path.join(os.homedir(), ".zcode", "cli", "db", "db.sqlite");
 const HIST = Number(process.env.TOKEN_RATE_HIST) || 60;         // history 曲线点数(最近请求明细)
-const MIN_GEN_MS = Number(process.env.TOKEN_RATE_MIN_MS) || 200;      // 有效样本:最短生成耗时
-const MAX_GEN_MS = Number(process.env.TOKEN_RATE_MAX_MS) || 3_600_000; // 有效样本:最长生成耗时(1h)
+const configuredMinDurationMs = Number(process.env.TOKEN_RATE_MIN_MS);
+const configuredMaxDurationMs = Number(process.env.TOKEN_RATE_MAX_MS);
+// 环境变量名为兼容 0.3 保留,0.4 起含义改为单次模型请求端到端时长。
+const MIN_DURATION_MS = Number.isFinite(configuredMinDurationMs) && configuredMinDurationMs > 0
+  ? configuredMinDurationMs : 500;
+const MAX_DURATION_MS = Number.isFinite(configuredMaxDurationMs) && configuredMaxDurationMs > 0
+  ? configuredMaxDurationMs : 3_600_000;
+// 仅用于 /tps 的 0.3 旧值对比,不可复用新的总时长门槛。
+const LEGACY_MIN_GEN_MS = 200;
+const LEGACY_MAX_GEN_MS = 3_600_000;
+const DURATION_SQL = "COALESCE(duration_ms, completed_at - started_at)";
+
+function rateTps(tokens, durationMs) {
+  return Math.round((tokens / durationMs) * 10000) / 10;
+}
 
 function readLastSessionState(file) {
   try {
@@ -137,7 +150,8 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
     const args = [];
     const base =
       "SELECT model_id, output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens," +
-      " first_token_at, completed_at, time_to_first_token_ms, status" +
+      " first_token_at, completed_at, time_to_first_token_ms, status," +
+      ` ${DURATION_SQL} dur_ms` +
       " FROM model_usage WHERE status = 'completed' AND query_source = 'main_turn'";
     if (sid) {
       args.push(sid);
@@ -154,12 +168,14 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
     const items = histRows.map((r) => {
       const tok = r.output_tokens ?? 0;
       const reasoning = r.reasoning_tokens ?? 0;
-      // 部分行(如非流式/中断请求)缺 first_token_at,须判无效
+      // first-token 只用于 0.3 旧值与 TTFT;0.4 headline 可统计无流式 token 事件的完成请求。
       const hasTime = Number.isFinite(r.first_token_at) && Number.isFinite(r.completed_at) && r.completed_at > r.first_token_at;
       const genMs = hasTime ? r.completed_at - r.first_token_at : null; // 纯生成耗时(不含首 token 等待)
-      // 速率分子含思考 token:思考内容同样是流式输出,ZCode 未单独记录时该列为 0,行为不变
-      const rateTokens = tok + reasoning;
-      const valid = genMs != null && genMs >= MIN_GEN_MS && genMs < MAX_GEN_MS && rateTokens > 0;
+      const durMs = Number.isFinite(r.dur_ms) ? r.dur_ms : null;
+      // ZCode/Responses 的 reasoning_tokens 是 output_tokens breakdown,不能再相加。
+      const valid = durMs != null && durMs >= MIN_DURATION_MS && durMs < MAX_DURATION_MS && tok > 0;
+      const legacyTokens = tok + reasoning;
+      const legacyValid = genMs != null && genMs >= LEGACY_MIN_GEN_MS && genMs < LEGACY_MAX_GEN_MS && legacyTokens > 0;
       return {
         model: r.model_id,
         outputTokens: tok,
@@ -168,11 +184,14 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
         cacheRead: r.cache_read_input_tokens ?? 0,
         ttftMs: Number.isFinite(r.time_to_first_token_ms) ? r.time_to_first_token_ms : null,
         genMs,
-        tokPerSec: valid ? Math.round((rateTokens / genMs) * 10000) / 10 : null,
+        durMs,
+        tokPerSec: valid ? rateTps(tok, durMs) : null,
+        // 严格复现 0.3 错误公式,只用于迁移对比;不代表可解释的物理 burst。
+        legacyTps: legacyValid ? rateTps(legacyTokens, genMs) : null,
         completedAt: r.completed_at,
       };
     });
-    // 展示用 latest 优先取最近一条"有效"记录,避免在途/缺字段行顶掉头条
+    // 展示用 latest 优先取最近一条新口径有效记录;无 first-token 但总时长有效的完成请求可入选。
     const latest = (items.find((i) => i.tokPerSec != null)) ?? items[0] ?? null;
     // 会话累计 token 用独立 SUM(不受流式有效性限制)
     const sumRow = db
@@ -181,17 +200,14 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
         " SUM(input_tokens) i, SUM(cache_read_input_tokens) c FROM (" + scopeSql + ")"
       )
       .get(...args);
-    // 会话级加权速率:Σ(输出+思考) ÷ Σ(纯生成时长),只统计有效请求,覆盖全量行(不受 HIST 窗口限制)
-    // 有效性边界与 JS 端保持同一半开区间 [MIN_GEN_MS, MAX_GEN_MS),参数化传入
+    // 会话级请求服务时长加权速率:Σprovider 总输出 ÷ Σ模型请求端到端时长。
+    // output 已含 reasoning breakdown;有效性与 JS 端使用同一半开区间。
     const aggrRow = db
       .prepare(
-        "SELECT COUNT(*) n, SUM(output_tokens + reasoning_tokens) tok," +
-        " SUM(completed_at - first_token_at) gen FROM (" + scopeSql + ")" +
-        " WHERE first_token_at IS NOT NULL AND completed_at > first_token_at" +
-        " AND (completed_at - first_token_at) >= ? AND (completed_at - first_token_at) < ?" +
-        " AND (output_tokens + reasoning_tokens) > 0"
+        "SELECT COUNT(*) n, SUM(output_tokens) tok, SUM(dur_ms) dur FROM (" + scopeSql + ")" +
+        " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0"
       )
-      .get(...args, MIN_GEN_MS, MAX_GEN_MS);
+      .get(...args, MIN_DURATION_MS, MAX_DURATION_MS);
 
     // ---- 子代理归因:trace_id 与主会话 main_turn 请求相同的 subagent 请求 ----
     // 独立降级边界:trace 列缺失等情况只影响子代理口径,主对话统计不受影响
@@ -204,39 +220,36 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
           "SELECT DISTINCT trace_id FROM model_usage" +
           " WHERE status = 'completed' AND query_source = 'main_turn'" +
           " AND session_id = ? AND trace_id IS NOT NULL";
+        const subScopeSql =
+          "SELECT output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens," +
+          ` ${DURATION_SQL} dur_ms FROM model_usage` +
+          " WHERE status = 'completed' AND query_source = 'subagent' AND trace_id IS NOT NULL" +
+          " AND trace_id IN (" + traceListSql + ")";
         subAggr = db
           .prepare(
-            "SELECT COUNT(*) n, SUM(output_tokens + reasoning_tokens) tok," +
-            " SUM(completed_at - first_token_at) gen FROM model_usage" +
-            " WHERE status = 'completed' AND query_source = 'subagent' AND trace_id IS NOT NULL" +
-            " AND trace_id IN (" + traceListSql + ")" +
-            " AND first_token_at IS NOT NULL AND completed_at > first_token_at" +
-            " AND (completed_at - first_token_at) >= ? AND (completed_at - first_token_at) < ?" +
-            " AND (output_tokens + reasoning_tokens) > 0"
+            "SELECT COUNT(*) n, SUM(output_tokens) tok, SUM(dur_ms) dur FROM (" + subScopeSql + ")" +
+            " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0"
           )
-          .get(sid, MIN_GEN_MS, MAX_GEN_MS);
-        if (subAggr?.n) {
-          subSum = db
-            .prepare(
-              "SELECT COUNT(*) n, SUM(output_tokens) o, SUM(reasoning_tokens) r," +
-              " SUM(input_tokens) i, SUM(cache_read_input_tokens) c FROM model_usage" +
-              " WHERE status = 'completed' AND query_source = 'subagent' AND trace_id IS NOT NULL" +
-              " AND trace_id IN (" + traceListSql + ")"
-            )
-            .get(sid);
-        }
+          .get(sid, MIN_DURATION_MS, MAX_DURATION_MS);
+        // 累计与有效速率样本解耦:即使全部子请求 output=0/时长无效,请求与 token 仍归因。
+        subSum = db
+          .prepare(
+            "SELECT COUNT(*) n, SUM(output_tokens) o, SUM(reasoning_tokens) r," +
+            " SUM(input_tokens) i, SUM(cache_read_input_tokens) c FROM (" + subScopeSql + ")"
+          )
+          .get(sid);
       } catch (e) {
         if (isBusyError(e)) throw e; // 忙时交由外层 withBusyRetry 重试,不在此静默吞掉
         subAggr = null;
         subSum = null; // trace 归因不可用时静默降级
       }
     }
-    const useSub = !!(includeSub && subAggr?.n && subSum);
+    const useSub = !!(includeSub && subSum?.n);
 
     const session = {
       requests: (sumRow.n ?? 0) + (useSub ? subSum.n : 0),
       // S2:有效样本数须与 avgTps 口径一致(含并入的子代理有效请求)
-      samples: (aggrRow?.n ?? 0) + (useSub ? subAggr.n ?? 0 : 0),
+      samples: (aggrRow?.n ?? 0) + (useSub ? subAggr?.n ?? 0 : 0),
       avgTps: null,
       includesSubagents: useSub,
       subagent: useSub
@@ -246,7 +259,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
             reasoning: subSum.r ?? 0,
             input: subSum.i ?? 0,
             cacheRead: subSum.c ?? 0,
-            avgTps: subAggr.gen ? Math.round((subAggr.tok / subAggr.gen) * 10000) / 10 : null,
+            avgTps: subAggr?.n && subAggr.dur ? rateTps(subAggr.tok, subAggr.dur) : null,
           }
         : null,
       totalOutput: (sumRow.o ?? 0) + (useSub ? subSum.o ?? 0 : 0),
@@ -256,10 +269,10 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
     };
     {
       // 会话均:主对话 + (可选)子代理,统一加权口径
-      const tok = (aggrRow?.tok ?? 0) + (useSub ? subAggr.tok : 0);
-      const gen = (aggrRow?.gen ?? 0) + (useSub ? subAggr.gen : 0);
-      const n = (aggrRow?.n ?? 0) + (useSub ? subAggr.n : 0);
-      if (n) session.avgTps = Math.round((tok / gen) * 10000) / 10;
+      const tok = (aggrRow?.tok ?? 0) + (useSub ? subAggr?.tok ?? 0 : 0);
+      const dur = (aggrRow?.dur ?? 0) + (useSub ? subAggr?.dur ?? 0 : 0);
+      const n = (aggrRow?.n ?? 0) + (useSub ? subAggr?.n ?? 0 : 0);
+      if (n && dur) session.avgTps = rateTps(tok, dur);
     }
 
     // ---- turn_usage:上一轮与会话累计(输入含缓存读,computed_total = 输入 + 输出) ----
@@ -292,21 +305,19 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
           completedAt: t.completed_at,
           cacheHit: t.i ? Math.round(((t.cr ?? 0) / t.i) * 1000) / 10 : null,
         };
-        // 轮次级加权速率:该轮全部有效请求的 Σ(输出+思考) ÷ Σ(纯生成时长)
+        // 轮次级请求服务时长加权速率:该轮有效请求的 Σoutput ÷ Σduration。
         // 复用 scopeSql 以继承"无 main_turn 数据时回退全部请求"的策略
         // O6:turn_id 可能为 NULL,用 IS 而非 =(= NULL 永不命中,IS NULL 可正确聚合该轮未打标请求)
         // O2:旧库缺 turn_id 列时仅放弃轮均(内层降级),本轮/会话累计不受影响
         try {
           const ta = db
             .prepare(
-              "SELECT COUNT(*) n, SUM(output_tokens + reasoning_tokens) tok," +
-              " SUM(completed_at - first_token_at) gen FROM (" + scopeSql + " AND turn_id IS ?)" +
-              " WHERE first_token_at IS NOT NULL AND completed_at > first_token_at" +
-              " AND (completed_at - first_token_at) >= ? AND (completed_at - first_token_at) < ?" +
-              " AND (output_tokens + reasoning_tokens) > 0"
+              "SELECT COUNT(*) n, SUM(output_tokens) tok, SUM(dur_ms) dur" +
+              " FROM (" + scopeSql + " AND turn_id IS ?)" +
+              " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0"
             )
-            .get(...args, t.turn_id, MIN_GEN_MS, MAX_GEN_MS);
-          if (ta?.n) turn.avgTps = Math.round((ta.tok / ta.gen) * 10000) / 10;
+            .get(...args, t.turn_id, MIN_DURATION_MS, MAX_DURATION_MS);
+          if (ta?.n && ta.dur) turn.avgTps = rateTps(ta.tok, ta.dur);
         } catch (e) {
           if (isBusyError(e)) throw e; // 同上:忙时重试,列缺失等才降级
         }
@@ -379,7 +390,7 @@ function formatLine(r, fields) {
   const parts = [];
   for (const id of list) {
     if (id === "rates") {
-      // 三级加权速率:请求级(最近一次) / 轮次级(上一轮全部有效请求) / 会话级(全部有效请求)
+      // 请求端到端速率:请求级(最近一次) / 轮次级与会话级(全部有效请求的服务时长加权值)
       const rates = [];
       if (l.tokPerSec != null) rates.push(`最近 ${l.tokPerSec}`);
       if (r.turn?.avgTps != null) rates.push(`上轮均 ${r.turn.avgTps}`);
@@ -448,7 +459,7 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
       console.log(formatLine(q, resolveRateFields(cfg.rateLineFields)));
       const s = q.session;
       if (s) {
-        console.log(`请求累计(含进行中轮):输出 ${s.totalOutput}${s.totalReasoning ? `(+${s.totalReasoning} 思考)` : ""} tok · 输入 ${fmtK(s.totalInput)} tok(其中缓存读 ${fmtK(s.totalCacheRead)}) · 请求 ${s.requests} 次`);
+        console.log(`请求累计(含进行中轮):输出 ${s.totalOutput}${s.totalReasoning ? `(其中 ${s.totalReasoning} 思考)` : ""} tok · 输入 ${fmtK(s.totalInput)} tok(其中缓存读 ${fmtK(s.totalCacheRead)}) · 请求 ${s.requests} 次`);
       }
       if (q.turn) {
         const t = q.turn;

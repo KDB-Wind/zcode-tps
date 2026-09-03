@@ -14,21 +14,42 @@ const SCRIPT = path.join(
   path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")),
   "..", "plugins", "zcode-tps", "scripts", "token-rate.mjs"
 );
+const HOOK = path.join(path.dirname(SCRIPT), "..", "hooks", "prompt-submit.mjs");
 const SID = "sess_test";
 
 function createModelUsage(db) {
   db.exec(`CREATE TABLE model_usage (
     turn_id TEXT, session_id TEXT, status TEXT, query_source TEXT, model_id TEXT,
     output_tokens INTEGER, reasoning_tokens INTEGER, input_tokens INTEGER,
-    cache_read_input_tokens INTEGER, trace_id TEXT, first_token_at INTEGER,
-    completed_at INTEGER, time_to_first_token_ms INTEGER)`);
+    cache_read_input_tokens INTEGER, trace_id TEXT, started_at INTEGER,
+    first_token_at INTEGER, completed_at INTEGER, duration_ms INTEGER,
+    time_to_first_token_ms INTEGER)`);
 }
 
-function insertRequest(db, { t0, out = 100, ttft = 200, gen = 1000, input = 1000, cacheRead = 900, turnId = null, qs = "main_turn", sess = SID, status = "completed", trace = null }) {
+function insertRequest(db, {
+  t0, out = 100, reasoning = 0, ttft = 200, gen = 1000, durMs,
+  startedAt, firstAt, completedAt, input = 1000, cacheRead = 900,
+  turnId = null, qs = "main_turn", sess = SID, status = "completed", trace = null,
+}) {
+  const start = startedAt !== undefined ? startedAt : t0;
+  const first = firstAt !== undefined
+    ? firstAt
+    : Number.isFinite(start) && Number.isFinite(ttft) ? start + ttft : null;
+  const wallDur = Number.isFinite(ttft) && Number.isFinite(gen)
+    ? ttft + gen
+    : Number.isFinite(durMs) ? durMs : null;
+  const completed = completedAt !== undefined
+    ? completedAt
+    : Number.isFinite(start) && Number.isFinite(wallDur) ? start + wallDur : null;
+  const storedDur = durMs !== undefined ? durMs : wallDur;
   db.prepare(
-    `INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).run(turnId, sess, status, qs, "test-model", out, 0, input, cacheRead, trace,
-        gen == null ? null : t0, gen == null ? t0 + 5000 : t0 + gen, ttft);
+    `INSERT INTO model_usage (
+       turn_id,session_id,status,query_source,model_id,
+       output_tokens,reasoning_tokens,input_tokens,cache_read_input_tokens,trace_id,
+       started_at,first_token_at,completed_at,duration_ms,time_to_first_token_ms
+     ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).run(turnId, sess, status, qs, "test-model", out, reasoning, input, cacheRead, trace,
+        start, first, completed, storedDur, Number.isFinite(ttft) ? ttft : null);
 }
 
 async function loadWith(dbPath) {
@@ -43,9 +64,10 @@ async function loadWith(dbPath) {
   const db = new DatabaseSync(dbPath);
   createModelUsage(db);
   const t0 = 1_000_000;
-  insertRequest(db, { t0: t0 + 200, out: 120, ttft: 200, gen: 1000 });   // 较新,有效 → 120 tok/s
-  insertRequest(db, { t0: t0 + 100, out: 50,  ttft: null, gen: null });  // 缺流式时间但 completed_at 最新 → 无效,应被跳过
-  insertRequest(db, { t0: t0,       out: 60,  ttft: 100, gen: 2000 });   // 最早,有效 → 30 tok/s
+  insertRequest(db, { t0: t0 + 200, out: 120, ttft: 200, gen: 1000 });
+  insertRequest(db, { t0: t0 + 100, out: 50, ttft: null, gen: null,
+                      startedAt: null, firstAt: null, completedAt: t0 + 5000, durMs: null }); // 最新但无总时长
+  insertRequest(db, { t0, out: 60, ttft: 100, gen: 2000 });
   db.close();
 
   const { query, formatLine } = await loadWith(dbPath);
@@ -53,7 +75,7 @@ async function loadWith(dbPath) {
   assert.equal(r.turn, null, "无 turn_usage 表时 turn 应为 null");
   assert.equal(r.usage, null, "无 turn_usage 表时 usage 应为 null");
   assert.equal(r.cacheHit, null, "无 turn_usage 表时 cacheHit 应为 null");
-  assert.equal(r.latest.tokPerSec, 30, "latest 应取最新一条有效记录(跳过缺失时间戳的行)");
+  assert.equal(r.latest.tokPerSec, 28.6, "latest 应取最新一条有效记录(60tok/2.1s)");
   assert.equal(r.history.length, 3, "history 应包含全部请求");
   assert.ok(formatLine(r).includes("⚡"), "降级时速率行仍可格式化");
 }
@@ -63,8 +85,8 @@ async function loadWith(dbPath) {
   const dbPath = path.join(tmp, "with-turn-usage.sqlite");
   const db = new DatabaseSync(dbPath);
   createModelUsage(db);
-  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, input: 800, cacheRead: 700, turnId: "turn_test" });
-  insertRequest(db, { t0: 3_000_000, out: 100, ttft: 100, gen: 9000, input: 800, cacheRead: 700, turnId: "turn_test" });
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000, input: 800, cacheRead: 700, turnId: "turn_test" });
+  insertRequest(db, { t0: 3_000_000, out: 100, ttft: 100, gen: 8900, durMs: 9000, input: 800, cacheRead: 700, turnId: "turn_test" });
   db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
     input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
     cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
@@ -114,7 +136,7 @@ async function loadWith(dbPath) {
   const db = new DatabaseSync(dbPath);
   createModelUsage(db);
   for (let i = 0; i < 7; i++) {
-    insertRequest(db, { t0: 1_000_000 + i * 10_000, out: 100 + i, ttft: 100, gen: 1000 });
+    insertRequest(db, { t0: 1_000_000 + i * 10_000, out: 100 + i, ttft: 100, gen: 900, durMs: 1000 });
   }
   db.close();
 
@@ -126,17 +148,17 @@ async function loadWith(dbPath) {
   assert.equal(r.latest.outputTokens, 106, "latest 应是最新一条");
 }
 
-// ---- 用例 5:纯生成时长恰为 MAX_GEN_MS → JS 与 SQL 用同一半开区间,一致排除 ----
+// ---- 用例 5:模型请求总时长恰为上限 → JS 与 SQL 用同一半开区间,一致排除 ----
 {
   const dbPath = path.join(tmp, "max-boundary.sqlite");
   const db = new DatabaseSync(dbPath);
   createModelUsage(db);
-  insertRequest(db, { t0: 1_000_000, out: 3600, ttft: 100, gen: 3_600_000 }); // == MAX_GEN_MS
+  insertRequest(db, { t0: 1_000_000, out: 3600, ttft: 100, gen: 3_599_900, durMs: 3_600_000 });
   db.close();
 
   const { query } = await loadWith(dbPath);
   const r = query(SID);
-  assert.equal(r.latest.tokPerSec, null, "请求级:gen == MAX_GEN_MS 应判无效(JS 半开区间)");
+  assert.equal(r.latest.tokPerSec, null, "请求级:dur == MAX_DURATION_MS 应判无效(JS 半开区间)");
   assert.equal(r.session.avgTps, null, "会话聚合:边界行不得计入(SQL 半开区间,与请求级一致)");
   assert.equal(r.session.samples, 0);
 }
@@ -146,7 +168,7 @@ async function loadWith(dbPath) {
   const dbPath = path.join(tmp, "fallback.sqlite");
   const db = new DatabaseSync(dbPath);
   createModelUsage(db);
-  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, turnId: "turn_x", qs: "session_title" });
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000, turnId: "turn_x", qs: "session_title" });
   db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
     input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
     cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
@@ -167,12 +189,12 @@ async function loadWith(dbPath) {
   const dbPath = path.join(tmp, "subagent.sqlite");
   const db = new DatabaseSync(dbPath);
   createModelUsage(db);
-  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, input: 800, cacheRead: 700, trace: "T1" });
-  insertRequest(db, { t0: 2_000_000, out: 200, ttft: 100, gen: 1000, input: 900, cacheRead: 800, trace: "T1",
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000, input: 800, cacheRead: 700, trace: "T1" });
+  insertRequest(db, { t0: 2_000_000, out: 200, ttft: 100, gen: 900, durMs: 1000, input: 900, cacheRead: 800, trace: "T1",
                       qs: "subagent", sess: "sess_sub_1" });
-  insertRequest(db, { t0: 3_000_000, out: 500, ttft: 100, gen: 1000, input: 900, cacheRead: 800, trace: "T9",
+  insertRequest(db, { t0: 3_000_000, out: 500, ttft: 100, gen: 900, durMs: 1000, input: 900, cacheRead: 800, trace: "T9",
                       qs: "subagent", sess: "sess_sub_2" });   // 异 trace → 不归因
-  insertRequest(db, { t0: 4_000_000, out: 999, ttft: 100, gen: 1000, input: 900, cacheRead: 800, trace: "T1",
+  insertRequest(db, { t0: 4_000_000, out: 999, ttft: 100, gen: 900, durMs: 1000, input: 900, cacheRead: 800, trace: "T1",
                       qs: "subagent", sess: "sess_sub_1", status: "error" }); // error → 排除
   db.close();
 
@@ -198,13 +220,14 @@ async function loadWith(dbPath) {
   db.exec(`CREATE TABLE model_usage (
     turn_id TEXT, session_id TEXT, status TEXT, query_source TEXT, model_id TEXT,
     output_tokens INTEGER, reasoning_tokens INTEGER, input_tokens INTEGER,
-    cache_read_input_tokens INTEGER, first_token_at INTEGER,
-    completed_at INTEGER, time_to_first_token_ms INTEGER)`);   // 无 trace_id
+    cache_read_input_tokens INTEGER, started_at INTEGER, first_token_at INTEGER,
+    completed_at INTEGER, duration_ms INTEGER, time_to_first_token_ms INTEGER)`);   // 无 trace_id
   db.prepare(`INSERT INTO model_usage (turn_id,session_id,status,query_source,model_id,
               output_tokens,reasoning_tokens,input_tokens,cache_read_input_tokens,
-              first_token_at,completed_at,time_to_first_token_ms)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(null, SID, "completed", "main_turn", "test-model", 100, 0, 800, 700, 1_000_000, 1_001_000, 100);
+              started_at,first_token_at,completed_at,duration_ms,time_to_first_token_ms)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(null, SID, "completed", "main_turn", "test-model", 100, 0, 800, 700,
+         1_000_000, 1_000_100, 1_001_000, 1000, 100);
   db.close();
 
   const { query } = await loadWith(dbPath);
@@ -416,7 +439,7 @@ async function loadWith(dbPath) {
   const dbPath = path.join(tmp, "null-turn.sqlite");
   const db = new DatabaseSync(dbPath);
   createModelUsage(db);
-  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, turnId: null });
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000, turnId: null });
   db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
     input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
     cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
@@ -431,5 +454,216 @@ async function loadWith(dbPath) {
   assert.equal(r.turn.avgTps, 100, "NULL turn_id 应用 IS 匹配同轮未打标请求(= NULL 永不命中)");
 }
 
+// ---- 用例 20:Responses output 已含 reasoning;headline 不得重复加,history 保留 0.3 旧值 ----
+{
+  const dbPath = path.join(tmp, "responses-semantics.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, {
+    t0: 1_000_000, out: 1807, reasoning: 1711, ttft: 12_283, gen: 477, durMs: 12_760,
+  });
+  db.close();
+
+  const { query, formatLine } = await loadWith(dbPath);
+  const r = query(SID);
+  assert.equal(r.latest.tokPerSec, 141.6, "headline 应为 1807/12.760s,reasoning 已包含在 output 中");
+  assert.equal(r.latest.legacyTps, 7375.3, "legacyTps 仅复现 0.3 的重复计数旧公式");
+  assert.equal(r.latest.durMs, 12_760);
+  assert.equal(r.latest.genMs, 477);
+  assert.equal(r.session.avgTps, 141.6);
+  assert.ok(formatLine(r).includes("最近 141.6"), "formatLine 应透传新 headline 速率");
+}
+
+// ---- 用例 21:零输出不计速率,但 main/subagent 请求与 token 累计不得消失 ----
+{
+  const dbPath = path.join(tmp, "zero-output.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000,
+                      input: 1000, turnId: "turn_zero", trace: "TZ" });
+  insertRequest(db, { t0: 2_000_000, out: 0, reasoning: 0, ttft: 100, gen: 900, durMs: 1000,
+                      input: 300, turnId: "turn_zero", trace: "TZ" });
+  insertRequest(db, { t0: 3_000_000, out: 0, reasoning: 0, ttft: 100, gen: 900, durMs: 1000,
+                      input: 400, trace: "TZ", qs: "subagent", sess: "sess_sub_zero" });
+  db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
+    input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
+    cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
+    computed_total_tokens INTEGER, duration_ms INTEGER, model_request_count INTEGER)`);
+  db.prepare(`INSERT INTO turn_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run("turn_zero", SID, "completed", 4_000_000, 1300, 100, 0, 0, 0, 1400, 2000, 2);
+  db.close();
+
+  const { query } = await loadWith(dbPath);
+  const r = query(SID);
+  assert.equal(r.latest.outputTokens, 100, "较新的零输出 main 行应被 latest 跳过");
+  assert.equal(r.session.samples, 1, "仅有输出的 main 请求计入样本");
+  assert.equal(r.session.avgTps, 100);
+  assert.equal(r.turn.avgTps, 100, "轮均同样排除零输出请求");
+  assert.equal(r.session.requests, 3, "两个 main + 一个归因 subagent 均须保留在累计请求数");
+  assert.equal(r.session.totalInput, 1700);
+  assert.ok(r.session.subagent, "即使 subagent 无有效速率,累计明细仍须存在");
+  assert.equal(r.session.subagent.requests, 1);
+  assert.equal(r.session.subagent.avgTps, null);
+}
+
+// ---- 用例 22:duration_ms 行级 NULL 时,latest/session/turn/subagent 都回退时间戳差 ----
+{
+  const dbPath = path.join(tmp, "duration-fallback.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: null,
+                      turnId: "turn_fallback", trace: "TF" });
+  insertRequest(db, { t0: 2_000_000, out: 200, ttft: 100, gen: 900, durMs: null,
+                      trace: "TF", qs: "subagent", sess: "sess_sub_fallback" });
+  db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
+    input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
+    cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
+    computed_total_tokens INTEGER, duration_ms INTEGER, model_request_count INTEGER)`);
+  db.prepare(`INSERT INTO turn_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run("turn_fallback", SID, "completed", 3_000_000, 1000, 100, 0, 0, 0, 1100, 1000, 1);
+  db.close();
+
+  const { query } = await loadWith(dbPath);
+  const r = query(SID);
+  assert.equal(r.latest.durMs, 1000);
+  assert.equal(r.latest.tokPerSec, 100);
+  assert.equal(r.turn.avgTps, 100);
+  assert.equal(r.session.subagent.avgTps, 200);
+  assert.equal(r.session.avgTps, 150);
+  assert.equal(r.session.samples, 2);
+}
+
+// ---- 用例 23:无 first-token 但总时长有效的新样本应纳入,legacy/TTFT 保持空 ----
+{
+  const dbPath = path.join(tmp, "no-first-valid-duration.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: null, gen: null, durMs: 1000,
+                      firstAt: null, completedAt: 1_001_000 });
+  db.close();
+
+  const { query } = await loadWith(dbPath);
+  const r = query(SID);
+  assert.equal(r.latest.tokPerSec, 100);
+  assert.equal(r.latest.durMs, 1000);
+  assert.equal(r.latest.genMs, null);
+  assert.equal(r.latest.legacyTps, null);
+  assert.equal(r.latest.ttftMs, null);
+  assert.equal(r.session.avgTps, 100);
+  assert.equal(r.session.samples, 1);
+}
+
+// ---- 用例 24:总时长无法生成时无效;有旧有效行则跳过,全无效仍保留 history[0] ----
+{
+  const dbPath = path.join(tmp, "invalid-duration.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000 });
+  insertRequest(db, { t0: 2_000_000, out: 50, ttft: null, gen: null, durMs: null,
+                      startedAt: null, firstAt: null, completedAt: 2_005_000 });
+  db.close();
+
+  const { query } = await loadWith(dbPath);
+  let r = query(SID);
+  assert.equal(r.latest.outputTokens, 100);
+  assert.equal(r.session.samples, 1);
+
+  const onlyPath = path.join(tmp, "only-invalid-duration.sqlite");
+  const only = new DatabaseSync(onlyPath);
+  createModelUsage(only);
+  insertRequest(only, { t0: 1_000_000, out: 50, ttft: null, gen: null, durMs: null,
+                        startedAt: null, firstAt: null, completedAt: 1_005_000 });
+  only.close();
+  ({ query: r } = await loadWith(onlyPath));
+  const result = r(SID);
+  assert.equal(result.latest.outputTokens, 50);
+  assert.equal(result.latest.tokPerSec, null);
+  assert.equal(result.session.samples, 0);
+  assert.equal(result.session.avgTps, null);
+}
+
+// ---- 用例 25:总时长边界与 TOKEN_RATE_MIN_MS 显式覆盖 ----
+{
+  const dbPath = path.join(tmp, "duration-boundaries.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 40, ttft: 100, gen: 300, durMs: 400 });
+  insertRequest(db, { t0: 2_000_000, out: 50, ttft: 100, gen: 400, durMs: 500 });
+  insertRequest(db, { t0: 3_000_000, out: 3600, ttft: 100, gen: 3_599_900, durMs: 3_600_000 });
+  db.close();
+
+  delete process.env.TOKEN_RATE_MIN_MS;
+  let { query } = await loadWith(dbPath);
+  let r = query(SID);
+  assert.equal(r.session.samples, 1);
+  assert.equal(r.session.avgTps, 100);
+  assert.equal(r.latest.durMs, 500);
+
+  process.env.TOKEN_RATE_MIN_MS = "400";
+  ({ query } = await loadWith(dbPath));
+  r = query(SID);
+  assert.equal(r.session.samples, 2, "显式旧配置值 400ms 应继续生效");
+  assert.equal(r.session.avgTps, 100);
+
+  process.env.TOKEN_RATE_MAX_MS = "500";
+  ({ query } = await loadWith(dbPath));
+  r = query(SID);
+  assert.equal(r.session.samples, 1, "显式 MAX=500ms 应按总时长半开区间排除 500ms 行");
+  assert.equal(r.latest.durMs, 400);
+  delete process.env.TOKEN_RATE_MIN_MS;
+  delete process.env.TOKEN_RATE_MAX_MS;
+}
+
+// ---- 用例 26:duration_ms 非 NULL 时优先于 completed-started ----
+{
+  const dbPath = path.join(tmp, "duration-precedence.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000,
+                      completedAt: 1_010_000 });
+  db.close();
+
+  const { query } = await loadWith(dbPath);
+  const r = query(SID);
+  assert.equal(r.latest.durMs, 1000);
+  assert.equal(r.latest.tokPerSec, 100);
+  assert.equal(r.session.avgTps, 100);
+}
+
+// ---- 用例 27:核心列缺失时 query 失败,hook 仍输出严格 JSON 空注入 ----
+{
+  const dbPath = path.join(tmp, "hook-missing-duration.sqlite");
+  const db = new DatabaseSync(dbPath);
+  db.exec(`CREATE TABLE model_usage (
+    turn_id TEXT, session_id TEXT, status TEXT, query_source TEXT, model_id TEXT,
+    output_tokens INTEGER, reasoning_tokens INTEGER, input_tokens INTEGER,
+    cache_read_input_tokens INTEGER, trace_id TEXT, first_token_at INTEGER,
+    completed_at INTEGER, time_to_first_token_ms INTEGER)`);
+  db.prepare(`INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(null, SID, "completed", "main_turn", "test-model", 100, 0, 1000, 900, null,
+         1_000_100, 1_001_000, 100);
+  db.close();
+
+  const { query } = await loadWith(dbPath);
+  assert.throws(() => query(SID), /duration_ms|started_at/);
+  const stateFile = path.join(tmp, "hook-state", "last-session.json");
+  const stdout = execFileSync(process.execPath, [HOOK], {
+    env: {
+      ...process.env,
+      ZCODE_USAGE_DB: dbPath,
+      ZCODE_SESSION_ID: SID,
+      ZCODE_TPS_LAST_SESSION: stateFile,
+    },
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const payload = JSON.parse(stdout);
+  assert.deepEqual(Object.keys(payload), ["hookSpecificOutput"]);
+  assert.equal(payload.hookSpecificOutput.hookEventName, "UserPromptSubmit");
+  assert.equal(payload.hookSpecificOutput.additionalContext, "");
+  assert.equal(JSON.parse(fs.readFileSync(stateFile, "utf8")).sessionId, SID,
+               "hook 状态写入必须使用测试隔离路径");
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log("全部 18 个用例通过 ✅(降级边界 / 加权口径 / 顺序 / 回退策略 / 子代理归因 / auto 识别 / 口径对齐 / 锁等待与优雅错误 / 布尔归一化 / 字段名单 / NULL 轮次)");
+console.log("全部 26 个用例通过 ✅(请求端到端口径 / 0.3 旧值 / duration 回退与边界 / 零输出 / 无 first-token / 子代理累计 / hook 契约 / 原有降级与字段机制)");

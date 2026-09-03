@@ -12,7 +12,8 @@ import { query, formatLine, parseBool, resolveRateFields } from "../scripts/toke
 const sid = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || "";
 if (sid) {
   try {
-    const file = path.join(os.homedir(), ".zcode", "zcode-tps.last-session.json");
+    const file = process.env.ZCODE_TPS_LAST_SESSION ||
+      path.join(os.homedir(), ".zcode", "zcode-tps.last-session.json");
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(
       file,

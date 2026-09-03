@@ -15,23 +15,28 @@ const DOC = path.join(
   "..", "plugins", "zcode-tps", "scripts", "doctor.mjs"
 );
 
-const MODEL_COLS = (extra) =>
-  `turn_id TEXT, session_id TEXT, status TEXT, query_source TEXT, model_id TEXT,
-   output_tokens INTEGER, reasoning_tokens INTEGER, input_tokens INTEGER,
-   cache_read_input_tokens INTEGER, ${extra} first_token_at INTEGER,
-   completed_at INTEGER, time_to_first_token_ms INTEGER`;
 const TURN_DDL = `CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
   input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
   cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
   computed_total_tokens INTEGER, duration_ms INTEGER, model_request_count INTEGER)`;
 
-function makeDb(name, { trace = true, turnId = true, turnTable = true } = {}) {
+function makeDb(name, {
+  trace = true, turnId = true, turnTable = true, duration = true, started = true,
+} = {}) {
   const dbPath = path.join(tmp, name);
   const db = new DatabaseSync(dbPath);
-  const extra = `${trace ? "trace_id TEXT," : ""}${turnId ? "" : ""}`;
-  let ddl = MODEL_COLS(extra);
-  if (!turnId) ddl = ddl.replace("turn_id TEXT, ", "");
-  db.exec(`CREATE TABLE model_usage (${ddl})`);
+  const cols = [
+    ...(turnId ? ["turn_id TEXT"] : []),
+    "session_id TEXT", "status TEXT", "query_source TEXT", "model_id TEXT",
+    "output_tokens INTEGER", "reasoning_tokens INTEGER", "input_tokens INTEGER",
+    "cache_read_input_tokens INTEGER",
+    ...(trace ? ["trace_id TEXT"] : []),
+    ...(started ? ["started_at INTEGER"] : []),
+    "first_token_at INTEGER", "completed_at INTEGER",
+    ...(duration ? ["duration_ms INTEGER"] : []),
+    "time_to_first_token_ms INTEGER",
+  ];
+  db.exec(`CREATE TABLE model_usage (${cols.join(", ")})`);
   if (turnTable) db.exec(TURN_DDL);
   db.close();
   return dbPath;
@@ -112,5 +117,23 @@ function failed(report) {
   }
 }
 
+// ---- 用例 7:缺 duration_ms → 核心 error ----
+{
+  const byName = await diagnose(makeDb("no-duration.sqlite", { duration: false }));
+  assert.equal(byName["usage 数据库"].ok, false);
+  assert.equal(byName["usage 数据库"].level, "error");
+  assert.match(byName["usage 数据库"].detail, /duration_ms/);
+  assert.ok(failed(byName) > 0);
+}
+
+// ---- 用例 8:缺 started_at → 核心 error ----
+{
+  const byName = await diagnose(makeDb("no-started.sqlite", { started: false }));
+  assert.equal(byName["usage 数据库"].ok, false);
+  assert.equal(byName["usage 数据库"].level, "error");
+  assert.match(byName["usage 数据库"].detail, /started_at/);
+  assert.ok(failed(byName) > 0);
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log("doctor 6 个用例通过 ✅(分级 error/warn / 可选列检查 / 布尔一致性)");
+console.log("doctor 8 个用例通过 ✅(核心 duration/start 列 / 分级 error/warn / 可选列检查 / 布尔一致性)");

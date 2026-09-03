@@ -22,7 +22,7 @@ const CONFIG_FILE = path.join(HOME, ".zcode", "zcode-tps.config.json");
 const REQUIRED_COLS = [
   "session_id", "status", "query_source", "model_id",
   "output_tokens", "reasoning_tokens", "input_tokens", "cache_read_input_tokens",
-  "first_token_at", "completed_at", "time_to_first_token_ms",
+  "started_at", "first_token_at", "completed_at", "duration_ms", "time_to_first_token_ms",
 ];
 // O1/O2:可选列缺失只降级(静默走回退路径),计 warn,不影响退出码
 // trace_id 缺失→子代理归因关闭;turn_id 缺失→轮均不可用(本轮/会话累计不受影响,见 token-rate 内层降级)
