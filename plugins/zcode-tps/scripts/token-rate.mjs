@@ -196,8 +196,12 @@ function formatLine(r) {
   if (r.turn?.avgTps != null) rates.push(`上轮均 ${r.turn.avgTps}`);
   if (r.session?.avgTps != null) rates.push(`会话均 ${r.session.avgTps}`);
   const parts = [`⚡ ${rates.length ? rates.join(" · ") : "-"} tok/s`];
-  if (l.ttftMs != null) parts.push(`首字 ${(l.ttftMs / 1000).toFixed(1)}s`);
-  if (r.turn) parts.push(`上轮 ${fmtK(r.turn.total)} tok(出 ${fmtK(r.turn.output)})`);
+  if (l.ttftMs != null) {
+    // 附上最后请求的上下文规模:首字延迟与它强相关,帮助区分"模型慢"和"上下文大"
+    const ctx = l.inputTokens ? `·ctx ${fmtK(l.inputTokens)}` : "";
+    parts.push(`首字 ${(l.ttftMs / 1000).toFixed(1)}s${ctx}`);
+  }
+  if (r.turn) parts.push(`上轮 读 ${fmtK(r.turn.input)}(出 ${fmtK(r.turn.output)})`);
   if (r.usage) {
     parts.push(`会话 ${fmtK(r.usage.total)} tok`);
     if (r.cacheHit != null) parts.push(`缓存 ${r.cacheHit}%`);

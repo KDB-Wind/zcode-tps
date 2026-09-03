@@ -72,7 +72,7 @@ async function loadWith(dbPath) {
     .run("turn_test", SID, "completed", 2_000_000, 800, 100, 0, 0, 700, 900, 5000, 1);
   db.close();
 
-  const { query } = await loadWith(dbPath);
+  const { query, formatLine } = await loadWith(dbPath);
   const r = query(SID);
   assert.equal(r.turn.total, 900);
   assert.equal(r.turn.cacheHit, 87.5);
@@ -82,6 +82,10 @@ async function loadWith(dbPath) {
   assert.equal(r.usage.turns, 1);
   assert.equal(r.usage.total, 900);
   assert.equal(r.cacheHit, 87.5);
+  const line = formatLine(r);
+  assert.ok(line.includes("ctx 800"), "首字后应附上下文规模");
+  assert.ok(line.includes("读 800"), "上轮应使用'读'口径标注输入(避免误读为消耗)");
+  assert.ok(line.includes("(出 100)"), "上轮应标注生成量");
   assert.equal(r.session.avgTps, 20, "会话级速率应为加权口径");
   assert.ok(Math.abs(r.latest.tokPerSec - 11.1) < 0.1, "最近应为最新请求的瞬时速率 100/9s");
 }
