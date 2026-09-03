@@ -2,10 +2,10 @@
 description: 自检 zcode-tps 插件(定位"速率行不见了"等问题)
 ---
 
-用 Bash 运行(自动定位插件安装缓存中最新的版本目录,ls -td 在 GNU/BSD ls 上均可用):
+用 Bash 运行(自动定位插件安装缓存中最新的版本目录,ls -td 在 GNU/BSD ls 上均可用;末尾 sed 去掉个别平台给可执行文件加的 `*` 后缀):
 
 ```
-node "$(ls -td ~/.zcode/cli/plugins/cache/*/zcode-tps/*/scripts/doctor.mjs 2>/dev/null | head -1)"
+node "$(ls -td ~/.zcode/cli/plugins/cache/*/zcode-tps/*/scripts/doctor.mjs 2>/dev/null | head -1 | sed 's/\*$//')"
 ```
 
 若找不到文件,回退为搜索用户目录(-maxdepth 9 覆盖插件缓存的完整深度):
