@@ -318,7 +318,34 @@ async function loadWith(dbPath) {
   assert.equal(otherCalls, 1, "非忙错误不应重试");
 }
 
-// ---- 用例 14:CLI 库不可用时 --json 输出 error 对象而非堆栈(S3) ----
+// ---- 用例 14:配置布尔归一化(O7):"false" 等字符串写法同样生效 ----
+{
+  const { parseBool } = await import(pathToFileURL(SCRIPT).href + "?case=parsebool" + Math.random());
+  assert.equal(parseBool("false", true), false);
+  assert.equal(parseBool("FALSE", true), false);
+  assert.equal(parseBool("0", true), false);
+  assert.equal(parseBool("off", true), false);
+  assert.equal(parseBool(undefined, true), true);
+  assert.equal(parseBool(undefined, false), false);
+  assert.equal(parseBool("yes", false), true);
+  assert.equal(parseBool("x", true), true, "未知值回落默认,避免误关");
+
+  const dbPath = path.join(tmp, "boolstr.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, trace: "T1" });
+  insertRequest(db, { t0: 2_000_000, out: 200, ttft: 100, gen: 1000, trace: "T1",
+                      qs: "subagent", sess: "sess_sub_1" });
+  db.close();
+
+  process.env.ZCODE_USAGE_DB = dbPath;
+  const { query } = await loadWith(dbPath);
+  const off = query(SID, { includeSubagents: "false" });
+  assert.equal(off.session.includesSubagents, false, "字符串 false 应关闭子代理归因");
+  assert.equal(off.session.requests, 1);
+}
+
+// ---- 用例 15:CLI 库不可用时 --json 输出 error 对象而非堆栈(S3) ----
 {
   let out = "";
   try {
@@ -335,5 +362,25 @@ async function loadWith(dbPath) {
   assert.ok(j.db, "错误对象应带出数据库路径以便排查");
 }
 
+// ---- 用例 16:turn_id 为 NULL 的轮次仍可聚合轮均(O6,IS 而非 =) ----
+{
+  const dbPath = path.join(tmp, "null-turn.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 1000, turnId: null });
+  db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
+    input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
+    cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
+    computed_total_tokens INTEGER, duration_ms INTEGER, model_request_count INTEGER)`);
+  db.prepare(`INSERT INTO turn_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(null, SID, "completed", 2_000_000, 800, 100, 0, 0, 700, 900, 5000, 1);
+  db.close();
+
+  const { query } = await loadWith(dbPath);
+  const r = query(SID);
+  assert.ok(r.turn, "turn 行应正常返回");
+  assert.equal(r.turn.avgTps, 100, "NULL turn_id 应用 IS 匹配同轮未打标请求(= NULL 永不命中)");
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log("全部 14 个用例通过 ✅(降级边界 / 加权口径 / 顺序 / 回退策略 / 子代理归因 / auto 识别 / 口径对齐 / 锁等待与优雅错误)");
+console.log("全部 16 个用例通过 ✅(降级边界 / 加权口径 / 顺序 / 回退策略 / 子代理归因 / auto 识别 / 口径对齐 / 锁等待与优雅错误 / 布尔归一化 / NULL 轮次)");

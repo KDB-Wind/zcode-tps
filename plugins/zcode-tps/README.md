@@ -63,4 +63,5 @@ Node ≥ 22.5(内置 `node:sqlite`)。跨平台。
 - **口径边界**:`turn_usage` 无子代理归因,会话 tok 与缓存命中率恒为主对话口径(`usage.scope="main_turn"`);并入子代理时速率行标注 `tok(主)`/`%(主)`,`session.samples` 与 `会话均` 则含子代理有效请求;
 - **会话识别**(`/tps` 未传 env 时):显式 `ZCODE_SESSION_ID` > `~/.zcode/zcode-tps.last-session.json`(新鲜或有数据时) > 最新 `main_turn` 会话 > 最新任意完成行——子代理行不再劫持自动识别;
 - **健壮性**:只读连接带 2s `busy_timeout` + 忙时重试一次;CLI `--json` 失败时输出 `{"error","db"}` 对象而非堆栈;
+- **自检分级**:`/tps-doctor` 分 error(❌,影响退出码)与 warn(⚠️,降级可用:缺 `trace_id`/`turn_id` 列、`turn_usage` 表);配置布尔兼容字符串写法(`"false"`/`"off"` 等同样生效)。
 - 回归测试:`node test/degrade.test.mjs`(覆盖 turn_usage 缺失/结构变更的降级路径、子代理归因与指标口径)。

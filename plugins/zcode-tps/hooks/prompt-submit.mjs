@@ -7,7 +7,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { query, formatLine } from "../scripts/token-rate.mjs";
+import { query, formatLine, parseBool } from "../scripts/token-rate.mjs";
 
 const sid = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || "";
 if (sid) {
@@ -42,11 +42,11 @@ function emit(ctx) {
 
 try {
   const cfg = readConfig();
-  if (cfg.tokenRateLine === false) {
+  if (!parseBool(cfg.tokenRateLine, true)) {
     emit("");
   } else {
     // includeSubagents 默认开启(缺省视为 true):trace 归因把主会话派生的子代理请求并入会话统计
-    emit(formatLine(query(sid || null, { includeSubagents: cfg.includeSubagents !== false })) + QUOTE_HINT);
+    emit(formatLine(query(sid || null, { includeSubagents: parseBool(cfg.includeSubagents, true) })) + QUOTE_HINT);
   }
 } catch {
   emit("");

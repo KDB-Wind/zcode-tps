@@ -64,6 +64,20 @@ function resolveAutoSid(db, lastSessionFile) {
   return { sid: row ? row.session_id : null, scoped: "auto" };
 }
 
+// O7:配置布尔归一化。手写 JSON 常把布尔写成字符串,严格 === false 会让
+// {"tokenRateLine":"false"} 等写法静默失效。未知值回落默认值,避免误关。
+function parseBool(v, def) {
+  if (v === undefined || v === null) return def;
+  if (typeof v === "boolean") return v;
+  if (typeof v === "number") return v !== 0;
+  if (typeof v === "string") {
+    const s = v.trim().toLowerCase();
+    if (["false", "0", "off", "no", "disable", "disabled"].includes(s)) return false;
+    if (["true", "1", "on", "yes", "enable", "enabled"].includes(s)) return true;
+  }
+  return def;
+}
+
 // S3:读锁等待 + 忙时重试一次。ZCode 写库期间(WAL checkpoint)只读连接可能撞 SQLITE_BUSY,
 // 钩子每消息同步执行且超时 8s,直接抛错会导致本轮速率行静默丢失,等 150ms 重试一次可扛住短暂 contention。
 const BUSY_TIMEOUT_MS = 2000;
@@ -101,7 +115,7 @@ function withBusyRetry(fn) {
 function query(sessionId, opts = {}) {
   // includeSubagents:把主会话派生的子代理(subagent)请求并入会话级统计,默认开启。
   // 归因键为 trace_id(主回复与其全部子代理共享同一 trace;parent/turn 字段经验证不指向主会话)。
-  const includeSub = opts.includeSubagents !== false;
+  const includeSub = parseBool(opts.includeSubagents, true);
   const lastSessionFile =
     opts.lastSessionFile ||
     process.env.ZCODE_TPS_LAST_SESSION ||
@@ -211,7 +225,8 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
             )
             .get(sid);
         }
-      } catch {
+      } catch (e) {
+        if (isBusyError(e)) throw e; // 忙时交由外层 withBusyRetry 重试,不在此静默吞掉
         subAggr = null;
         subSum = null; // trace 归因不可用时静默降级
       }
@@ -279,16 +294,22 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
         };
         // 轮次级加权速率:该轮全部有效请求的 Σ(输出+思考) ÷ Σ(纯生成时长)
         // 复用 scopeSql 以继承"无 main_turn 数据时回退全部请求"的策略
-        const ta = db
-          .prepare(
-            "SELECT COUNT(*) n, SUM(output_tokens + reasoning_tokens) tok," +
-            " SUM(completed_at - first_token_at) gen FROM (" + scopeSql + " AND turn_id = ?)" +
-            " WHERE first_token_at IS NOT NULL AND completed_at > first_token_at" +
-            " AND (completed_at - first_token_at) >= ? AND (completed_at - first_token_at) < ?" +
-            " AND (output_tokens + reasoning_tokens) > 0"
-          )
-          .get(...args, t.turn_id, MIN_GEN_MS, MAX_GEN_MS);
-        if (ta?.n) turn.avgTps = Math.round((ta.tok / ta.gen) * 10000) / 10;
+        // O6:turn_id 可能为 NULL,用 IS 而非 =(= NULL 永不命中,IS NULL 可正确聚合该轮未打标请求)
+        // O2:旧库缺 turn_id 列时仅放弃轮均(内层降级),本轮/会话累计不受影响
+        try {
+          const ta = db
+            .prepare(
+              "SELECT COUNT(*) n, SUM(output_tokens + reasoning_tokens) tok," +
+              " SUM(completed_at - first_token_at) gen FROM (" + scopeSql + " AND turn_id IS ?)" +
+              " WHERE first_token_at IS NOT NULL AND completed_at > first_token_at" +
+              " AND (completed_at - first_token_at) >= ? AND (completed_at - first_token_at) < ?" +
+              " AND (output_tokens + reasoning_tokens) > 0"
+            )
+            .get(...args, t.turn_id, MIN_GEN_MS, MAX_GEN_MS);
+          if (ta?.n) turn.avgTps = Math.round((ta.tok / ta.gen) * 10000) / 10;
+        } catch (e) {
+          if (isBusyError(e)) throw e; // 同上:忙时重试,列缺失等才降级
+        }
       }
       const u = db
         .prepare(
@@ -369,7 +390,7 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
   })();
   const r = (() => {
     try {
-      return { ok: true, value: query(sid, { includeSubagents: cfg.includeSubagents !== false }) };
+      return { ok: true, value: query(sid, { includeSubagents: parseBool(cfg.includeSubagents, true) }) };
     } catch (e) {
       return { ok: false, error: e?.message ?? String(e) };
     }
@@ -408,4 +429,4 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
   }
 }
 
-export { query, formatLine, openDb, withBusyRetry };
+export { query, formatLine, openDb, withBusyRetry, parseBool };
