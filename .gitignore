@@ -1,4 +1,5 @@
 REVIEW.md
+PLAN-*.md
 *.log
 node_modules/
 .DS_Store
