@@ -149,8 +149,8 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
     }
     const args = [];
     const base =
-      "SELECT model_id, output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens," +
-      " first_token_at, completed_at, time_to_first_token_ms, status," +
+      "SELECT turn_id, model_id, output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens," +
+      " cache_creation_input_tokens, first_token_at, completed_at, time_to_first_token_ms, status," +
       ` ${DURATION_SQL} dur_ms` +
       " FROM model_usage WHERE status = 'completed' AND query_source = 'main_turn'";
     if (sid) {
@@ -275,78 +275,63 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
       if (n && dur) session.avgTps = rateTps(tok, dur);
     }
 
-    // ---- turn_usage:上一轮与会话累计(输入含缓存读,computed_total = 输入 + 输出) ----
-    // 独立降级边界:表缺失/列变更只影响这三项,tok/s 等核心指标不受影响
+    // ---- 轮次与会话累计:统一以 model_usage 为单一数据源(按 turn_id 分组) ----
+    // 不再读取 turn_usage:实测跨重启恢复的会话,ZCode 不再写入 turn_usage 行(其余会话正常),
+    // 依赖它会让"上轮/会话 tok/缓存"冻结在旧数据(实测滞后 2.9 天)。turn_usage 本就是
+    // model_usage 的按轮求和(数值恒等),故以 model_usage 为单一数据源,永远新鲜。
+    // 上一轮 = 最新一组:钩子触发于消息发送瞬间,当前轮尚未产生请求,最新组即上一轮;
+    // 队列补发消息的场景下可能是进行中轮的部分累计,如实展示。
+    const turnRows = withBusyRetry(() =>
+      db.prepare(
+        "SELECT turn_id, COUNT(*) requests, SUM(input_tokens) i, SUM(output_tokens) o," +
+        " SUM(reasoning_tokens) r, SUM(cache_read_input_tokens) cr," +
+        " SUM(cache_creation_input_tokens) cc, MAX(completed_at) completed_at" +
+        " FROM (" + scopeSql + ") GROUP BY turn_id ORDER BY MAX(completed_at) DESC"
+      ).all(...args));
+    const validRows = withBusyRetry(() =>
+      db.prepare(
+        "SELECT turn_id, SUM(output_tokens) vtok, SUM(dur_ms) vdur FROM (" + scopeSql + ")" +
+        " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 GROUP BY turn_id"
+      ).all(...args, MIN_DURATION_MS, MAX_DURATION_MS));
+    const validByTurn = new Map(validRows.map((v) => [v.turn_id ?? "", v]));
+    const sumOf = (key) => turnRows.reduce((s, r) => s + (r[key] ?? 0), 0);
+
+    // 最新组若无任何 token(全 error 轮等)则顺延到下一组,避免"上轮"空段
+    const g = turnRows.find((t) => (t.i ?? 0) + (t.o ?? 0) + (t.r ?? 0) > 0) ?? turnRows[0] ?? null;
+    const gv = g ? validByTurn.get(g.turn_id ?? "") : null;
     let turn = null;
-    let usage = null;
-    let cacheHit = null;
-    if (sid) {
-      try {
-        const t = db
-        .prepare(
-          "SELECT turn_id, input_tokens i, output_tokens o, reasoning_tokens r," +
-          " cache_creation_input_tokens cc, cache_read_input_tokens cr, computed_total_tokens total," +
-          " duration_ms dur, model_request_count reqs, completed_at" +
-          " FROM turn_usage WHERE session_id = ? AND status = 'completed'" +
-          " ORDER BY completed_at DESC LIMIT 1"
-        )
-        .get(sid);
-      if (t && Number.isFinite(t.total) && t.total > 0) {
-        turn = {
-          turnId: t.turn_id,
-          input: t.i ?? 0,
-          output: t.o ?? 0,
-          reasoning: t.r ?? 0,
-          cacheRead: t.cr ?? 0,
-          cacheCreation: t.cc ?? 0,
-          total: t.total,
-          durationMs: t.dur,
-          requests: t.reqs,
-          completedAt: t.completed_at,
-          cacheHit: t.i ? Math.round(((t.cr ?? 0) / t.i) * 1000) / 10 : null,
-        };
-        // 轮次级请求服务时长加权速率:该轮有效请求的 Σoutput ÷ Σduration。
-        // 复用 scopeSql 以继承"无 main_turn 数据时回退全部请求"的策略
-        // O6:turn_id 可能为 NULL,用 IS 而非 =(= NULL 永不命中,IS NULL 可正确聚合该轮未打标请求)
-        // O2:旧库缺 turn_id 列时仅放弃轮均(内层降级),本轮/会话累计不受影响
-        try {
-          const ta = db
-            .prepare(
-              "SELECT COUNT(*) n, SUM(output_tokens) tok, SUM(dur_ms) dur" +
-              " FROM (" + scopeSql + " AND turn_id IS ?)" +
-              " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0"
-            )
-            .get(...args, t.turn_id, MIN_DURATION_MS, MAX_DURATION_MS);
-          if (ta?.n && ta.dur) turn.avgTps = rateTps(ta.tok, ta.dur);
-        } catch (e) {
-          if (isBusyError(e)) throw e; // 同上:忙时重试,列缺失等才降级
-        }
-      }
-      const u = db
-        .prepare(
-          "SELECT COUNT(*) turns, SUM(input_tokens) i, SUM(output_tokens) o, SUM(reasoning_tokens) r," +
-          " SUM(cache_creation_input_tokens) cc, SUM(cache_read_input_tokens) cr," +
-          " SUM(computed_total_tokens) total FROM turn_usage WHERE session_id = ? AND status = 'completed'"
-        )
-        .get(sid);
-      if (u && Number.isFinite(u.turns) && u.turns > 0) {
-        usage = {
-          // S2:turn_usage 无子代理归因,恒为主对话口径(与含子的 session.avgTps 区分)
-          scope: "main_turn",
-          turns: u.turns,
-          input: u.i ?? 0,
-          output: u.o ?? 0,
-          reasoning: u.r ?? 0,
-          cacheRead: u.cr ?? 0,
-          cacheCreation: u.cc ?? 0,
-          total: u.total ?? 0,
-        };
-        cacheHit = usage.input ? Math.round((usage.cacheRead / usage.input) * 1000) / 10 : null;
-      }
-      } catch {
-        // turn_usage 表缺失或结构变更:仅放弃本轮/会话累计/缓存命中率三项,核心速率不受影响
-      }
+    if (g) {
+      turn = {
+        turnId: g.turn_id,
+        input: g.i ?? 0,
+        output: g.o ?? 0,
+        reasoning: g.r ?? 0,
+        cacheRead: g.cr ?? 0,
+        cacheCreation: g.cc ?? 0,
+        total: (g.i ?? 0) + (g.o ?? 0) + (g.r ?? 0),
+        durationMs: gv?.vdur ?? 0,
+        requests: g.requests ?? 0,
+        completedAt: g.completed_at,
+        avgTps: gv?.vdur ? rateTps(gv.vtok, gv.vdur) : null,
+        cacheHit: g.i ? Math.round(((g.cr ?? 0) / g.i) * 1000) / 10 : null,
+      };
     }
+
+    const usage = turnRows.length
+      ? {
+          scope: "main_turn",
+          turns: turnRows.length,
+          input: sumOf("i"),
+          output: sumOf("o"),
+          reasoning: sumOf("r"),
+          cacheRead: sumOf("cr"),
+          cacheCreation: sumOf("cc"),
+          total: sumOf("i") + sumOf("o") + sumOf("r"),
+        }
+      : null;
+    const cacheHit = usage && usage.input
+      ? Math.round((usage.cacheRead / usage.input) * 1000) / 10
+      : null;
 
     return { sessionId: sid, scoped, latest, session, turn, usage, cacheHit, history: items };
   } finally {

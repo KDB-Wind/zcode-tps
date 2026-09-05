@@ -26,7 +26,7 @@ const REQUIRED_COLS = [
 ];
 // O1/O2:可选列缺失只降级(静默走回退路径),计 warn,不影响退出码
 // trace_id 缺失→子代理归因关闭;turn_id 缺失→轮均不可用(本轮/会话累计不受影响,见 token-rate 内层降级)
-// 本轮/会话用量依赖的列(turn_usage 表)
+// v0.4.1 起轮次/会话累计改由 model_usage 聚合,turn_usage 表不再被读取——以下检查仅供参考
 const TURN_COLS = [
   "session_id", "status", "input_tokens", "output_tokens", "reasoning_tokens",
   "cache_creation_input_tokens", "cache_read_input_tokens",
@@ -108,14 +108,14 @@ async function turnTableCheck() {
       .all()
       .map((r) => r.name);
     if (!tables.includes("turn_usage")) {
-      return { name: "turn_usage 表", level: "warn", ok: false, detail: "表不存在", hint: "本轮/会话累计/缓存命中率将不可用;速率行仍工作(仅缺这几项)。ZCode 升级后可能新增此表" };
+      return { name: "turn_usage 表", level: "warn", ok: true, detail: "表不存在(无影响)", hint: "v0.4.1 起轮次/会话累计已改由 model_usage 聚合,不再依赖该表" };
     }
     const cols = db.prepare("PRAGMA table_info(turn_usage)").all().map((c) => c.name);
     const missing = TURN_COLS.filter((c) => !cols.includes(c));
     if (missing.length) {
-      return { name: "turn_usage 表", level: "warn", ok: false, detail: `缺少列: ${missing.join(", ")}`, hint: "ZCode 版本变更了表结构,请升级插件" };
+      return { name: "turn_usage 表", level: "warn", ok: true, detail: `列结构与插件预期不同(无影响)`, hint: "v0.4.1 起不再读取该表;此检查仅供参考" };
     }
-    return { name: "turn_usage 表", level: "warn", ok: true, detail: "表结构完整", hint: null };
+    return { name: "turn_usage 表", level: "warn", ok: true, detail: "表结构完整(仅供参考,v0.4.1 起不再读取)", hint: null };
   } finally {
     db.close();
   }

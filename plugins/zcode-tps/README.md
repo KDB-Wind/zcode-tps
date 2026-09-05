@@ -85,8 +85,9 @@ Node ≥ 22.5(内置 `node:sqlite`)。跨平台。
 - 缓存命中率 = 缓存读 ÷ 总输入;`cache_creation_input_tokens`(缓存写入)不计入命中;
 - 会话 `input_tokens` 为该会话所有 main_turn 请求的输入(含缓存读);
 - **子代理归因**:默认开启——与主会话共享 `trace_id` 的子代理(subagent)请求会并入会话级统计(实测约占输出 token 的两成);`~/.zcode/zcode-tps.config.json` → `{"includeSubagents": false}` 切回纯主对话口径(需重开会话);
-- **口径边界**:`turn_usage` 无子代理归因,会话 tok 与缓存命中率恒为主对话口径(`usage.scope="main_turn"`);并入子代理时速率行标注 `tok(主)`/`%(主)`,`session.samples` 与 `会话均` 则含子代理有效请求;子代理没有有效速率样本时其累计仍保留、`subagent.avgTps` 为空;
+- **单一数据源(v0.4.1)**:轮次/会话聚合只读 `model_usage`,不再读取 `turn_usage`——实测跨重启恢复的会话,ZCode 不再写入 turn_usage 行(其余会话正常),旧实现会把三天前的"上轮/会话 tok/缓存命中率"冻结展示。代价:会话累计只覆盖 model_usage 的留存窗口(ZCode 会定期清理旧行),不再是全历史总量;
+- **口径边界**:子代理归因只作用于会话级速率与累计;并入子代理时速率行标注 `tok(主)`/`%(主)` 标明 token/缓存的纯主对话口径,`session.samples` 与 `会话均` 则含子代理有效请求;子代理没有有效速率样本时其累计仍保留、`subagent.avgTps` 为空;
 - **会话识别**(`/tps` 未传 env 时):显式 `ZCODE_SESSION_ID` > `~/.zcode/zcode-tps.last-session.json`(新鲜或有数据时) > 最新 `main_turn` 会话 > 最新任意完成行——子代理行不再劫持自动识别;
 - **健壮性**:只读连接带 2s `busy_timeout` + 忙时重试一次;CLI `--json` 失败时输出 `{"error","db"}` 对象而非堆栈;
-- **自检分级**:`/tps-doctor` 分 error(❌,影响退出码)与 warn(⚠️,降级可用:缺 `trace_id`/`turn_id` 列、`turn_usage` 表);配置布尔兼容字符串写法(`"false"`/`"off"` 等同样生效)。
+- **自检分级**:`/tps-doctor` 分 error(❌,影响退出码)与 warn(⚠️,降级可用:缺 `trace_id`/`turn_id` 列;`turn_usage` 表自 v0.4.1 起不再被读取);配置布尔兼容字符串写法(`"false"`/`"off"` 等同样生效)。
 - 回归测试:`node test/degrade.test.mjs`(覆盖 turn_usage 缺失/结构变更的降级路径、子代理归因与指标口径)。

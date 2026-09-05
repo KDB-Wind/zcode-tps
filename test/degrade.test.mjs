@@ -21,9 +21,9 @@ function createModelUsage(db) {
   db.exec(`CREATE TABLE model_usage (
     turn_id TEXT, session_id TEXT, status TEXT, query_source TEXT, model_id TEXT,
     output_tokens INTEGER, reasoning_tokens INTEGER, input_tokens INTEGER,
-    cache_read_input_tokens INTEGER, trace_id TEXT, started_at INTEGER,
-    first_token_at INTEGER, completed_at INTEGER, duration_ms INTEGER,
-    time_to_first_token_ms INTEGER)`);
+    cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER,
+    trace_id TEXT, started_at INTEGER, first_token_at INTEGER,
+    completed_at INTEGER, duration_ms INTEGER, time_to_first_token_ms INTEGER)`);
 }
 
 function insertRequest(db, {
@@ -58,7 +58,7 @@ async function loadWith(dbPath) {
   return import(pathToFileURL(SCRIPT).href + "?case=" + Math.random());
 }
 
-// ---- 用例 1:库里只有 model_usage(无 turn_usage 表)→ 核心速率仍工作,turn/usage 优雅置空 ----
+// ---- 用例 1:库里只有 model_usage(无 turn_usage 表)→ 轮次/会话/缓存全部由 model_usage 聚合 ----
 {
   const dbPath = path.join(tmp, "no-turn-usage.sqlite");
   const db = new DatabaseSync(dbPath);
@@ -72,48 +72,46 @@ async function loadWith(dbPath) {
 
   const { query, formatLine } = await loadWith(dbPath);
   const r = query(SID);
-  assert.equal(r.turn, null, "无 turn_usage 表时 turn 应为 null");
-  assert.equal(r.usage, null, "无 turn_usage 表时 usage 应为 null");
-  assert.equal(r.cacheHit, null, "无 turn_usage 表时 cacheHit 应为 null");
+  assert.equal(r.turn.requests, 3, "三条请求同组(NULL turn_id)聚合为一轮");
+  assert.equal(r.turn.total, 3230, "total = Σ(input+output) = 3000+230");
+  assert.equal(r.usage.turns, 1);
+  assert.equal(r.usage.total, 3230);
+  assert.equal(r.cacheHit, 90, "缓存命中率 = 2700/3000");
   assert.equal(r.latest.tokPerSec, 28.6, "latest 应取最新一条有效记录(60tok/2.1s)");
   assert.equal(r.history.length, 3, "history 应包含全部请求");
   assert.ok(formatLine(r).includes("⚡"), "降级时速率行仍可格式化");
 }
 
-// ---- 用例 2:turn_usage 存在 → 本轮/会话累计/缓存命中率正常计算,且区分加权与算术平均 ----
+// ---- 用例 2:按 turn_id 聚合 → 本轮/会话累计/缓存命中率正常计算,且区分加权与算术平均 ----
 {
   const dbPath = path.join(tmp, "with-turn-usage.sqlite");
   const db = new DatabaseSync(dbPath);
   createModelUsage(db);
   insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000, input: 800, cacheRead: 700, turnId: "turn_test" });
   insertRequest(db, { t0: 3_000_000, out: 100, ttft: 100, gen: 8900, durMs: 9000, input: 800, cacheRead: 700, turnId: "turn_test" });
-  db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
-    input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
-    cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
-    computed_total_tokens INTEGER, duration_ms INTEGER, model_request_count INTEGER)`);
-  db.prepare(`INSERT INTO turn_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run("turn_test", SID, "completed", 2_000_000, 800, 100, 0, 0, 700, 900, 5000, 1);
   db.close();
 
   const { query, formatLine } = await loadWith(dbPath);
   const r = query(SID);
-  assert.equal(r.turn.total, 900);
+  assert.equal(r.turn.requests, 2);
+  assert.equal(r.turn.input, 1600);
+  assert.equal(r.turn.total, 1800, "total = Σ(input+output)");
   assert.equal(r.turn.cacheHit, 87.5);
   // 100tok/1s + 100tok/9s → 加权 = 200/10s = 20;算术平均会是 (11.1+11.1)/2? 不,两条速率不同,
   // 算术平均 = (100+11.1)/2 ≈ 55.6 —— 用 20 断言可区分两种算法
   assert.equal(r.turn.avgTps, 20, "轮级速率应为加权口径 200tok÷10s=20,而非算术平均≈55.6");
   assert.equal(r.usage.turns, 1);
-  assert.equal(r.usage.total, 900);
+  assert.equal(r.usage.total, 1800);
   assert.equal(r.cacheHit, 87.5);
   const line = formatLine(r, "all");
   assert.ok(line.includes("ctx 800"), "首字后应附上下文规模");
-  assert.ok(line.includes("读 800"), "上轮应使用'读'口径标注输入(避免误读为消耗)");
-  assert.ok(line.includes("(出 100)"), "上轮应标注生成量");
+  assert.ok(line.includes("读 1.6k"), "上轮应使用'读'口径标注输入(避免误读为消耗)");
+  assert.ok(line.includes("(出 200)"), "上轮应标注生成量");
   assert.equal(r.session.avgTps, 20, "会话级速率应为加权口径");
   assert.ok(Math.abs(r.latest.tokPerSec - 11.1) < 0.1, "最近应为最新请求的瞬时速率 100/9s");
 }
 
-// ---- 用例 3:turn_usage 存在但列结构变更 → 仍只降级三项,不抛异常 ----
+// ---- 用例 3:turn_usage 表存在但列结构变更 → 完全不影响(v0.4.1 起不再读取该表) ----
 {
   const dbPath = path.join(tmp, "bad-turn-usage.sqlite");
   const db = new DatabaseSync(dbPath);
@@ -124,8 +122,8 @@ async function loadWith(dbPath) {
 
   const { query, formatLine } = await loadWith(dbPath);
   const r = query(SID);
-  assert.equal(r.turn, null);
-  assert.equal(r.usage, null);
+  assert.ok(r.turn, "turn 应改由 model_usage 聚合,不受 turn_usage 结构影响");
+  assert.ok(r.usage, "usage 应改由 model_usage 聚合");
   assert.ok(r.latest.tokPerSec > 0, "结构变更时 tok/s 仍应可用");
   assert.ok(formatLine(r).includes("⚡"));
 }
@@ -220,7 +218,8 @@ async function loadWith(dbPath) {
   db.exec(`CREATE TABLE model_usage (
     turn_id TEXT, session_id TEXT, status TEXT, query_source TEXT, model_id TEXT,
     output_tokens INTEGER, reasoning_tokens INTEGER, input_tokens INTEGER,
-    cache_read_input_tokens INTEGER, started_at INTEGER, first_token_at INTEGER,
+    cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER,
+    started_at INTEGER, first_token_at INTEGER,
     completed_at INTEGER, duration_ms INTEGER, time_to_first_token_ms INTEGER)`);   // 无 trace_id
   db.prepare(`INSERT INTO model_usage (turn_id,session_id,status,query_source,model_id,
               output_tokens,reasoning_tokens,input_tokens,cache_read_input_tokens,
@@ -637,10 +636,14 @@ async function loadWith(dbPath) {
   db.exec(`CREATE TABLE model_usage (
     turn_id TEXT, session_id TEXT, status TEXT, query_source TEXT, model_id TEXT,
     output_tokens INTEGER, reasoning_tokens INTEGER, input_tokens INTEGER,
-    cache_read_input_tokens INTEGER, trace_id TEXT, first_token_at INTEGER,
-    completed_at INTEGER, time_to_first_token_ms INTEGER)`);
-  db.prepare(`INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(null, SID, "completed", "main_turn", "test-model", 100, 0, 1000, 900, null,
+    cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER,
+    trace_id TEXT, first_token_at INTEGER,
+    completed_at INTEGER, time_to_first_token_ms INTEGER)`);   // 无 started_at/duration_ms
+  db.prepare(`INSERT INTO model_usage (turn_id,session_id,status,query_source,model_id,
+              output_tokens,reasoning_tokens,input_tokens,cache_read_input_tokens,
+              cache_creation_input_tokens,trace_id,first_token_at,completed_at,time_to_first_token_ms)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(null, SID, "completed", "main_turn", "test-model", 100, 0, 1000, 900, null, null,
          1_000_100, 1_001_000, 100);
   db.close();
 
@@ -665,5 +668,32 @@ async function loadWith(dbPath) {
                "hook 状态写入必须使用测试隔离路径");
 }
 
+// ---- 用例 28:跨重启恢复的会话 —— turn_usage 冻结在旧数据时,轮次/会话仍取到 model_usage 的新鲜值 ----
+// 真实场景:ZCode 对重启后恢复的会话不再写 turn_usage 行(实测滞后 2.9 天),旧实现会把
+// 三天前的"上轮/会话 tok/缓存命中率"当作当前数据显示。v0.4.1 起以 model_usage 为单一数据源。
+{
+  const dbPath = path.join(tmp, "resumed-stale.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
+    input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
+    cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
+    computed_total_tokens INTEGER, duration_ms INTEGER, model_request_count INTEGER)`);
+  db.prepare(`INSERT INTO turn_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run("turn_old", SID, "completed", 1_000_000, 100, 100, 0, 0, 0, 200, 1000, 1); // 冻结的旧数据
+  // 今天(恢复后)的新轮次:model_usage 有行,turn_usage 无对应行
+  insertRequest(db, { t0: 9_000_000, out: 150, ttft: 100, gen: 900, durMs: 1000,
+                      input: 2000, cacheRead: 1800, turnId: "turn_today" });
+  db.close();
+
+  const { query } = await loadWith(dbPath);
+  const r = query(SID);
+  assert.equal(r.turn.turnId, "turn_today", "上轮必须是今天的新轮次,而非 turn_usage 里的陈旧行");
+  assert.equal(r.turn.total, 2150, "上轮 token 应来自 model_usage 的新鲜聚合(2000+150)");
+  assert.equal(r.usage.turns, 1, "轮次数按 model_usage 的 turn_id 分组");
+  assert.equal(r.usage.total, 2150, "会话累计不得冻结在 turn_usage 的旧值");
+  assert.equal(r.cacheHit, 90, "缓存命中率 = 1800/2000(新鲜口径)");
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log("全部 26 个用例通过 ✅(请求端到端口径 / 0.3 旧值 / duration 回退与边界 / 零输出 / 无 first-token / 子代理累计 / hook 契约 / 原有降级与字段机制)");
+console.log("全部 28 个用例通过 ✅(请求端到端口径 / 0.3 旧值 / duration 回退与边界 / 零输出 / 无 first-token / 子代理累计 / hook 契约 / model_usage 单一数据源)");
