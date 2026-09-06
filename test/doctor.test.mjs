@@ -89,10 +89,10 @@ function failed(report) {
   assert.equal(failed(byName), 0);
 }
 
-// ---- 用例 4:缺 turn_usage 表 → warn,failed 为 0 ----
+// ---- 用例 4:缺 turn_usage 表 → 仍 ok:true(仅 warn 参考项;v0.4.1 起不再单独读取该表) ----
 {
   const byName = await diagnose(makeDb("no-turn.sqlite", { turnTable: false }));
-  assert.equal(byName["turn_usage 表"].ok, false);
+  assert.equal(byName["turn_usage 表"].ok, true);
   assert.equal(byName["turn_usage 表"].level, "warn");
   assert.equal(failed(byName), 0);
 }
