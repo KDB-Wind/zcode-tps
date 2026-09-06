@@ -1,0 +1,26 @@
+# 零依赖 Node 项目 CI(改编自 github-workflow-kit ci-node-zerodep)。
+# 本仓无 package.json、测试为可直接运行的 node 脚本；node:sqlite 需 Node ≥22.13(免 flag)。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24] # 22 取最新 22.x(≥22.13，sqlite 免 flag)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - run: node --test "test/*.test.mjs" # 必须 glob:裸 test/ 目录在 Windows 会被当模块解析而失败(已本地实证)
