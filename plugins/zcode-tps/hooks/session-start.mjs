@@ -3,25 +3,21 @@
 // 1) 记录"用户最后所处的会话"到状态文件(供 /tps-doctor 自检钩子是否已注册)
 // 2) 注入一行使用提示(严格 JSON 输出)
 
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+import { readConfig, parseBool, stateFile, writeState, validId } from "../scripts/runtime.mjs";
 
 const sid = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || "";
-if (sid) {
+if (validId(sid)) {
   try {
-    const file = process.env.ZCODE_TPS_LAST_SESSION ||
-      path.join(os.homedir(), ".zcode", "zcode-tps.last-session.json");
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(
-      file,
-      JSON.stringify({ sessionId: sid, ts: Date.now(), source: "session-start" })
-    );
+    writeState(stateFile(), { sessionId: sid, ts: Date.now(), source: "session-start" });
   } catch {}
 }
 
-const hint =
-  "[zcode-tps] 已就绪。每轮用户消息都会注入【token 速率】行(真实数据,来自 usage 库;显示的是上一轮),请在每条回复末尾原样附上「⚡」开头的整行。命令:/tps 查看完整报表、/tps-doctor 自检。关闭速率行:~/.zcode/zcode-tps.config.json → {\"tokenRateLine\":false}。";
+let hint = "";
+try {
+  if (parseBool(readConfig().tokenRateLine, true)) {
+    hint = "[zcode-tps] 已加载。仅在本条用户消息附带新速率行时,在回复末尾原样引用该行,不要复用历史数字。数据为发送消息时库内留存的已完成请求,通常对应上一轮。命令:/tps 查看报表、/tps-doctor 自检。";
+  }
+} catch {} // Config problems are diagnosed by prompt-submit/doctor.
 
 process.stdout.write(
   JSON.stringify({

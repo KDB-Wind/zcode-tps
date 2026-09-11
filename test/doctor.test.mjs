@@ -1,19 +1,22 @@
 // doctor 分级回归测试:可选列/表缺失只 warn,不计 failed;核心缺失才 error。
-// 运行:node test/doctor.test.mjs(需要 Node >= 22.5,零第三方依赖)
-// 注意:仅断言数据库相关检查项;会话状态/配置文件项读取真实家目录,不作断言。
+// 运行:node test/doctor.test.mjs(需要 Node >= 22.13,零第三方依赖)
+// 注意:仅断言数据库相关检查项;会话状态/配置文件使用临时路径隔离,此文件只断言数据库相关项。
 
 import assert from "node:assert";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-tps-doctor-"));
 const DOC = path.join(
-  path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")),
+  path.dirname(fileURLToPath(import.meta.url)),
   "..", "plugins", "zcode-tps", "scripts", "doctor.mjs"
 );
+process.env.ZCODE_TPS_CONFIG = path.join(tmp, "config.json");
+process.env.ZCODE_TPS_LAST_SESSION = path.join(tmp, "state.json");
+process.env.ZCODE_TPS_HEALTH = path.join(tmp, "health.json");
 
 const TURN_DDL = `CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
   input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
@@ -29,7 +32,7 @@ function makeDb(name, {
     ...(turnId ? ["turn_id TEXT"] : []),
     "session_id TEXT", "status TEXT", "query_source TEXT", "model_id TEXT",
     "output_tokens INTEGER", "reasoning_tokens INTEGER", "input_tokens INTEGER",
-    "cache_read_input_tokens INTEGER",
+    "cache_read_input_tokens INTEGER", "cache_creation_input_tokens INTEGER",
     ...(trace ? ["trace_id TEXT"] : []),
     ...(started ? ["started_at INTEGER"] : []),
     "first_token_at INTEGER", "completed_at INTEGER",
@@ -49,8 +52,8 @@ async function diagnose(dbPath) {
   return Object.fromEntries(report.checks.map((c) => [c.name, c]));
 }
 
-// 仅统计数据库相关检查(会话状态/配置文件读取真实家目录,不受本测试控制,不计入)
-const DB_CHECKS = ["usage 数据库", "子代理归因列(trace_id)", "轮次关联列(turn_id)", "turn_usage 表"];
+// 仅统计数据库相关检查(会话状态/配置文件在 release 测试中验证,此处不计入)
+const DB_CHECKS = ["usage 数据库", "子代理归因列(trace_id)", "轮次关联列(turn_id)", "缓存写入列(cache_creation_input_tokens)", "turn_usage 表"];
 
 function warns(report) {
   return Object.values(report).filter((c) => DB_CHECKS.includes(c.name) && !c.ok && c.level === "warn").length;
@@ -89,12 +92,13 @@ function failed(report) {
   assert.equal(failed(byName), 0);
 }
 
-// ---- 用例 4:缺 turn_usage 表 → 仍 ok:true(仅 warn 参考项;v0.4.1 起不再单独读取该表) ----
+// ---- 用例 4:缺 turn_usage 表 → 无影响,无警告 ----
 {
   const byName = await diagnose(makeDb("no-turn.sqlite", { turnTable: false }));
   assert.equal(byName["turn_usage 表"].ok, true);
   assert.equal(byName["turn_usage 表"].level, "warn");
   assert.equal(failed(byName), 0);
+  assert.equal(warns(byName), 0);
 }
 
 // ---- 用例 5:库路径不存在 → error,failed > 0 ----

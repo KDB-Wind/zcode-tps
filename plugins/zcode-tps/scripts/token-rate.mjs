@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Token 输出速率与用量统计:从 ZCode 自身的 usage 数据库(model_usage / turn_usage 表)计算。
+// Token 输出速率与用量统计:从 ZCode 自身的 usage 数据库(model_usage 表)计算。
 // 基于 shy3130/zcode-tps-monitor 0.7.0 (MIT) 修改:增加本轮 token、会话累计、缓存命中率。
 // 用法:
 //   node token-rate.mjs            速率行 + 会话统计(人类可读)
@@ -8,28 +8,21 @@
 //   ZCODE_USAGE_DB=/path/db.sqlite 指定数据库路径(默认按用户主目录解析)
 // 只读打开 WAL 数据库,不影响运行中的客户端。
 
-// 抑制 node:sqlite 的 ExperimentalWarning 噪音:必须在动态 import 之前接管 warning 通道
-// (静态 import 的内置模块在模块体执行前就已求值,届时再监听就晚了)。
-process.removeAllListeners("warning");
-process.on("warning", () => {});
+// Runtime warnings remain on stderr; importing this module must not alter other warning listeners.
 
-const { DatabaseSync } = await import("node:sqlite");
+let DatabaseSync;
+let sqliteError;
+try { ({ DatabaseSync } = await import("node:sqlite")); }
+catch (e) { sqliteError = e; }
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { inspectSchema, parseBool, querySettings, readConfig, validId, validIdSql, parseJson } from "./runtime.mjs";
 
 // 跨平台默认路径(macOS/Linux: ~/.zcode/...;Windows: %USERPROFILE%\.zcode\...),可用 ZCODE_USAGE_DB 覆盖
 const DB_PATH =
   process.env.ZCODE_USAGE_DB ||
   path.join(os.homedir(), ".zcode", "cli", "db", "db.sqlite");
-const HIST = Number(process.env.TOKEN_RATE_HIST) || 60;         // history 曲线点数(最近请求明细)
-const configuredMinDurationMs = Number(process.env.TOKEN_RATE_MIN_MS);
-const configuredMaxDurationMs = Number(process.env.TOKEN_RATE_MAX_MS);
-// 环境变量名为兼容 0.3 保留,0.4 起含义改为单次模型请求端到端时长。
-const MIN_DURATION_MS = Number.isFinite(configuredMinDurationMs) && configuredMinDurationMs > 0
-  ? configuredMinDurationMs : 500;
-const MAX_DURATION_MS = Number.isFinite(configuredMaxDurationMs) && configuredMaxDurationMs > 0
-  ? configuredMaxDurationMs : 3_600_000;
 // 仅用于 /tps 的 0.3 旧值对比,不可复用新的总时长门槛。
 const LEGACY_MIN_GEN_MS = 200;
 const LEGACY_MAX_GEN_MS = 3_600_000;
@@ -41,54 +34,31 @@ function rateTps(tokens, durationMs) {
 
 function readLastSessionState(file) {
   try {
-    const st = JSON.parse(fs.readFileSync(file, "utf8"));
-    if (st && typeof st.sessionId === "string" && st.sessionId) return st;
+    const st = parseJson(fs.readFileSync(file, "utf8"));
+    if (st && validId(st.sessionId)) return st;
   } catch {}
   return null;
 }
 
 // S1:自动会话识别必须优先 main_turn,不能被更新的子代理行劫持。
-// 顺序:显式 sid > last-session 文件(新会话/同会话,以时间新鲜度+是否有数据判断) > 最新 main_turn > 最新任意行。
+// 顺序:显式 sid > 两小时内的 last-session 文件 > 最新 main_turn > 最新任意行。
 function resolveAutoSid(db, lastSessionFile) {
   const st = readLastSessionState(lastSessionFile);
   if (st) {
-    let hasData = false;
-    try {
-      hasData = !!db.prepare("SELECT 1 FROM model_usage WHERE session_id = ? LIMIT 1").get(st.sessionId);
-    } catch {}
-    if (!hasData) {
-      try {
-        hasData = !!db.prepare("SELECT 1 FROM turn_usage WHERE session_id = ? LIMIT 1").get(st.sessionId);
-      } catch {}
-    }
     const ageMs = Date.now() - (Number(st.ts) || 0);
-    // 有数据直接采用;无数据仅当文件很新(新会话,钩子刚写入)时采用,避免陈旧文件屏蔽正常回退
-    if (hasData || ageMs < 2 * 3600 * 1000) return { sid: st.sessionId, scoped: "file" };
+    // Fresh hook state also identifies a new session with no usage yet. Old/future state never pins a session.
+    if (ageMs >= 0 && ageMs < 2 * 3600 * 1000) return { sid: st.sessionId, scoped: "file" };
   }
   try {
     const row = db
-      .prepare("SELECT session_id FROM model_usage WHERE status = 'completed' AND query_source = 'main_turn' ORDER BY completed_at DESC LIMIT 1")
+      .prepare("SELECT session_id FROM model_usage WHERE status = 'completed' AND query_source = 'main_turn' AND " + validIdSql("session_id") + " ORDER BY completed_at DESC LIMIT 1")
       .get();
     if (row && row.session_id) return { sid: row.session_id, scoped: "auto-main" };
-  } catch {}
+  } catch (e) { if (isBusyError(e)) throw e; }
   const row = db
-    .prepare("SELECT session_id FROM model_usage WHERE status = 'completed' ORDER BY completed_at DESC LIMIT 1")
+    .prepare("SELECT session_id FROM model_usage WHERE status = 'completed' AND " + validIdSql("session_id") + " ORDER BY completed_at DESC LIMIT 1")
     .get();
   return { sid: row ? row.session_id : null, scoped: "auto" };
-}
-
-// O7:配置布尔归一化。手写 JSON 常把布尔写成字符串,严格 === false 会让
-// {"tokenRateLine":"false"} 等写法静默失效。未知值回落默认值,避免误关。
-function parseBool(v, def) {
-  if (v === undefined || v === null) return def;
-  if (typeof v === "boolean") return v;
-  if (typeof v === "number") return v !== 0;
-  if (typeof v === "string") {
-    const s = v.trim().toLowerCase();
-    if (["false", "0", "off", "no", "disable", "disabled"].includes(s)) return false;
-    if (["true", "1", "on", "yes", "enable", "enabled"].includes(s)) return true;
-  }
-  return def;
 }
 
 // S3:读锁等待 + 忙时重试一次。ZCode 写库期间(WAL checkpoint)只读连接可能撞 SQLITE_BUSY,
@@ -97,6 +67,7 @@ const BUSY_TIMEOUT_MS = 2000;
 const BUSY_RETRY_WAIT_MS = 150;
 
 function openDb() {
+  if (sqliteError) throw new Error(`node:sqlite 不可用,请使用 Node 22.13+ 或 24+: ${sqliteError.message}`);
   const db = new DatabaseSync(DB_PATH, { readOnly: true });
   try {
     db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
@@ -126,6 +97,7 @@ function withBusyRetry(fn) {
 }
 
 function query(sessionId, opts = {}) {
+  if (sessionId != null && !validId(sessionId)) throw new Error("显式会话 sessionId 必须为非空字符串");
   // includeSubagents:把主会话派生的子代理(subagent)请求并入会话级统计,默认开启。
   // 归因键为 trace_id(主回复与其全部子代理共享同一 trace;parent/turn 字段经验证不指向主会话)。
   const includeSub = parseBool(opts.includeSubagents, true);
@@ -137,8 +109,14 @@ function query(sessionId, opts = {}) {
 }
 
 function queryOnce(sessionId, includeSub, lastSessionFile) {
+  const { history: HIST, min: MIN_DURATION_MS, max: MAX_DURATION_MS } = querySettings();
   const db = openDb();
   try {
+    db.exec("BEGIN");
+    const schema = inspectSchema(db);
+    if (schema.missing.length) throw new Error(`model_usage 缺少列: ${schema.missing.join(", ")}`);
+    const sampledAt = Date.now();
+    const warnings = [...schema.warnings];
     // 未显式指定会话时,按 resolveAutoSid 回退链识别当前会话(见上)
     let sid = sessionId;
     let scoped = sessionId ? "explicit" : "auto";
@@ -147,25 +125,24 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
       sid = r.sid;
       scoped = r.scoped;
     }
-    const args = [];
+    const args = sid ? [sid] : [];
+    const sessionFilter = sid ? " AND session_id = ?" : " AND 0";
+    if (!sid) warnings.push("无法识别有效会话,未汇总其他会话数据");
     const base =
-      "SELECT turn_id, model_id, output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens," +
-      " cache_creation_input_tokens, first_token_at, completed_at, time_to_first_token_ms, status," +
+      `SELECT ${schema.columns.has("turn_id") ? "NULLIF(turn_id, '')" : "NULL"} turn_id, model_id, output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens,` +
+      ` ${schema.columns.has("cache_creation_input_tokens") ? "cache_creation_input_tokens" : "NULL"} cache_creation_input_tokens, first_token_at, completed_at, time_to_first_token_ms, status,` +
       ` ${DURATION_SQL} dur_ms` +
       " FROM model_usage WHERE status = 'completed' AND query_source = 'main_turn'";
-    if (sid) {
-      args.push(sid);
-    }
     // 主对话优先:无 main_turn 数据时回退为全部请求
     const hasMain = db
-      .prepare(base + (sid ? " AND session_id = ?" : "") + " LIMIT 1")
-      .get(...(sid ? [sid] : []));
+      .prepare(base + sessionFilter + " LIMIT 1")
+      .get(...args);
     const scopeSql = hasMain
-      ? base + " AND session_id = ?"
-      : base.replace(" AND query_source = 'main_turn'", "") + (sid ? " AND session_id = ?" : "");
-    // 曲线历史(大窗口)与统计(小窗口)分别查询,刷新/重开不丢
+      ? base + sessionFilter
+      : base.replace(" AND query_source = 'main_turn'", "") + sessionFilter;
+    // History only limits detail rows; latest/aggregates query the entire retained scope.
     const histRows = db.prepare(scopeSql + " ORDER BY completed_at DESC LIMIT ?").all(...args, HIST);
-    const items = histRows.map((r) => {
+    const mapRequest = (r) => {
       const tok = r.output_tokens ?? 0;
       const reasoning = r.reasoning_tokens ?? 0;
       // first-token 只用于 0.3 旧值与 TTFT;0.4 headline 可统计无流式 token 事件的完成请求。
@@ -177,6 +154,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
       const legacyTokens = tok + reasoning;
       const legacyValid = genMs != null && genMs >= LEGACY_MIN_GEN_MS && genMs < LEGACY_MAX_GEN_MS && legacyTokens > 0;
       return {
+        turnId: r.turn_id,
         model: r.model_id,
         outputTokens: tok,
         reasoningTokens: reasoning,
@@ -190,14 +168,19 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
         legacyTps: legacyValid ? rateTps(legacyTokens, genMs) : null,
         completedAt: r.completed_at,
       };
-    });
+    };
+    const items = histRows.map(mapRequest);
     // 展示用 latest 优先取最近一条新口径有效记录;无 first-token 但总时长有效的完成请求可入选。
-    const latest = (items.find((i) => i.tokPerSec != null)) ?? items[0] ?? null;
+    const latestRow = db.prepare("SELECT * FROM (" + scopeSql + ") WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 ORDER BY completed_at DESC LIMIT 1")
+      .get(...args, MIN_DURATION_MS, MAX_DURATION_MS);
+    const latest = latestRow ? mapRequest(latestRow) : items[0] ?? null;
     // 会话累计 token 用独立 SUM(不受流式有效性限制)
     const sumRow = db
       .prepare(
         "SELECT COUNT(*) n, SUM(output_tokens) o, SUM(reasoning_tokens) r," +
-        " SUM(input_tokens) i, SUM(cache_read_input_tokens) c FROM (" + scopeSql + ")"
+        " SUM(input_tokens) i, SUM(cache_read_input_tokens) c, SUM(cache_creation_input_tokens) cc," +
+        " COUNT(DISTINCT turn_id) turns, SUM(CASE WHEN turn_id IS NULL THEN 1 ELSE 0 END) unknown_turn_requests," +
+        " MIN(completed_at) first_at, MAX(completed_at) last_at FROM (" + scopeSql + ")"
       )
       .get(...args);
     // 会话级请求服务时长加权速率:Σprovider 总输出 ÷ Σ模型请求端到端时长。
@@ -213,17 +196,17 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
     // 独立降级边界:trace 列缺失等情况只影响子代理口径,主对话统计不受影响
     let subAggr = null;
     let subSum = null;
-    if (includeSub && sid) {
+    if (includeSub && sid && schema.columns.has("trace_id")) {
       try {
         // 注意:不能用 base 包裹子查询(base 的列清单不含 trace_id),直接过滤 model_usage
         const traceListSql =
           "SELECT DISTINCT trace_id FROM model_usage" +
           " WHERE status = 'completed' AND query_source = 'main_turn'" +
-          " AND session_id = ? AND trace_id IS NOT NULL";
+          " AND session_id = ? AND " + validIdSql("trace_id");
         const subScopeSql =
           "SELECT output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens," +
           ` ${DURATION_SQL} dur_ms FROM model_usage` +
-          " WHERE status = 'completed' AND query_source = 'subagent' AND trace_id IS NOT NULL" +
+          " WHERE status = 'completed' AND query_source = 'subagent' AND " + validIdSql("trace_id") +
           " AND trace_id IN (" + traceListSql + ")";
         subAggr = db
           .prepare(
@@ -241,7 +224,8 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
       } catch (e) {
         if (isBusyError(e)) throw e; // 忙时交由外层 withBusyRetry 重试,不在此静默吞掉
         subAggr = null;
-        subSum = null; // trace 归因不可用时静默降级
+        subSum = null;
+        warnings.push(`子代理归因失败: ${e.message}`);
       }
     }
     const useSub = !!(includeSub && subSum?.n);
@@ -275,65 +259,63 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
       if (n && dur) session.avgTps = rateTps(tok, dur);
     }
 
-    // ---- 轮次与会话累计:统一以 model_usage 为单一数据源(按 turn_id 分组) ----
-    // 不再读取 turn_usage:实测跨重启恢复的会话,ZCode 不再写入 turn_usage 行(其余会话正常),
-    // 依赖它会让"上轮/会话 tok/缓存"冻结在旧数据(实测滞后 2.9 天)。turn_usage 本就是
-    // model_usage 的按轮求和(数值恒等),故以 model_usage 为单一数据源,永远新鲜。
-    // 上一轮 = 最新一组:钩子触发于消息发送瞬间,当前轮尚未产生请求,最新组即上一轮;
-    // 队列补发消息的场景下可能是进行中轮的部分累计,如实展示。
-    const turnRows = withBusyRetry(() =>
-      db.prepare(
-        "SELECT turn_id, COUNT(*) requests, SUM(input_tokens) i, SUM(output_tokens) o," +
-        " SUM(reasoning_tokens) r, SUM(cache_read_input_tokens) cr," +
-        " SUM(cache_creation_input_tokens) cc, MAX(completed_at) completed_at" +
-        " FROM (" + scopeSql + ") GROUP BY turn_id ORDER BY MAX(completed_at) DESC"
-      ).all(...args));
-    const validRows = withBusyRetry(() =>
-      db.prepare(
-        "SELECT turn_id, SUM(output_tokens) vtok, SUM(dur_ms) vdur FROM (" + scopeSql + ")" +
-        " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 GROUP BY turn_id"
-      ).all(...args, MIN_DURATION_MS, MAX_DURATION_MS));
-    const validByTurn = new Map(validRows.map((v) => [v.turn_id ?? "", v]));
-    const sumOf = (key) => turnRows.reduce((s, r) => s + (r[key] ?? 0), 0);
-
-    // 最新组若无任何 token(全 error 轮等)则顺延到下一组,避免"上轮"空段
-    const g = turnRows.find((t) => (t.i ?? 0) + (t.o ?? 0) + (t.r ?? 0) > 0) ?? turnRows[0] ?? null;
-    const gv = g ? validByTurn.get(g.turn_id ?? "") : null;
+    // Only aggregate the latest observed turn. NULL IDs carry no reliable grouping information.
+    // A completed request does not prove that its containing turn has finished.
+    const latestTurnId = histRows[0]?.turn_id;
+    const validSql = "dur_ms >= ? AND dur_ms < ? AND output_tokens > 0";
+    const g = latestTurnId == null ? null : db.prepare(
+      "SELECT COUNT(*) requests, SUM(input_tokens) i, SUM(output_tokens) o," +
+      " SUM(reasoning_tokens) r, SUM(cache_read_input_tokens) cr, SUM(cache_creation_input_tokens) cc," +
+      " MAX(completed_at) completed_at," +
+      ` SUM(CASE WHEN ${validSql} THEN output_tokens ELSE 0 END) vtok,` +
+      ` SUM(CASE WHEN ${validSql} THEN dur_ms ELSE 0 END) vdur` +
+      " FROM (" + scopeSql + ") WHERE turn_id = ?"
+    ).get(MIN_DURATION_MS, MAX_DURATION_MS, MIN_DURATION_MS, MAX_DURATION_MS, ...args, latestTurnId);
     let turn = null;
     if (g) {
       turn = {
-        turnId: g.turn_id,
+        turnId: latestTurnId,
+        completion: "unknown",
         input: g.i ?? 0,
         output: g.o ?? 0,
         reasoning: g.r ?? 0,
         cacheRead: g.cr ?? 0,
-        cacheCreation: g.cc ?? 0,
-        total: (g.i ?? 0) + (g.o ?? 0) + (g.r ?? 0),
-        durationMs: gv?.vdur ?? 0,
+        cacheCreation: schema.columns.has("cache_creation_input_tokens") ? g.cc ?? 0 : null,
+        total: (g.i ?? 0) + (g.o ?? 0),
+        durationMs: g.vdur ?? 0,
         requests: g.requests ?? 0,
         completedAt: g.completed_at,
-        avgTps: gv?.vdur ? rateTps(gv.vtok, gv.vdur) : null,
+        avgTps: g.vdur ? rateTps(g.vtok, g.vdur) : null,
         cacheHit: g.i ? Math.round(((g.cr ?? 0) / g.i) * 1000) / 10 : null,
       };
     }
 
-    const usage = turnRows.length
+    const usage = sumRow.n
       ? {
-          scope: "main_turn",
-          turns: turnRows.length,
-          input: sumOf("i"),
-          output: sumOf("o"),
-          reasoning: sumOf("r"),
-          cacheRead: sumOf("cr"),
-          cacheCreation: sumOf("cc"),
-          total: sumOf("i") + sumOf("o") + sumOf("r"),
+          scope: hasMain ? "main_turn" : "session_all",
+          turns: sumRow.unknown_turn_requests ? null : sumRow.turns,
+          knownTurns: sumRow.turns,
+          unknownTurnRequests: sumRow.unknown_turn_requests ?? 0,
+          input: sumRow.i ?? 0,
+          output: sumRow.o ?? 0,
+          reasoning: sumRow.r ?? 0,
+          cacheRead: sumRow.c ?? 0,
+          cacheCreation: schema.columns.has("cache_creation_input_tokens") ? sumRow.cc ?? 0 : null,
+          total: (sumRow.i ?? 0) + (sumRow.o ?? 0),
         }
       : null;
     const cacheHit = usage && usage.input
       ? Math.round((usage.cacheRead / usage.input) * 1000) / 10
       : null;
 
-    return { sessionId: sid, scoped, latest, session, turn, usage, cacheHit, history: items };
+    if (sumRow.unknown_turn_requests) warnings.push(`${sumRow.unknown_turn_requests} 条请求缺少 turn_id,轮次数未知`);
+    session.scope = !sid ? "unknown" : useSub ? "main_turn+subagent" : hasMain ? "main_turn" : "session_all";
+    session.total = session.totalInput + session.totalOutput;
+    session.cacheHit = session.totalInput ? Math.round(session.totalCacheRead / session.totalInput * 1000) / 10 : null;
+    const coverage = { retainedOnly: true, status: "completed", scope: usage?.scope ?? session.scope,
+      firstCompletedAt: sumRow.first_at ?? null, lastCompletedAt: sumRow.last_at ?? null };
+    db.exec("COMMIT");
+    return { sessionId: sid, scoped, sampledAt, coverage, warnings, latest, session, turn, usage, cacheHit, history: items };
   } finally {
     db.close();
   }
@@ -369,7 +351,7 @@ function resolveRateFields(v) {
 
 function formatLine(r, fields) {
   const l = r.latest;
-  if (!l) return "暂无已完成的模型请求";
+  if (!l) return r.sessionId == null ? "会话未知,暂无可归属的统计" : "暂无已完成的模型请求";
   const t = new Date(l.completedAt).toLocaleTimeString("zh-CN", { hour12: false });
   const list = resolveRateFields(fields);
   const parts = [];
@@ -378,7 +360,7 @@ function formatLine(r, fields) {
       // 请求端到端速率:请求级(最近一次) / 轮次级与会话级(全部有效请求的服务时长加权值)
       const rates = [];
       if (l.tokPerSec != null) rates.push(`最近 ${l.tokPerSec}`);
-      if (r.turn?.avgTps != null) rates.push(`上轮均 ${r.turn.avgTps}`);
+      if (r.turn?.avgTps != null) rates.push(`最近轮均 ${r.turn.avgTps}`);
       if (r.session?.avgTps != null) rates.push(`会话均 ${r.session.avgTps}`);
       parts.push(`⚡ ${rates.length ? rates.join(" · ") : "-"} tok/s`);
     } else if (id === "ttft") {
@@ -388,7 +370,7 @@ function formatLine(r, fields) {
         parts.push(`首字 ${(l.ttftMs / 1000).toFixed(1)}s${ctx}`);
       }
     } else if (id === "turn") {
-      if (r.turn) parts.push(`上轮 读 ${fmtK(r.turn.input)}(出 ${fmtK(r.turn.output)})`);
+      if (r.turn) parts.push(`最近轮 读 ${fmtK(r.turn.input)}(出 ${fmtK(r.turn.output)})`);
     } else if (id === "session") {
       if (r.usage) {
         // S2:会话均已并入子代理时,会话 tok 仍是主对话口径,须标注避免误导
@@ -413,15 +395,10 @@ function formatLine(r, fields) {
 if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
   const json = process.argv.includes("--json");
   const sid = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || null;
-  const cfg = (() => {
-    try {
-      return JSON.parse(fs.readFileSync(path.join(os.homedir(), ".zcode", "zcode-tps.config.json"), "utf8"));
-    } catch {
-      return {};
-    }
-  })();
+  let cfg;
   const r = (() => {
     try {
+      cfg = readConfig();
       return { ok: true, value: query(sid, { includeSubagents: parseBool(cfg.includeSubagents, true) }) };
     } catch (e) {
       return { ok: false, error: e?.message ?? String(e) };
@@ -448,15 +425,17 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
       }
       if (q.turn) {
         const t = q.turn;
-        console.log(`上一轮(已完成):输入 ${fmtK(t.input)} + 输出 ${fmtK(t.output)} = ${fmtK(t.total)} tok · ${t.requests} 次请求 / ${(t.durationMs / 1000).toFixed(1)}s · 缓存命中 ${t.cacheHit ?? "-"}%`);
+        console.log(`最近轮次(已完成请求,整轮状态未知):输入 ${fmtK(t.input)} + 输出 ${fmtK(t.output)} = ${fmtK(t.total)} tok · ${t.requests} 次请求 / 有效请求服务时长 ${(t.durationMs / 1000).toFixed(1)}s · 缓存命中 ${t.cacheHit ?? "-"}%`);
       }
       if (q.usage) {
-        const scopeNote = q.session?.includesSubagents ? ",主对话口径" : "";
-        console.log(`会话用量(已完成轮${scopeNote}):${q.usage.turns} 轮 · 总计 ${fmtK(q.usage.total)} tok(输入 ${fmtK(q.usage.input)} / 输出 ${fmtK(q.usage.output)}${q.usage.reasoning ? ` / 思考 ${fmtK(q.usage.reasoning)}` : ""}) · 缓存命中率 ${q.cacheHit ?? "-"}%`);
+        const scopeNote = q.usage.scope === "main_turn" ? "主对话" : "当前会话全部请求来源";
+        console.log(`会话用量(库内留存的已完成请求,${scopeNote}):${q.usage.turns == null ? "轮次数未知" : q.usage.turns + " 个已观察轮次"} · 总计 ${fmtK(q.usage.total)} tok(输入 ${fmtK(q.usage.input)} / 输出 ${fmtK(q.usage.output)}${q.usage.reasoning ? ` / 其中思考 ${fmtK(q.usage.reasoning)}` : ""}) · 缓存命中率 ${q.cacheHit ?? "-"}%`);
       }
       if (q.session.subagent) {
         console.log(`子代理归因:并入 ${q.session.subagent.requests} 次请求 / 输出 ${fmtK(q.session.subagent.output)} tok(子代理均 ${q.session.subagent.avgTps ?? "-"} tok/s) · 配置 includeSubagents:false 可切回纯主对话口径`);
       }
+      console.log(`采样时间:${new Date(q.sampledAt).toISOString()}`);
+      for (const warning of q.warnings) console.log(`⚠️ ${warning}`);
     }
   }
 }

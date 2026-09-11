@@ -1,0 +1,13 @@
+{
+  "name": "zcode-tps",
+  "version": "0.4.2",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^22.13.0 || >=23.4.0"
+  },
+  "scripts": {
+    "test": "node --test test/degrade.test.mjs test/doctor.test.mjs test/release.test.mjs",
+    "benchmark": "node test/benchmark.mjs"
+  }
+}

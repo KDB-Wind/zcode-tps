@@ -1,5 +1,5 @@
 // 最小回归测试:验证 usage 库结构异常时的降级行为与查询口径。
-// 运行:node test/degrade.test.mjs(需要 Node >= 22.5,零第三方依赖)
+// 运行:node test/degrade.test.mjs(需要 Node >= 22.13,零第三方依赖)
 
 import assert from "node:assert";
 import { execFileSync } from "node:child_process";
@@ -7,15 +7,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-tps-test-"));
 const SCRIPT = path.join(
-  path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")),
+  path.dirname(fileURLToPath(import.meta.url)),
   "..", "plugins", "zcode-tps", "scripts", "token-rate.mjs"
 );
 const HOOK = path.join(path.dirname(SCRIPT), "..", "hooks", "prompt-submit.mjs");
 const SID = "sess_test";
+process.env.ZCODE_TPS_CONFIG = path.join(tmp, "config.json");
+process.env.ZCODE_TPS_LAST_SESSION = path.join(tmp, "last-session.json");
+process.env.ZCODE_TPS_HEALTH = path.join(tmp, "health.json");
 
 function createModelUsage(db) {
   db.exec(`CREATE TABLE model_usage (
@@ -29,7 +32,7 @@ function createModelUsage(db) {
 function insertRequest(db, {
   t0, out = 100, reasoning = 0, ttft = 200, gen = 1000, durMs,
   startedAt, firstAt, completedAt, input = 1000, cacheRead = 900,
-  turnId = null, qs = "main_turn", sess = SID, status = "completed", trace = null,
+  turnId = "turn_default", qs = "main_turn", sess = SID, status = "completed", trace = null,
 }) {
   const start = startedAt !== undefined ? startedAt : t0;
   const first = firstAt !== undefined
@@ -72,7 +75,7 @@ async function loadWith(dbPath) {
 
   const { query, formatLine } = await loadWith(dbPath);
   const r = query(SID);
-  assert.equal(r.turn.requests, 3, "三条请求同组(NULL turn_id)聚合为一轮");
+  assert.equal(r.turn.requests, 3, "三条请求拥有同一明确 turn_id,聚合为一轮");
   assert.equal(r.turn.total, 3230, "total = Σ(input+output) = 3000+230");
   assert.equal(r.usage.turns, 1);
   assert.equal(r.usage.total, 3230);
@@ -296,7 +299,7 @@ async function loadWith(dbPath) {
   const r = query(SID);
   assert.equal(r.session.includesSubagents, true);
   assert.equal(r.session.samples, 2, "samples 应与 avgTps 口径一致(含子代理有效请求)");
-  assert.equal(r.usage.scope, "main_turn", "turn_usage 无子代理归因,恒为主对话口径");
+  assert.equal(r.usage.scope, "main_turn", "存在 main_turn 时 usage 为主对话口径");
   const line = formatLine(r);
   assert.ok(line.includes("tok(主)"), "并入子代理时会话 tok 须标注主对话口径");
   assert.ok(line.includes("缓存") && line.includes("%(主)"), "并入子代理时缓存命中率须标注主对话口径");
@@ -418,14 +421,14 @@ async function loadWith(dbPath) {
   const r = query(SID);
   const def = formatLine(r);
   assert.ok(def.includes("⚡") && def.includes("会话 900 tok") && def.includes("缓存 87.5%"));
-  assert.ok(!def.includes("首字") && !def.includes("上轮 读") && !def.includes("⏱") && !def.includes("ctx"));
+  assert.ok(!def.includes("首字") && !def.includes("最近轮 读") && !def.includes("⏱") && !def.includes("ctx"));
 
   const custom = formatLine(r, ["time", "rates"]);
   assert.ok(custom.startsWith("⏱"), "应尊重自定义顺序");
   assert.ok(custom.includes("⚡") && !custom.includes("会话 "), "未选字段不应出现(注意速率组内的会话均不算)");
 
   const all = formatLine(r, "all");
-  for (const s of ["⚡", "首字", "上轮 读", "会话 900 tok", "缓存 87.5%", "⏱"]) {
+  for (const s of ["⚡", "首字", "最近轮 读", "会话 900 tok", "缓存 87.5%", "⏱"]) {
     assert.ok(all.includes(s), `"all" 应含 ${s}`);
   }
   // 无数据的字段被跳过至空时回落默认名单,行恒非空
@@ -433,7 +436,7 @@ async function loadWith(dbPath) {
   assert.ok(empty.includes("⚡"), "所选字段无数据时应回落默认渲染");
 }
 
-// ---- 用例 19:turn_id 为 NULL 的轮次仍可聚合轮均(O6,IS 而非 =) ----
+// ---- 用例 19:turn_id 为 NULL 时不推测轮次;会话累计仍可用 ----
 {
   const dbPath = path.join(tmp, "null-turn.sqlite");
   const db = new DatabaseSync(dbPath);
@@ -449,8 +452,10 @@ async function loadWith(dbPath) {
 
   const { query } = await loadWith(dbPath);
   const r = query(SID);
-  assert.ok(r.turn, "turn 行应正常返回");
-  assert.equal(r.turn.avgTps, 100, "NULL turn_id 应用 IS 匹配同轮未打标请求(= NULL 永不命中)");
+  assert.equal(r.turn, null, "NULL turn_id 不能证明轮次关系");
+  assert.equal(r.usage.turns, null);
+  assert.equal(r.usage.total, 1100);
+  assert.equal(r.session.avgTps, 100);
 }
 
 // ---- 用例 20:Responses output 已含 reasoning;headline 不得重复加,history 保留 0.3 旧值 ----
