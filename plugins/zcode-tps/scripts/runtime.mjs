@@ -69,6 +69,65 @@ export function querySettings(env = process.env) {
   return { history, min, max };
 }
 
+// 时区显示:数据库时间戳无时区语义,UTC 字符串只是 toISOString() 的格式化选择。
+// 默认 Asia/Shanghai;配置可设 "UTC"、"system"(跟随系统)或任意 IANA 时区名。
+export const DEFAULT_TIMEZONE = "Asia/Shanghai";
+
+function isValidZone(zone) {
+  try { new Intl.DateTimeFormat("en-US", { timeZone: zone }); return true; }
+  catch { return false; }
+}
+
+// 无效配置回退默认并推入 warnings(调用方提供数组时),时间显示永不因配置失败。
+export function resolveTimezone(value, warnings = null) {
+  const raw = typeof value === "string" ? value.trim() : "";
+  let candidate = raw || DEFAULT_TIMEZONE;
+  if (candidate.toLowerCase() === "system") {
+    let sys;
+    try { sys = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch {}
+    candidate = sys && isValidZone(sys) ? sys : DEFAULT_TIMEZONE;
+  }
+  if (!isValidZone(candidate)) {
+    if (Array.isArray(warnings)) warnings.push(`timezone 配置无效:${raw},已回退 ${DEFAULT_TIMEZONE}`);
+    candidate = DEFAULT_TIMEZONE;
+  }
+  return isValidZone(candidate) ? candidate : "UTC";
+}
+
+const zoneFormatterCache = new Map();
+function zoneFormatter(tz, withDate) {
+  const key = `${tz}|${withDate ? "d" : "t"}`;
+  let f = zoneFormatterCache.get(key);
+  if (!f) {
+    f = new Intl.DateTimeFormat("en-GB", { timeZone: tz, hour12: false,
+      ...(withDate ? { year: "numeric", month: "2-digit", day: "2-digit" } : {}),
+      hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    zoneFormatterCache.set(key, f);
+  }
+  return f;
+}
+
+// 毫秒时间戳 → 配置时区的 "YYYY-MM-DD HH:mm:ss";withDate=false 仅 "HH:mm:ss"。非有限时间返回 null。
+export function formatInZone(ms, tz, withDate = true) {
+  if (!Number.isFinite(ms)) return null;
+  const zone = resolveTimezone(tz);
+  const parts = {};
+  for (const p of zoneFormatter(zone, withDate).formatToParts(new Date(ms))) parts[p.type] = p.value;
+  const time = `${parts.hour}:${parts.minute}:${parts.second}`;
+  return withDate ? `${parts.year}-${parts.month}-${parts.day} ${time}` : time;
+}
+
+// 时区相对 UTC 的偏移标签,如 "UTC+8"、"UTC+5:30";零偏移为 "UTC"。
+export function zoneOffsetLabel(tz, ms = Date.now()) {
+  const zone = resolveTimezone(tz);
+  try {
+    const f = new Intl.DateTimeFormat("en-US", { timeZone: zone, timeZoneName: "shortOffset" });
+    const name = f.formatToParts(new Date(ms)).find((p) => p.type === "timeZoneName")?.value ?? "";
+    const label = name === "GMT" ? "UTC" : name.replace(/^GMT/, "UTC");
+    return label === "UTC+0" ? "UTC" : label;
+  } catch { return "UTC"; }
+}
+
 export function writeState(file, value) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;

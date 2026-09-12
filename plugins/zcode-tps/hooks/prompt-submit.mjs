@@ -32,10 +32,11 @@ try {
   } else {
     // includeSubagents 默认开启(缺省视为 true):trace 归因把主会话派生的子代理请求并入会话统计
     // rateLineFields 自定义速率行字段(默认 rates/session/cache 三段,"all"=全部六段)
+    // timezone 显示时区(默认 Asia/Shanghai,可设 "UTC"/"system"/IANA 名,环境变量 ZCODE_TPS_TIMEZONE 优先)
     const { query, formatLine, resolveRateFields } = await import("../scripts/token-rate.mjs");
     const fields = resolveRateFields(cfg.rateLineFields);
-    const result = query(sid || null, { includeSubagents: parseBool(cfg.includeSubagents, true) });
-    const sampleHint = `\n[zcode-tps 采样时间:${new Date(result.sampledAt).toISOString()};统计仅覆盖库内留存的已完成请求,最近轮次可能未结束。]`;
+    const result = query(sid || null, { includeSubagents: parseBool(cfg.includeSubagents, true), timezone: cfg.timezone });
+    const sampleHint = `\n[zcode-tps 采样时间:${result.sampledAtText ?? new Date(result.sampledAt).toISOString()}(${result.timezone ?? "UTC"} ${result.utcOffset ?? "UTC"});统计仅覆盖库内留存的已完成请求,最近轮次可能未结束。]`;
     const context = formatLine(result, fields) + sampleHint + QUOTE_HINT;
     complete({ status: "ok", resolvedSessionId: result.sessionId,
       lastSuccessAt: Date.now(), sampledAt: result.sampledAt, error: null, warnings: result.warnings });

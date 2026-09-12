@@ -1,5 +1,13 @@
 # 更新记录
 
+## 0.4.3
+
+### 改进
+
+- 时间显示默认改为 Asia/Shanghai（此前为 UTC 的 `toISOString()` 或依赖系统时区的短时间）；可在配置 `timezone` 设为 `"UTC"`、`"system"` 或任意 IANA 时区名，环境变量 `ZCODE_TPS_TIMEZONE` 优先，无效值回退默认并在 `warnings` 提示。
+- JSON 新增 `timezone`、`utcOffset` 与预格式化 `*Text` 时间字段（`sampledAtText`、`coverage`/`latest`/`turn`/`history` 的 `completedAtText`）；`/tps` 报表直接引用，不再由模型把毫秒时间戳换算成 UTC。
+- 速率行 `time` 段含日期（会话跨零点时纯 `HH:mm:ss` 有歧义）；注入采样提示与 doctor 的最后成功时间同样按配置时区显示。
+
 ## 0.4.2
 
 ### 修复

@@ -305,6 +305,56 @@ try {
     assert.notEqual(healthFile("../window-a"), healthFile("window-a"));
     assert.equal(path.dirname(healthFile("../window-a")), tmp, "session IDs cannot escape the health directory");
   });
+  await fixture("timezone-display", async ({ insert, load }) => {
+    insert({ time: 1000 });
+    const runtimeHref = pathToFileURL(path.join(root, "plugins/zcode-tps/scripts/runtime.mjs")).href;
+    const { formatInZone, resolveTimezone, zoneOffsetLabel } = await import(runtimeHref);
+    // 纯函数:同一毫秒时间戳在不同时区的预格式化字符串(ICU 时区名大小写不敏感)
+    assert.equal(formatInZone(0), "1970-01-01 08:00:00");
+    assert.equal(formatInZone(0, "UTC"), "1970-01-01 00:00:00");
+    assert.equal(formatInZone(0, "utc", false), "00:00:00");
+    assert.equal(formatInZone("not-a-number"), null);
+    assert.equal(zoneOffsetLabel("Asia/Shanghai"), "UTC+8");
+    assert.equal(zoneOffsetLabel("UTC"), "UTC");
+    assert.ok(/^[A-Za-z][\w+-]*\/[\w+-]+$|^[A-Za-z]+$/.test(resolveTimezone("system")), "system 解析为合法时区");
+    const warns = [];
+    assert.equal(resolveTimezone("Mars/Olympus", warns), "Asia/Shanghai");
+    assert.ok(warns.some(w => /timezone 配置无效/.test(w)));
+    const { query } = await load();
+    const runChild = (relative, envExtra = {}, scriptArgs = []) => spawnSync(process.execPath,
+      [path.join(root, "plugins/zcode-tps", relative), ...scriptArgs], {
+        env: { ...process.env, ZCODE_SESSION_ID: "s", ...envExtra }, encoding: "utf8", timeout: 10000 });
+    // 进程内:timezone 选项透传(配置→query 的接线由下方 CLI/hook 子进程覆盖)
+    const r = query("s", { timezone: "UTC" });
+    assert.equal(r.timezone, "UTC");
+    assert.equal(r.utcOffset, "UTC");
+    assert.match(r.sampledAtText, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
+    assert.equal(r.sampledAtText, formatInZone(r.sampledAt, "UTC"));
+    assert.equal(r.latest.completedAtText, "1970-01-01 00:00:01");
+    assert.equal(r.history[0].completedAtText, r.latest.completedAtText);
+    assert.equal(r.turn.completedAtText, r.latest.completedAtText);
+    assert.equal(r.coverage.lastCompletedAtText, r.latest.completedAtText);
+    // 无效选项回退默认并进入 warnings
+    const bad = query("s", { timezone: "Mars/Olympus" });
+    assert.equal(bad.timezone, "Asia/Shanghai");
+    assert.ok(bad.warnings.some(w => /timezone 配置无效/.test(w)));
+    // CLI 读取配置文件;环境变量优先于配置(配置为无效值)
+    fs.writeFileSync(process.env.ZCODE_TPS_CONFIG, '{"timezone":"UTC"}');
+    const cli = JSON.parse(runChild("scripts/token-rate.mjs", {}, ["--json"]).stdout);
+    assert.equal(cli.timezone, "UTC");
+    assert.equal(cli.sampledAtText, formatInZone(cli.sampledAt, "UTC"));
+    fs.writeFileSync(process.env.ZCODE_TPS_CONFIG, '{"timezone":"Mars/Olympus"}');
+    const cliEnv = JSON.parse(runChild("scripts/token-rate.mjs", { ZCODE_TPS_TIMEZONE: "UTC" }, ["--json"]).stdout);
+    assert.equal(cliEnv.timezone, "UTC");
+    // hook 注入提示按配置时区显示(无效配置回退默认),不再是 ISO Z 字符串
+    const child = runChild("hooks/prompt-submit.mjs");
+    assert.equal(child.status, 0);
+    const ctx = JSON.parse(child.stdout).hookSpecificOutput.additionalContext;
+    assert.match(ctx, /\[zcode-tps 采样时间:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\(Asia\/Shanghai UTC\+8\);/);
+    assert.doesNotMatch(ctx, /采样时间:\d{4}-\d{2}-\d{2}T/);
+    count += 1;
+    console.log("timezone-display 用例通过");
+  });
   assert.deepEqual(querySettings({}), { history: 60, min: 500, max: 3600000 });
   for (const value of ["-1", "0", "1.5", "Infinity", "1001", "garbage", ""]) {
     assert.throws(() => querySettings({ TOKEN_RATE_HIST: value }), /TOKEN_RATE_HIST/);
@@ -320,7 +370,7 @@ try {
     JSON.parse(fs.readFileSync(path.join(root, "marketplace.json"))).plugins[0].version,
     JSON.parse(fs.readFileSync(path.join(root, "plugins/zcode-tps/.zcode-plugin/plugin.json"))).version,
   ];
-  assert.deepEqual(versions, ["0.4.2", "0.4.2", "0.4.2"]);
+  assert.deepEqual(versions, ["0.4.3", "0.4.3", "0.4.3"]);
   console.log(`release ${count} 个用例通过`);
 } finally {
   for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];

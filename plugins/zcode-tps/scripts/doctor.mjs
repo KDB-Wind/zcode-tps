@@ -8,7 +8,13 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { inspectSchema, parseBool as parseBoolLoose, readConfig, querySettings, stateFile, healthFile, supportsNode, validId, parseJson } from "./runtime.mjs";
+import { inspectSchema, parseBool as parseBoolLoose, readConfig, querySettings, stateFile, healthFile, supportsNode, validId, parseJson, resolveTimezone, formatInZone } from "./runtime.mjs";
+
+// 显示时区:配置优先,配置不可读时回退默认;与速率行/报表共用一套配置
+function displayTimezone() {
+  try { return resolveTimezone(process.env.ZCODE_TPS_TIMEZONE ?? readConfig().timezone); }
+  catch { return resolveTimezone(process.env.ZCODE_TPS_TIMEZONE); }
+}
 
 const HOME = os.homedir();
 const DB_PATH =
@@ -187,9 +193,10 @@ function healthCheck() {
       }
       status = !alive || Date.now() - h.startedAt >= 8000 ? "采集中断或超时(未记录完成)" : "采集中(尚未完成)";
     }
+    const zone = displayTimezone();
     return { name: "最近采集", level: "warn", ok,
       sessionId: h.sessionId ?? null, runId: h.runId ?? null, status: h.status,
-      detail: `会话 ${h.sessionId ?? "未知"};${status};耗时 ${h.durationMs ?? "未知"}ms;最后成功 ${h.lastSuccessAt ? new Date(h.lastSuccessAt).toISOString() : "无记录"}${h.error ? ";" + h.error : ""}${h.warnings?.length ? ";" + h.warnings.join(";") : ""}`,
+      detail: `会话 ${h.sessionId ?? "未知"};${status};耗时 ${h.durationMs ?? "未知"}ms;最后成功 ${h.lastSuccessAt ? `${formatInZone(h.lastSuccessAt, zone)} (${zone})` : "无记录"}${h.error ? ";" + h.error : ""}${h.warnings?.length ? ";" + h.warnings.join(";") : ""}`,
       hint: fresh ? "这是最近一次 hook 的结果,并非当前会话注册状态的证明" : "记录过期或时间异常,发送新消息后重试" };
   } catch {
     return { name: "最近采集", level: "warn", ok: false, sessionId,

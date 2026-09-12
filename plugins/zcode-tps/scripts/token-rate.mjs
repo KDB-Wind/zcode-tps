@@ -17,7 +17,7 @@ catch (e) { sqliteError = e; }
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { inspectSchema, parseBool, querySettings, readConfig, validId, validIdSql, parseJson } from "./runtime.mjs";
+import { inspectSchema, parseBool, querySettings, readConfig, validId, validIdSql, parseJson, resolveTimezone, formatInZone, zoneOffsetLabel } from "./runtime.mjs";
 
 // 跨平台默认路径(macOS/Linux: ~/.zcode/...;Windows: %USERPROFILE%\.zcode\...),可用 ZCODE_USAGE_DB 覆盖
 const DB_PATH =
@@ -100,15 +100,17 @@ function query(sessionId, opts = {}) {
   if (sessionId != null && !validId(sessionId)) throw new Error("显式会话 sessionId 必须为非空字符串");
   // includeSubagents:把主会话派生的子代理(subagent)请求并入会话级统计,默认开启。
   // 归因键为 trace_id(主回复与其全部子代理共享同一 trace;parent/turn 字段经验证不指向主会话)。
+  // timezone:显示时区配置(默认 Asia/Shanghai,可设 "UTC"/"system"/IANA 名),环境变量 ZCODE_TPS_TIMEZONE 优先。
   const includeSub = parseBool(opts.includeSubagents, true);
+  const timezoneOption = process.env.ZCODE_TPS_TIMEZONE ?? opts.timezone;
   const lastSessionFile =
     opts.lastSessionFile ||
     process.env.ZCODE_TPS_LAST_SESSION ||
     path.join(os.homedir(), ".zcode", "zcode-tps.last-session.json");
-  return withBusyRetry(() => queryOnce(sessionId, includeSub, lastSessionFile));
+  return withBusyRetry(() => queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption));
 }
 
-function queryOnce(sessionId, includeSub, lastSessionFile) {
+function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
   const { history: HIST, min: MIN_DURATION_MS, max: MAX_DURATION_MS } = querySettings();
   const db = openDb();
   try {
@@ -117,6 +119,9 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
     if (schema.missing.length) throw new Error(`model_usage 缺少列: ${schema.missing.join(", ")}`);
     const sampledAt = Date.now();
     const warnings = [...schema.warnings];
+    const timezone = resolveTimezone(timezoneOption, warnings);
+    const utcOffset = zoneOffsetLabel(timezone, sampledAt);
+    const inZone = (ms) => formatInZone(ms, timezone);
     // 未显式指定会话时,按 resolveAutoSid 回退链识别当前会话(见上)
     let sid = sessionId;
     let scoped = sessionId ? "explicit" : "auto";
@@ -170,10 +175,13 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
       };
     };
     const items = histRows.map(mapRequest);
+    // 预格式化时间字段(*Text):/tps 报表直接引用,避免模型自行把时间戳换算成 UTC
+    for (const it of items) it.completedAtText = inZone(it.completedAt);
     // 展示用 latest 优先取最近一条新口径有效记录;无 first-token 但总时长有效的完成请求可入选。
     const latestRow = db.prepare("SELECT * FROM (" + scopeSql + ") WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 ORDER BY completed_at DESC LIMIT 1")
       .get(...args, MIN_DURATION_MS, MAX_DURATION_MS);
     const latest = latestRow ? mapRequest(latestRow) : items[0] ?? null;
+    if (latest && latest.completedAtText == null) latest.completedAtText = inZone(latest.completedAt);
     // 会话累计 token 用独立 SUM(不受流式有效性限制)
     const sumRow = db
       .prepare(
@@ -288,6 +296,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
         avgTps: g.vdur ? rateTps(g.vtok, g.vdur) : null,
         cacheHit: g.i ? Math.round(((g.cr ?? 0) / g.i) * 1000) / 10 : null,
       };
+      turn.completedAtText = inZone(turn.completedAt);
     }
 
     const usage = sumRow.n
@@ -313,9 +322,11 @@ function queryOnce(sessionId, includeSub, lastSessionFile) {
     session.total = session.totalInput + session.totalOutput;
     session.cacheHit = session.totalInput ? Math.round(session.totalCacheRead / session.totalInput * 1000) / 10 : null;
     const coverage = { retainedOnly: true, status: "completed", scope: usage?.scope ?? session.scope,
-      firstCompletedAt: sumRow.first_at ?? null, lastCompletedAt: sumRow.last_at ?? null };
+      firstCompletedAt: sumRow.first_at ?? null, lastCompletedAt: sumRow.last_at ?? null,
+      firstCompletedAtText: inZone(sumRow.first_at), lastCompletedAtText: inZone(sumRow.last_at) };
     db.exec("COMMIT");
-    return { sessionId: sid, scoped, sampledAt, coverage, warnings, latest, session, turn, usage, cacheHit, history: items };
+    return { sessionId: sid, scoped, sampledAt, sampledAtText: inZone(sampledAt),
+      timezone, utcOffset, coverage, warnings, latest, session, turn, usage, cacheHit, history: items };
   } finally {
     db.close();
   }
@@ -352,7 +363,8 @@ function resolveRateFields(v) {
 function formatLine(r, fields) {
   const l = r.latest;
   if (!l) return r.sessionId == null ? "会话未知,暂无可归属的统计" : "暂无已完成的模型请求";
-  const t = new Date(l.completedAt).toLocaleTimeString("zh-CN", { hour12: false });
+  // 含日期:会话跨零点时纯 HH:mm:ss 有歧义;时区跟随查询配置,不依赖系统设置
+  const t = l.completedAtText ?? formatInZone(l.completedAt, r.timezone);
   const list = resolveRateFields(fields);
   const parts = [];
   for (const id of list) {
@@ -399,7 +411,7 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
   const r = (() => {
     try {
       cfg = readConfig();
-      return { ok: true, value: query(sid, { includeSubagents: parseBool(cfg.includeSubagents, true) }) };
+      return { ok: true, value: query(sid, { includeSubagents: parseBool(cfg.includeSubagents, true), timezone: cfg.timezone }) };
     } catch (e) {
       return { ok: false, error: e?.message ?? String(e) };
     }
@@ -434,7 +446,8 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
       if (q.session.subagent) {
         console.log(`子代理归因:并入 ${q.session.subagent.requests} 次请求 / 输出 ${fmtK(q.session.subagent.output)} tok(子代理均 ${q.session.subagent.avgTps ?? "-"} tok/s) · 配置 includeSubagents:false 可切回纯主对话口径`);
       }
-      console.log(`采样时间:${new Date(q.sampledAt).toISOString()}`);
+      const zone = q.timezone ?? resolveTimezone(cfg.timezone);
+      console.log(`采样时间:${q.sampledAtText ?? formatInZone(q.sampledAt, zone)}(${zone} ${q.utcOffset ?? zoneOffsetLabel(zone, q.sampledAt)})`);
       for (const warning of q.warnings) console.log(`⚠️ ${warning}`);
     }
   }

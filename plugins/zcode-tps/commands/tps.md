@@ -37,14 +37,16 @@ node "$tps_script" --json
 
 先检查 JSON 的 `error` 字段，有错误则展示原因和 `db` 路径，不渲染虚构指标。成功时整理为中文报表：
 
-1. **采样与范围**：展示 `sampledAt`、会话 ID 和识别来源 `scoped`。数据仅覆盖库内留存的 completed 请求；这是脚本执行时的快照，可能包括当前轮已完成请求。`coverage` 的完成时间范围对应基础请求范围。
-2. **最近请求**：取 `history` 前 10 条，按返回顺序展示时间、模型、`tokPerSec`、TTFT、输出（其中 reasoning）与 `durMs`。`latest` 为独立查询的最近有效请求，可能不在 history 内；应标注其完成时间。`legacyTps` 只在用户明确要求与 0.3 对比时展示，并说明旧公式存在重复计数，不代表物理爆发速度。
-3. **最近轮次**：`turn=null` 时显示“轮次未知”，不推测轮均；否则展示输入、输出、其中思考、总量、缓存读、缓存写入、请求数和有效请求服务时长。`completion=unknown` 表示整轮是否结束未知，不标成“已完成轮”。
+1. **采样与范围**：展示 `sampledAtText`（连同 `timezone` 和 `utcOffset`）、会话 ID 和识别来源 `scoped`。数据仅覆盖库内留存的 completed 请求；这是脚本执行时的快照，可能包括当前轮已完成请求。`coverage` 的完成时间范围对应基础请求范围（`firstCompletedAtText`/`lastCompletedAtText`）。
+2. **最近请求**：取 `history` 前 10 条，按返回顺序展示时间、模型、`tokPerSec`、TTFT、输出（其中 reasoning）与 `durMs`。时间一律直接引用各行预格式化的 `completedAtText`，不要用毫秒时间戳自行换算成 UTC。`latest` 为独立查询的最近有效请求，可能不在 history 内；应标注其完成时间（`latest.completedAtText`）。`legacyTps` 只在用户明确要求与 0.3 对比时展示，并说明旧公式存在重复计数，不代表物理爆发速度。
+3. **最近轮次**：`turn=null` 时显示“轮次未知”，不推测轮均；否则展示输入、输出、其中思考、总量、缓存读、缓存写入、请求数和有效请求服务时长（完成时间用 `turn.completedAtText`）。`completion=unknown` 表示整轮是否结束未知，不标成“已完成轮”。
 4. **基础范围累计**：按 `usage.scope` 标注主对话（main_turn）或当前会话全部请求来源（session_all）。总量 = 输入 + 输出；reasoning 已含在输出中。`usage.turns=null` 时显示未知，可附 `knownTurns` 和 `unknownTurnRequests`；已知轮数也不是已完成轮数。缓存命中率取 `cacheHit`。缺失值显示“未知”，不能补成 0。
 5. **会话合计与子代理**：按 `session.scope` 展示请求数、有效样本数、总输入、总输出、总量 `session.total`、均速与 `session.cacheHit`。有 `session.subagent` 时另列子代理累计和均速；无有效速率样本时均速可为空，但用量仍存在。不要把 usage 的主对话总量冒充含子代理合计。
 6. **降级信息**：展示 `warnings` 中的原因。若无请求，直接说明暂无数据。
 
 速率为 provider 总输出 ÷ 单次请求端到端时长，reasoning 不再相加。`durMs=duration_ms ?? (completed_at-started_at)`。有效样本要求 output>0、时长位于 `[TOKEN_RATE_MIN_MS,TOKEN_RATE_MAX_MS)`，默认 500ms/1h。最近轮均和会话均为 `Σoutput÷Σduration`，并发请求时长相加；不包含请求间工具执行，不是整轮墙钟吞吐。零输出或无效时长 completed 请求仍计入用量。
+
+时间显示：JSON 中所有毫秒时间戳仅是机器可读值，报表一律使用随结果返回的预格式化 `*Text` 字段（已按 `timezone` 换算，默认 Asia/Shanghai，附 `utcOffset`），不要自行换算成 UTC。需要 UTC 对照时说明可在配置 `timezone` 设为 `"UTC"`（也支持 `"system"` 与任意 IANA 时区名；环境变量 `ZCODE_TPS_TIMEZONE` 优先）。
 
 `includeSubagents` 默认开启，可在配置文件中关闭。默认简洁行 token/缓存对应 usage 范围，含子代理会话均与它范围不同。不要把输入 token（含缓存）直接解释成实际计费。
 

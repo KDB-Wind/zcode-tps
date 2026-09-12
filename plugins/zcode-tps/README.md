@@ -1,4 +1,4 @@
-# zcode-tps 0.4.2
+# zcode-tps 0.4.3
 
 从 `~/.zcode/cli/db/db.sqlite` 的 `model_usage` 只读计算速率、用量和缓存命中率。无需额外模型调用；自动行由模型根据 hook 上下文引用展示。
 
@@ -29,7 +29,8 @@
 {
   "tokenRateLine": true,
   "includeSubagents": true,
-  "rateLineFields": ["rates", "ttft", "turn", "session", "cache", "time"]
+  "rateLineFields": ["rates", "ttft", "turn", "session", "cache", "time"],
+  "timezone": "Asia/Shanghai"
 }
 ```
 
@@ -40,9 +41,11 @@
 | `turn` | 最近可识别轮次的输入、输出 |
 | `session` | `usage.total`，库内留存范围内累计 |
 | `cache` | `usage` 范围内的缓存命中率 |
-| `time` | 最近有效请求完成时间；查询采样时间另见 `sampledAt` |
+| `time` | 最近有效请求完成时间（按 `timezone` 显示日期+时间）；查询采样时间另见 `sampledAt` |
 
 `rateLineFields` 缺省为 `["rates", "session", "cache"]`；`"all"` 展开全部六段。未知字段忽略，空名单或所选字段均无数据时回落默认显示。布尔选项兼容 `"false"`、`"off"` 等字符串。
+
+`timezone` 控制所有时间显示（速率行 `time` 段、采样提示、`/tps` 报表、doctor），默认 `Asia/Shanghai`；可设 `"UTC"`、`"system"`（跟随系统时区）或任意 IANA 时区名（如 `America/New_York`）。无效值回退默认并在 `warnings` 提示。环境变量 `ZCODE_TPS_TIMEZONE` 优先于配置文件。数据库中的时间戳无时区语义，只是显示层的选择。
 
 关闭自动行后，SessionStart 和 UserPromptSubmit 不再注入显示指令。后续未提供新行时，指令要求模型不要沿用旧数字；实际展示仍取决于模型执行。
 
@@ -64,6 +67,8 @@
 | 字段 | 契约 |
 |---|---|
 | `sampledAt` | 本次 SQLite 读快照建立后的时间，毫秒时间戳 |
+| `timezone` / `utcOffset` | 时间显示时区（默认 Asia/Shanghai）及其 UTC 偏移，如 `UTC+8` |
+| `*Text` 字段 | `sampledAtText`、`coverage`/`latest`/`turn`/`history` 行内的 `completedAtText` 等，按 `timezone` 预格式化的 `YYYY-MM-DD HH:mm:ss`；报表应直接引用而非自行换算 |
 | `coverage` | `retainedOnly=true`、completed 请求、基础统计范围及其最早/最晚完成时间 |
 | `warnings` | 缺可选列、未知轮次和子代理归因降级原因 |
 | `history` | 基础统计范围内最近请求，倒序，默认最多 60 条 |
