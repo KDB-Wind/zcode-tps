@@ -1,5 +1,20 @@
 # 更新记录
 
+## 0.5.2
+
+### 修复
+
+- 会话级 Decode(主对话与子代理)与请求级、分布统计统一最小解码窗口 200ms:`decodeSamples` 与 `decodeStats.samples` 现在同一有效性定义下计数,1–199ms 的极短窗口不再进入会话 Decode。
+- `decodeStats` 分位数改为 nearest-rank 定义(`index = ceil(p×n)−1`):小样本不再偏低,3 个样本的 p90 为最大值;README 与报表说明同步。
+- 根 README 的版本与示例、插件 README 标题、manifest 描述、hook 注释与 0.5.x 实际行为漂移,全部修正;新增发布一致性测试(README 版本/示例、hook 注释与 `DEFAULT_RATE_FIELDS` 对应)。
+
+### 改进
+
+- 速率行 Decode 段改名为 `Decode 会话均`,明示其为整个留存会话的加权值,不与"最近轮均"的时间范围混淆。
+- "与官方 Decode 直接对比"的表述统一弱化为:近似纯生成口径,可用于同环境趋势观察;不同服务、模型、请求长度与官方测速结果不保证等价。
+- 新增 `auxiliary`(JSON/CLI/`/tps` 报表):本会话非 `main_turn`/`subagent` 的已完成辅助请求按来源分组(标题类/系统类/未分类),不计入主统计;未识别来源进入 `warnings`,以发现 ZCode 升级带来的来源变化(适配 ZCode 3.11.2 的 `session_title`、`goal_summary_title`、`compact`、`target_completion_verification`)。
+- 评估文档入库:`docs/ZCODE-3.11.2-COMPATIBILITY-AND-REPAIR-PLAN.md`。
+
 ## 0.5.1
 
 ### 改进

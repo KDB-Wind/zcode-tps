@@ -377,12 +377,12 @@ try {
     assert.equal(r.session.decodeTps, 177.3);
     assert.equal(r.session.decodeSamples, 3);
     assert.equal(r.session.samples, 4, "e2e 有效样本仍含 ttft 缺失行");
-    // 速率行:decode 段默认出现,只显示会话加权(单请求波动大不上行)
-    assert.ok(formatLine(r).includes("Decode 177.3 tok/s"));
-    assert.equal(formatLine(r, ["decode"]), "Decode 177.3 tok/s");
+    // 速率行:decode 段默认出现,只显示会话加权并明示范围(单请求波动大不上行)
+    assert.ok(formatLine(r).includes("Decode 会话均 177.3 tok/s"));
+    assert.equal(formatLine(r, ["decode"]), "Decode 会话均 177.3 tok/s");
     assert.ok(!formatLine(r).includes("Decode 最近"), "请求级 decode 不进紧凑行");
-    // 请求级 Decode 分布(基础范围,不含子代理;窗口>=200ms):有序 [100, 181.8, 500]
-    assert.deepEqual(r.decodeStats, { samples: 3, mean: 260.6, median: 181.8, p90: 181.8 });
+    // 请求级 Decode 分布(基础范围,不含子代理;窗口>=200ms):有序 [100, 181.8, 500],nearest-rank p90=ceil(2.7)=第3个
+    assert.deepEqual(r.decodeStats, { samples: 3, mean: 260.6, median: 181.8, p90: 500 });
     // 子代理 decode 并入会话口径
     insert({ out: 100, source: "subagent", sid: "child", trace: "trace1", time: 7000 });
     assert.equal(query("s").decodeStats.samples, 3, "分布统计不含子代理");
@@ -399,6 +399,62 @@ try {
     count += 1;
     console.log("decode-speed 用例通过");
   });
+  await fixture("decode-window-boundary", async ({ insert, load }) => {
+    // 三条 e2e 均有效,但解码窗口跨 200ms 边界;另有 199ms 子代理
+    insert({ out: 40, dur: 1200, ttft: 1000, time: 1000 });   // dec 200 → 参与(恰好达下限)
+    insert({ out: 500, dur: 1199, ttft: 1000, time: 2000 });  // dec 199 → 不参与任何 Decode
+    insert({ out: 100, dur: 1001, ttft: 1000, time: 3000 });  // dec 1 → 不参与
+    insert({ out: 900, source: "subagent", sid: "child", trace: "trace1", dur: 1199, ttft: 1000, time: 4000 }); // 子代理 dec 199
+    const { query } = await load();
+    const r = query("s");
+    assert.deepEqual(r.history.map(h => h.decodeTps), [null, null, 200], "history 倒序,窗口恰好 200ms 的最新有效行参与");
+    assert.equal(r.session.decodeSamples, 1, "主/子代理会话 Decode 均要求窗口>=200ms");
+    assert.equal(r.session.decodeTps, 200);
+    assert.equal(r.session.samples, 4, "e2e 有效样本不受解码窗口影响");
+    assert.equal(r.session.subagent.avgTps, 750.6, "子代理端到端均速不受解码窗口影响;其 decode 样本数为 0 已并入会话 decodeSamples");
+    assert.equal(r.decodeStats.samples, 1);
+    assert.equal(r.decodeStats.mean, 200);
+    assert.equal(r.auxiliary.requests, 0, "无辅助来源时 auxiliary 为空组且无告警");
+    assert.ok(!r.warnings.some(w => /未识别的请求来源/.test(w)));
+    count += 1;
+    console.log("decode-window-boundary 用例通过");
+  });
+  await fixture("decode-quantiles", async ({ insert, load }) => {
+    // v = out(dec 窗口 1000ms);两个会话覆盖 nearest-rank 的 1/2/10 样本定义
+    insert({ out: 100, sid: "q2", dur: 1100, ttft: 100, time: 1000 });
+    insert({ out: 200, sid: "q2", dur: 1100, ttft: 100, time: 2000 });
+    for (let i = 0; i < 10; i++) insert({ out: 100 * (i + 1), sid: "q10", dur: 1100, ttft: 100, time: 100000 + i * 1000 });
+    const { query } = await load();
+    const r2 = query("q2");
+    assert.deepEqual(r2.decodeStats, { samples: 2, mean: 150, median: 100, p90: 200 }, "nearest-rank: n=2 时 median 取第1个,p90 取第2个");
+    const r10 = query("q10");
+    assert.deepEqual(r10.decodeStats, { samples: 10, mean: 550, median: 500, p90: 900 }, "n=10: median=ceil(5)=第5个,p90=ceil(9)=第9个");
+    count += 1;
+    console.log("decode-quantiles 用例通过");
+  });
+  await fixture("auxiliary-sources", async ({ db, insert, load }) => {
+    insert(); // 主对话 100 tok
+    const raw = (turn, src, out, input) => db.prepare("INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      turn, "s", "completed", src, "m", out, 0, input, 0, 0, "tr-aux", 0, 100, 1000, 1000, 100);
+    raw("ta1", "compact", 50, 1000);
+    raw("ta2", "compact", 50, 1000);
+    raw("tb1", "session_title", 30, 500);
+    raw("tc1", "brand_new_source", 20, 300);
+    const { query } = await load();
+    const r = query("s");
+    assert.equal(r.usage.total, 1100, "主统计不含辅助来源");
+    assert.equal(r.session.requests, 1);
+    assert.deepEqual(r.auxiliary.requests, 4);
+    assert.deepEqual(r.auxiliary.output, 150);
+    assert.deepEqual(r.auxiliary.total, 2950); // input 2800 + output 150
+    const bySource = Object.fromEntries(r.auxiliary.groups.map(g => [g.source, g]));
+    assert.deepEqual(bySource.compact, { source: "compact", class: "system", requests: 2, input: 2000, output: 100, total: 2100 });
+    assert.equal(bySource.session_title.class, "title");
+    assert.equal(bySource.brand_new_source.class, "unknown");
+    assert.ok(r.warnings.some(w => /未识别的请求来源\(brand_new_source\)/.test(w)), "未知来源应告警");
+    count += 1;
+    console.log("auxiliary-sources 用例通过");
+  });
   assert.deepEqual(querySettings({}), { history: 60, min: 500, max: 3600000 });
   for (const value of ["-1", "0", "1.5", "Infinity", "1001", "garbage", ""]) {
     assert.throws(() => querySettings({ TOKEN_RATE_HIST: value }), /TOKEN_RATE_HIST/);
@@ -414,7 +470,18 @@ try {
     JSON.parse(fs.readFileSync(path.join(root, "marketplace.json"))).plugins[0].version,
     JSON.parse(fs.readFileSync(path.join(root, "plugins/zcode-tps/.zcode-plugin/plugin.json"))).version,
   ];
-  assert.deepEqual(versions, ["0.5.1", "0.5.1", "0.5.1"]);
+  assert.deepEqual(versions, ["0.5.2", "0.5.2", "0.5.2"]);
+  // 发布一致性:README 版本与示例、hook 注释与字段常量对应,防止再次漂移
+  const pkgVersion = versions[0];
+  const { DEFAULT_RATE_FIELDS } = await import(pathToFileURL(path.join(root, "plugins/zcode-tps/scripts/token-rate.mjs")).href + "?drift");
+  const pluginReadme = fs.readFileSync(path.join(root, "plugins/zcode-tps/README.md"), "utf8");
+  assert.ok(pluginReadme.startsWith(`# zcode-tps ${pkgVersion}`), "插件 README 标题版本应与机器版本一致");
+  const rootReadme = fs.readFileSync(path.join(root, "README.md"), "utf8");
+  assert.ok(rootReadme.includes(`当前版本 **${pkgVersion}**`), "根 README 版本应与机器版本一致");
+  const defaultFields = DEFAULT_RATE_FIELDS.join("/");
+  assert.ok(rootReadme.includes(`最近轮均`) && rootReadme.includes(`Decode 会话均`), "根 README 示例应反映默认行内容");
+  const hookSrc = fs.readFileSync(path.join(root, "plugins/zcode-tps/hooks/prompt-submit.mjs"), "utf8");
+  assert.ok(hookSrc.includes(`默认 ${defaultFields} ${DEFAULT_RATE_FIELDS.length}段`), "hook 注释的字段名单/数量应与 DEFAULT_RATE_FIELDS 一致");
   console.log(`release ${count} 个用例通过`);
 } finally {
   for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];

@@ -31,7 +31,7 @@ try {
     emit("");
   } else {
     // includeSubagents 默认开启(缺省视为 true):trace 归因把主会话派生的子代理请求并入会话统计
-    // rateLineFields 自定义速率行字段(默认 rates/session/cache 三段,"all"=全部六段)
+    // rateLineFields 自定义速率行字段(默认 rates/decode/session/cache 4段,"all"=全部7段)
     // timezone 显示时区(默认 Asia/Shanghai,可设 "UTC"/"system"/IANA 名,环境变量 ZCODE_TPS_TIMEZONE 优先)
     const { query, formatLine, resolveRateFields } = await import("../scripts/token-rate.mjs");
     const fields = resolveRateFields(cfg.rateLineFields);

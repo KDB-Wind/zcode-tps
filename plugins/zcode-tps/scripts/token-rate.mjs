@@ -207,27 +207,63 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
         " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0"
       )
       .get(...args, MIN_DURATION_MS, MAX_DURATION_MS);
-    // Decode(纯生成)会话聚合:与 e2e 有效样本同一请求集,分母剔除首字等待;dec_ms > 0 同时排除无法回退 TTFT 的行
+    // Decode(纯生成)会话聚合:与 e2e 有效样本同一请求集,分母剔除首字等待;与请求级/分布统计共用同一
+    // 最小解码窗口 DECODE_MIN_MS(dec_ms >= 200),保证"Decode 有效样本"在全插件只有一个定义。
     const decodeRow = db
       .prepare(
         "SELECT COUNT(*) n, SUM(output_tokens) tok, SUM(dec_ms) dec FROM (" + scopeSql + ")" +
-        " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 AND dec_ms > 0"
+        ` WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 AND dec_ms >= ${DECODE_MIN_MS}`
       )
       .get(...args, MIN_DURATION_MS, MAX_DURATION_MS);
-    // 请求级 Decode 分布(基础范围,不含子代理;解码窗口 ≥ DECODE_MIN_MS,与请求级 decodeTps 同一有效性):
-    // 均值/中位/p90 全部在 SQL 内完成,不把整段历史载入 JS;有限样本取 floor 索引的有序值(近似分位)。
+    // 请求级 Decode 分布(基础范围,不含子代理;解码窗口 ≥ DECODE_MIN_MS,与请求级/会话级 Decode 同一有效性):
+    // 均值/中位/p90 全部在 SQL 内完成,不把整段历史载入 JS;分位数为 nearest-rank 定义:index = ceil(p×n)-1。
     const DECODE_V_SQL =
       "SELECT output_tokens * 1000.0 / dec_ms v FROM (" + scopeSql + ")" +
-      " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 AND dec_ms >= " + DECODE_MIN_MS;
+      ` WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 AND dec_ms >= ${DECODE_MIN_MS}`;
     const dcRow = db
       .prepare("SELECT COUNT(*) n, AVG(v) mean FROM (" + DECODE_V_SQL + ")")
       .get(...args, MIN_DURATION_MS, MAX_DURATION_MS);
     let decodeStats = null;
     if (dcRow.n) {
       const pick = (frac) => Math.round(db.prepare(DECODE_V_SQL + " ORDER BY v LIMIT 1 OFFSET ?")
-        .get(...args, MIN_DURATION_MS, MAX_DURATION_MS, Math.floor(frac * (dcRow.n - 1))).v * 10) / 10;
+        .get(...args, MIN_DURATION_MS, MAX_DURATION_MS, Math.ceil(frac * dcRow.n) - 1).v * 10) / 10;
       decodeStats = { samples: dcRow.n,
         mean: Math.round(dcRow.mean * 10) / 10, median: pick(0.5), p90: pick(0.9) };
+    }
+
+    // 辅助/内部请求(ZCode 3.11.2+ 的标题生成、压缩、目标完成验证等):completed 但非 main_turn/subagent。
+    // 不进入主统计与速率;按来源分组暴露,未识别来源推入 warnings,以便 ZCode 升级新增来源时主动可见。
+    const AUX_CLASS = {
+      session_title: "title", goal_summary_title: "title",
+      compact: "system", target_completion_verification: "system",
+    };
+    let auxiliary = null;
+    if (sid) {
+      const auxRows = db
+        .prepare(
+          "SELECT query_source src, COUNT(*) n, SUM(input_tokens) i, SUM(output_tokens) o FROM model_usage" +
+          " WHERE status = 'completed' AND " + validIdSql("query_source") + sessionFilter +
+          " AND query_source <> 'main_turn' AND query_source <> 'subagent'" +
+          " GROUP BY query_source ORDER BY n DESC, src"
+        )
+        .all(...args);
+      const groups = auxRows.map((r) => ({
+        source: r.src,
+        class: AUX_CLASS[r.src] ?? "unknown",
+        requests: r.n ?? 0,
+        input: r.i ?? 0,
+        output: r.o ?? 0,
+        total: (r.i ?? 0) + (r.o ?? 0),
+      }));
+      auxiliary = {
+        requests: groups.reduce((s, g) => s + g.requests, 0),
+        input: groups.reduce((s, g) => s + g.input, 0),
+        output: groups.reduce((s, g) => s + g.output, 0),
+        groups,
+      };
+      auxiliary.total = auxiliary.input + auxiliary.output;
+      const unknownSrc = groups.filter((g) => g.class === "unknown").map((g) => g.source);
+      if (unknownSrc.length) warnings.push(`未识别的请求来源(${unknownSrc.join(", ")}),已单列 auxiliary,未计入主统计`);
     }
 
     // ---- 子代理归因:trace_id 与主会话 main_turn 请求相同的 subagent 请求 ----
@@ -256,7 +292,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
         subDecodeRow = db
           .prepare(
             "SELECT COUNT(*) n, SUM(output_tokens) tok, SUM(dec_ms) dec FROM (" + subScopeSql + ")" +
-            " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 AND dec_ms > 0"
+            ` WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 AND dec_ms >= ${DECODE_MIN_MS}`
           )
           .get(sid, MIN_DURATION_MS, MAX_DURATION_MS);
         // 累计与有效速率样本解耦:即使全部子请求 output=0/时长无效,请求与 token 仍归因。
@@ -371,7 +407,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
       firstCompletedAtText: inZone(sumRow.first_at), lastCompletedAtText: inZone(sumRow.last_at) };
     db.exec("COMMIT");
     return { sessionId: sid, scoped, sampledAt, sampledAtText: inZone(sampledAt),
-      timezone, utcOffset, coverage, warnings, latest, session, turn, usage, cacheHit, decodeStats, history: items };
+      timezone, utcOffset, coverage, warnings, latest, session, turn, usage, cacheHit, decodeStats, auxiliary, history: items };
   } finally {
     db.close();
   }
@@ -422,9 +458,9 @@ function formatLine(r, fields) {
         : ["最近轮均", null];
       parts.push(`⚡ ${label} ${v ?? "-"} tok/s`);
     } else if (id === "decode") {
-      // Decode 速度:会话加权纯生成速率(剔除首字等待),与智谱官方"高峰期平均 Decode 速度"同口径。
-      // 单请求波动大不上行;请求级速度保留在 JSON decodeTps、CLI 明细与 /tps 报表
-      if (r.session?.decodeTps != null) parts.push(`Decode ${r.session.decodeTps} tok/s`);
+      // Decode 速度:会话加权纯生成速率(剔除首字等待),近似官方 Decode 口径。
+      // "会话均"明示统计范围(整个留存会话,非最近轮),单请求波动大不上行;请求级见 JSON/报表
+      if (r.session?.decodeTps != null) parts.push(`Decode 会话均 ${r.session.decodeTps} tok/s`);
     } else if (id === "ttft") {
       if (l.ttftMs != null) {
         // 附上最后请求的上下文规模:首字延迟与它强相关,帮助区分"模型慢"和"上下文大"
@@ -493,10 +529,12 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
         const scopeNote = q.usage.scope === "main_turn" ? "主对话" : "当前会话全部请求来源";
         console.log(`会话用量(库内留存的已完成请求,${scopeNote}):${q.usage.turns == null ? "轮次数未知" : q.usage.turns + " 个已观察轮次"} · 总计 ${fmtK(q.usage.total)} tok(输入 ${fmtK(q.usage.input)} / 输出 ${fmtK(q.usage.output)}${q.usage.reasoning ? ` / 其中思考 ${fmtK(q.usage.reasoning)}` : ""}) · 缓存命中率 ${q.cacheHit ?? "-"}%`);
       }
-      if (q.session) {
-        // Decode 与官方"高峰期平均 Decode 速度"同口径:剔除首字等待,排队/预填充不计入分母
-        const smp = q.session.samples || 0;
-        console.log(`Decode 速度(纯生成,剔除首字等待):最近 ${q.latest?.decodeTps ?? "-"} · 会话加权 ${q.session.decodeTps ?? "-"} tok/s(有效样本 ${q.session.decodeSamples ?? 0}/${smp},TTFT 缺失且无法回退的请求不参与)`);
+      if (q.session.decodeSamples != null && q.session.samples != null) {
+        // Decode 与官方"高峰期平均 Decode 速度"同思路:剔除首字等待;窗口下限与会话/请求级一致(200ms)
+        console.log(`Decode 速度(纯生成,剔除首字等待):会话加权 ${q.session.decodeTps ?? "-"} tok/s(有效样本 ${q.session.decodeSamples ?? 0}/${q.session.samples},解码窗口 ≥200ms,TTFT 缺失且无法回退的请求不参与)`);
+      }
+      if (q.auxiliary && q.auxiliary.requests) {
+        console.log(`辅助请求(不计入主统计与速率):${q.auxiliary.requests} 次 / 输出 ${fmtK(q.auxiliary.output)} tok(${q.auxiliary.groups.map((g) => `${g.source}×${g.requests}`).join(" · ")})`);
       }
       if (q.session.subagent) {
         console.log(`子代理归因:并入 ${q.session.subagent.requests} 次请求 / 输出 ${fmtK(q.session.subagent.output)} tok(子代理均 ${q.session.subagent.avgTps ?? "-"} tok/s) · 配置 includeSubagents:false 可切回纯主对话口径`);

@@ -1,4 +1,4 @@
-# zcode-tps 0.5.0
+# zcode-tps 0.5.2
 
 从 `~/.zcode/cli/db/db.sqlite` 的 `model_usage` 只读计算速率、用量和缓存命中率。无需额外模型调用；自动行由模型根据 hook 上下文引用展示。
 
@@ -20,9 +20,9 @@
 默认显示四个字段：
 
 ```text
-> ⚡ 最近轮均 43.1 · Decode 62.4 tok/s · 会话 29.13M tok · 缓存 97.3%
+> ⚡ 最近轮均 43.1 tok/s · Decode 会话均 62.4 tok/s · 会话 29.13M tok · 缓存 97.3%
 
-四个数各答一个问题:最近轮均=现在的端到端体感速度;Decode=本会话纯生成平均(与智谱官方"高峰期平均 Decode 速度"同口径);会话=留存范围累计 token;缓存=命中率。请求级与会话级端到端速度不在紧凑行中,见 `/tps` 报表与 JSON。
+四个数各答一个问题:最近轮均=现在的端到端体感速度;Decode 会话均=整个留存会话的纯生成加权平均;会话=留存范围累计 token;缓存=命中率。请求级与会话级端到端速度不在紧凑行中,见 `/tps` 报表与 JSON。
 ```
 
 配置文件：`~/.zcode/zcode-tps.config.json`。配置在每次 hook 或命令执行时读取，不需要为配置变化重启。
@@ -39,7 +39,7 @@
 | 字段 | 内容 |
 |---|---|
 | `rates` | 最近一轮的端到端速度(无轮次数据时降级为 会话均→最近请求,标签跟随来源) |
-| `decode` | 会话加权 Decode 速度:纯生成速率(剔除首字等待),与智谱官方"高峰期平均 Decode 速度"同口径;请求级值见 JSON `decodeTps` 与 `/tps` 报表 |
+| `decode` | `Decode 会话均`:整个留存会话的纯生成加权速度(剔除首字等待);请求级分布见 JSON `decodeStats` 与 `/tps` 报表 |
 | `ttft` | 最近有效请求的 TTFT 与输入上下文规模 |
 | `turn` | 最近可识别轮次的输入、输出 |
 | `session` | `usage.total`，库内留存范围内累计 |
@@ -61,7 +61,7 @@
 - 最近轮均、会话均为 `Σoutput / Σduration`。请求内等待计入；请求间工具执行和编排间隙不计入。并发子代理的请求时长相加，不代表整轮墙钟吞吐。
 - 总量始终为输入 + 输出；reasoning 是输出明细，不再相加。零输出或时长无效的 completed 请求仍计入用量和请求数。
 - 缓存命中率 = 缓存读 / 输入；输入已含缓存读，缓存创建不计命中。
-- Decode 速度 = `output / (durMs − TTFT)`，只计纯生成阶段，排队与预填充不计入分母，因此高于端到端速率且可与智谱官方"高峰期平均 Decode 速度"直接对比。TTFT 取 `time_to_first_token_ms`，缺失时回退 `first_token_at − started_at`；两者皆缺的请求不参与 Decode（仍计入端到端与用量）。请求级解码窗口须 ≥200ms；会话 Decode 为同批有效样本的 `Σoutput / Σ(durMs − TTFT)` 加权值。
+- Decode 速度 = `output / (durMs − TTFT)`，只计纯生成阶段，排队与预填充不计入分母，因此高于端到端速率。口径近似智谱官方"高峰期平均 Decode 速度"（同为纯生成思路），但计时边界、请求构成与平均方法不同，可用于同环境趋势观察，不保证与官方数字等价。TTFT 取 `time_to_first_token_ms`，缺失时回退 `first_token_at − started_at`；两者皆缺的请求不参与 Decode（仍计入端到端与用量）。解码窗口 ≥200ms 的要求对请求级、分布与会话级（含子代理）统一生效；会话 Decode 为同批有效样本的 `Σoutput / Σ(durMs − TTFT)` 加权值。
 - 不使用 `turn_usage` 计算指标。ZCode 清理旧 `model_usage` 行后累计可能下降，不能当全历史消耗或费用账本。
 
 ## JSON 与时间边界
@@ -80,7 +80,8 @@
 | `turn` | 最新已完成请求所属的可识别轮次；`completion="unknown"`，不能证明整轮完成 |
 | `usage` | 基础范围的输入/输出/总量/缓存/轮次数；reasoning 是其中量 |
 | `session` | 基础范围加可归因子代理的累计与加权速率；`total=input+output`，有独立 `cacheHit` 和 `scope`；`decodeTps`/`decodeSamples` 为会话加权 Decode 及其有效样本数 |
-| `decodeStats` | 请求级 Decode 分布（基础范围，不含子代理）：`mean`/`median`/`p90`（tok/s）与 `samples`；解码窗口 ≥200ms，分位为 SQL 有序近似 |
+| `decodeStats` | 请求级 Decode 分布（基础范围，不含子代理）：`mean`/`median`/`p90`（tok/s）与 `samples`；解码窗口 ≥200ms，分位为 nearest-rank（`index = ceil(p×n)−1`） |
+| `auxiliary` | 本会话非 `main_turn`/`subagent` 的已完成辅助请求（标题/压缩/验证等），按来源分组并标注 `class`（title/system/unknown）；不计入主统计；未识别来源进入 `warnings` |
 
 基础范围优先为当前会话 `main_turn`，没有 main_turn 时回退当前会话全部请求来源，`usage.scope="session_all"`，不再错误标成主对话。`session.scope` 对应 `main_turn`、`main_turn+subagent` 或 `session_all`。无法识别有效会话时返回空统计、`sessionId=null`、`session.scope="unknown"` 和警告，不会汇总全库。
 
