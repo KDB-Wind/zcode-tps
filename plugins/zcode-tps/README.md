@@ -80,6 +80,7 @@
 | `turn` | 最新已完成请求所属的可识别轮次；`completion="unknown"`，不能证明整轮完成 |
 | `usage` | 基础范围的输入/输出/总量/缓存/轮次数；reasoning 是其中量 |
 | `session` | 基础范围加可归因子代理的累计与加权速率；`total=input+output`，有独立 `cacheHit` 和 `scope`；`decodeTps`/`decodeSamples` 为会话加权 Decode 及其有效样本数 |
+| `decodeStats` | 请求级 Decode 分布（基础范围，不含子代理）：`mean`/`median`/`p90`（tok/s）与 `samples`；解码窗口 ≥200ms，分位为 SQL 有序近似 |
 
 基础范围优先为当前会话 `main_turn`，没有 main_turn 时回退当前会话全部请求来源，`usage.scope="session_all"`，不再错误标成主对话。`session.scope` 对应 `main_turn`、`main_turn+subagent` 或 `session_all`。无法识别有效会话时返回空统计、`sessionId=null`、`session.scope="unknown"` 和警告，不会汇总全库。
 

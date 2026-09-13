@@ -214,6 +214,21 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
         " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 AND dec_ms > 0"
       )
       .get(...args, MIN_DURATION_MS, MAX_DURATION_MS);
+    // 请求级 Decode 分布(基础范围,不含子代理;解码窗口 ≥ DECODE_MIN_MS,与请求级 decodeTps 同一有效性):
+    // 均值/中位/p90 全部在 SQL 内完成,不把整段历史载入 JS;有限样本取 floor 索引的有序值(近似分位)。
+    const DECODE_V_SQL =
+      "SELECT output_tokens * 1000.0 / dec_ms v FROM (" + scopeSql + ")" +
+      " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 AND dec_ms >= " + DECODE_MIN_MS;
+    const dcRow = db
+      .prepare("SELECT COUNT(*) n, AVG(v) mean FROM (" + DECODE_V_SQL + ")")
+      .get(...args, MIN_DURATION_MS, MAX_DURATION_MS);
+    let decodeStats = null;
+    if (dcRow.n) {
+      const pick = (frac) => Math.round(db.prepare(DECODE_V_SQL + " ORDER BY v LIMIT 1 OFFSET ?")
+        .get(...args, MIN_DURATION_MS, MAX_DURATION_MS, Math.floor(frac * (dcRow.n - 1))).v * 10) / 10;
+      decodeStats = { samples: dcRow.n,
+        mean: Math.round(dcRow.mean * 10) / 10, median: pick(0.5), p90: pick(0.9) };
+    }
 
     // ---- 子代理归因:trace_id 与主会话 main_turn 请求相同的 subagent 请求 ----
     // 独立降级边界:trace 列缺失等情况只影响子代理口径,主对话统计不受影响
@@ -356,7 +371,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
       firstCompletedAtText: inZone(sumRow.first_at), lastCompletedAtText: inZone(sumRow.last_at) };
     db.exec("COMMIT");
     return { sessionId: sid, scoped, sampledAt, sampledAtText: inZone(sampledAt),
-      timezone, utcOffset, coverage, warnings, latest, session, turn, usage, cacheHit, history: items };
+      timezone, utcOffset, coverage, warnings, latest, session, turn, usage, cacheHit, decodeStats, history: items };
   } finally {
     db.close();
   }

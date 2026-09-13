@@ -381,14 +381,18 @@ try {
     assert.ok(formatLine(r).includes("Decode 177.3 tok/s"));
     assert.equal(formatLine(r, ["decode"]), "Decode 177.3 tok/s");
     assert.ok(!formatLine(r).includes("Decode 最近"), "请求级 decode 不进紧凑行");
+    // 请求级 Decode 分布(基础范围,不含子代理;窗口>=200ms):有序 [100, 181.8, 500]
+    assert.deepEqual(r.decodeStats, { samples: 3, mean: 260.6, median: 181.8, p90: 181.8 });
     // 子代理 decode 并入会话口径
     insert({ out: 100, source: "subagent", sid: "child", trace: "trace1", time: 7000 });
+    assert.equal(query("s").decodeStats.samples, 3, "分布统计不含子代理");
     const withSub = query("s");
     assert.equal(withSub.session.decodeTps, 158.1);  // (390+100)/(2.2+0.9)
     assert.equal(withSub.session.decodeSamples, 4);
     // 全部请求 ttft 缺失时 decode 段整体消失,行回落其他段
     db.exec("UPDATE model_usage SET time_to_first_token_ms = NULL, first_token_at = NULL");
     const none = query("s");
+    assert.equal(none.decodeStats, null);
     assert.equal(none.session.decodeTps, null);
     assert.ok(!formatLine(none, ["decode"]).includes("Decode"));
     assert.ok(formatLine(none).includes("⚡"), "decode 无数据时默认行仍渲染其余段");
@@ -410,7 +414,7 @@ try {
     JSON.parse(fs.readFileSync(path.join(root, "marketplace.json"))).plugins[0].version,
     JSON.parse(fs.readFileSync(path.join(root, "plugins/zcode-tps/.zcode-plugin/plugin.json"))).version,
   ];
-  assert.deepEqual(versions, ["0.5.0", "0.5.0", "0.5.0"]);
+  assert.deepEqual(versions, ["0.5.1", "0.5.1", "0.5.1"]);
   console.log(`release ${count} 个用例通过`);
 } finally {
   for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];
