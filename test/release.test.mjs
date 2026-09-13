@@ -377,9 +377,10 @@ try {
     assert.equal(r.session.decodeTps, 177.3);
     assert.equal(r.session.decodeSamples, 3);
     assert.equal(r.session.samples, 4, "e2e 有效样本仍含 ttft 缺失行");
-    // 速率行:decode 段默认出现
-    assert.ok(formatLine(r).includes("Decode 最近 500 · 会话 177.3 tok/s"));
-    assert.equal(formatLine(r, ["decode"]), "Decode 最近 500 · 会话 177.3 tok/s");
+    // 速率行:decode 段默认出现,只显示会话加权(单请求波动大不上行)
+    assert.ok(formatLine(r).includes("Decode 177.3 tok/s"));
+    assert.equal(formatLine(r, ["decode"]), "Decode 177.3 tok/s");
+    assert.ok(!formatLine(r).includes("Decode 最近"), "请求级 decode 不进紧凑行");
     // 子代理 decode 并入会话口径
     insert({ out: 100, source: "subagent", sid: "child", trace: "trace1", time: 7000 });
     const withSub = query("s");
@@ -409,7 +410,7 @@ try {
     JSON.parse(fs.readFileSync(path.join(root, "marketplace.json"))).plugins[0].version,
     JSON.parse(fs.readFileSync(path.join(root, "plugins/zcode-tps/.zcode-plugin/plugin.json"))).version,
   ];
-  assert.deepEqual(versions, ["0.4.4", "0.4.4", "0.4.4"]);
+  assert.deepEqual(versions, ["0.4.5", "0.4.5", "0.4.5"]);
   console.log(`release ${count} 个用例通过`);
 } finally {
   for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];

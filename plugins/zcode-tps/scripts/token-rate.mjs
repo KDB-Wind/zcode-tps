@@ -406,11 +406,9 @@ function formatLine(r, fields) {
       if (r.session?.avgTps != null) rates.push(`会话均 ${r.session.avgTps}`);
       parts.push(`⚡ ${rates.length ? rates.join(" · ") : "-"} tok/s`);
     } else if (id === "decode") {
-      // Decode 速度:纯生成阶段(剔除首字等待),与智谱官方"高峰期平均 Decode 速度"同口径可比
-      const dec = [];
-      if (l.decodeTps != null) dec.push(`最近 ${l.decodeTps}`);
-      if (r.session?.decodeTps != null) dec.push(`会话 ${r.session.decodeTps}`);
-      if (dec.length) parts.push(`Decode ${dec.join(" · ")} tok/s`);
+      // Decode 速度:会话加权纯生成速率(剔除首字等待),与智谱官方"高峰期平均 Decode 速度"同口径。
+      // 单请求波动大不上行;请求级速度保留在 JSON decodeTps、CLI 明细与 /tps 报表
+      if (r.session?.decodeTps != null) parts.push(`Decode ${r.session.decodeTps} tok/s`);
     } else if (id === "ttft") {
       if (l.ttftMs != null) {
         // 附上最后请求的上下文规模:首字延迟与它强相关,帮助区分"模型慢"和"上下文大"
