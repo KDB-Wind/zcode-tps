@@ -410,7 +410,7 @@ try {
     JSON.parse(fs.readFileSync(path.join(root, "marketplace.json"))).plugins[0].version,
     JSON.parse(fs.readFileSync(path.join(root, "plugins/zcode-tps/.zcode-plugin/plugin.json"))).version,
   ];
-  assert.deepEqual(versions, ["0.4.5", "0.4.5", "0.4.5"]);
+  assert.deepEqual(versions, ["0.5.0", "0.5.0", "0.5.0"]);
   console.log(`release ${count} 个用例通过`);
 } finally {
   for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];

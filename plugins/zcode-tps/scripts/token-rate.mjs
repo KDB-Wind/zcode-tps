@@ -399,12 +399,13 @@ function formatLine(r, fields) {
   const parts = [];
   for (const id of list) {
     if (id === "rates") {
-      // 请求端到端速率:请求级(最近一次) / 轮次级与会话级(全部有效请求的服务时长加权值)
-      const rates = [];
-      if (l.tokPerSec != null) rates.push(`最近 ${l.tokPerSec}`);
-      if (r.turn?.avgTps != null) rates.push(`最近轮均 ${r.turn.avgTps}`);
-      if (r.session?.avgTps != null) rates.push(`会话均 ${r.session.avgTps}`);
-      parts.push(`⚡ ${rates.length ? rates.join(" · ") : "-"} tok/s`);
+      // 端到端速度只显示一个数:最近一轮。请求级波动大、会话均会被拥堵期历史拖偏(长会话失真),
+      // 都移出紧凑行(仍见 JSON 与 /tps 报表);降级链 轮均→会话均→最近请求 保证 ⚡ 恒有值且标签跟源。
+      const [label, v] = r.turn?.avgTps != null ? ["最近轮均", r.turn.avgTps]
+        : r.session?.avgTps != null ? ["会话均", r.session.avgTps]
+        : l.tokPerSec != null ? ["最近", l.tokPerSec]
+        : ["最近轮均", null];
+      parts.push(`⚡ ${label} ${v ?? "-"} tok/s`);
     } else if (id === "decode") {
       // Decode 速度:会话加权纯生成速率(剔除首字等待),与智谱官方"高峰期平均 Decode 速度"同口径。
       // 单请求波动大不上行;请求级速度保留在 JSON decodeTps、CLI 明细与 /tps 报表

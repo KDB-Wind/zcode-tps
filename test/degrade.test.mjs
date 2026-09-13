@@ -477,7 +477,7 @@ async function loadWith(dbPath) {
   assert.equal(r.latest.durMs, 12_760);
   assert.equal(r.latest.genMs, 477);
   assert.equal(r.session.avgTps, 141.6);
-  assert.ok(formatLine(r).includes("最近 141.6"), "formatLine 应透传新 headline 速率");
+  assert.ok(formatLine(r).includes("最近轮均 141.6"), "formatLine 应透传轮级端到端速率(单请求级不在紧凑行)");
 }
 
 // ---- 用例 21:零输出不计速率,但 main/subagent 请求与 token 累计不得消失 ----
