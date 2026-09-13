@@ -164,25 +164,30 @@ async function loadWith(dbPath) {
   assert.equal(r.session.samples, 0);
 }
 
-// ---- 用例 6:会话无 main_turn 请求 → 轮级聚合应继承回退策略 ----
+// ---- 用例 6:会话无 main_turn(仅辅助来源)→ 主统计严格为空,辅助单列,不产出任何速率 ----
 {
-  const dbPath = path.join(tmp, "fallback.sqlite");
+  const dbPath = path.join(tmp, "aux-only.sqlite");
   const db = new DatabaseSync(dbPath);
   createModelUsage(db);
-  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000, turnId: "turn_x", qs: "session_title" });
-  db.exec(`CREATE TABLE turn_usage (turn_id TEXT, session_id TEXT, status TEXT, completed_at INTEGER,
-    input_tokens INTEGER, output_tokens INTEGER, reasoning_tokens INTEGER,
-    cache_creation_input_tokens INTEGER, cache_read_input_tokens INTEGER,
-    computed_total_tokens INTEGER, duration_ms INTEGER, model_request_count INTEGER)`);
-  db.prepare(`INSERT INTO turn_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run("turn_x", SID, "completed", 2_000_000, 100, 100, 0, 0, 0, 200, 1000, 1);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000, turnId: "turn_x", qs: "session_title", input: 950 });
   db.close();
 
-  const { query } = await loadWith(dbPath);
+  const { query, formatLine } = await loadWith(dbPath);
   const r = query(SID);
-  assert.equal(r.latest.tokPerSec, 100, "回退后应统计非 main_turn 请求");
-  assert.equal(r.turn.avgTps, 100, "轮级聚合应继承回退策略(旧实现固定 main_turn 会得到 undefined)");
-  assert.equal(r.session.avgTps, 100, "会话聚合同样走回退");
+  assert.equal(r.latest, null, "辅助来源不得充当 latest");
+  assert.equal(r.turn, null, "无主请求时轮级统计为空");
+  assert.equal(r.usage, null, "主统计严格限定 main_turn,不再回退全部来源");
+  assert.equal(r.session.requests, 0);
+  assert.equal(r.session.avgTps, null, "不得生成虚假会话均");
+  assert.equal(r.session.decodeTps, null, "不得生成虚假 Decode");
+  assert.equal(r.session.decodeSamples, 0);
+  assert.equal(r.history.length, 0);
+  assert.equal(formatLine(r), "暂无已完成的模型请求", "无主请求时不产出速率行");
+  assert.deepEqual(r.auxiliary.groups, [
+    { source: "session_title", class: "title", requests: 1, input: 950, output: 100, total: 1050 },
+  ], "辅助用量仍按来源单列");
+  assert.equal(r.auxiliary.requests, 1);
+  assert.equal(r.auxiliary.total, 1050);
 }
 
 // ---- 用例 7:子代理归因 —— 同 trace 的 subagent 请求并入会话口径(默认开启),异 trace/error 排除 ----

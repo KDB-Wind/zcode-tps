@@ -142,9 +142,11 @@ try {
   });
   await fixture("scope-and-snapshot", async ({ insert, load }) => {
     insert({ source: "other" });
+    insert();
     const { query } = await load();
     const before = Date.now(); const r = query("s");
-    assert.equal(r.usage.scope, "session_all");
+    assert.equal(r.usage.scope, "main_turn", "主统计严格 main_turn,session_all 回退已移除");
+    assert.equal(r.session.requests, 1, "辅助来源不进入主统计");
     assert.ok(r.sampledAt >= before && r.sampledAt <= Date.now());
     assert.equal(r.coverage.retainedOnly, true);
     assert.equal(r.turn.completion, "unknown");
@@ -454,6 +456,26 @@ try {
     assert.ok(r.warnings.some(w => /未识别的请求来源\(brand_new_source\)/.test(w)), "未知来源应告警");
     count += 1;
     console.log("auxiliary-sources 用例通过");
+  });
+  await fixture("auxiliary-only-session", async ({ db, load }) => {
+    // 会话只有 compact 辅助请求:主统计必须为空,不得回退全部来源产出虚假速率
+    db.prepare("INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+      .run("tc1", "s2", "completed", "compact", "m", 50, 0, 1000, 0, 0, "tr-only", 0, 100, 1000, 1000, 100);
+    const { query, formatLine } = await load();
+    const r = query("s2");
+    assert.equal(r.usage, null, "无 main_turn 时主统计为空,不回退全部来源");
+    assert.equal(r.latest, null);
+    assert.equal(r.turn, null);
+    assert.equal(r.session.requests, 0);
+    assert.equal(r.session.avgTps, null, "不得产出虚假会话均(旧回退会得 50)");
+    assert.equal(r.session.decodeTps, null, "不得产出虚假 Decode(旧回退会得 55.6)");
+    assert.equal(formatLine(r), "暂无已完成的模型请求");
+    assert.deepEqual(r.auxiliary.groups, [
+      { source: "compact", class: "system", requests: 1, input: 1000, output: 50, total: 1050 },
+    ]);
+    assert.equal(r.auxiliary.total, 1050);
+    count += 1;
+    console.log("auxiliary-only-session 用例通过");
   });
   assert.deepEqual(querySettings({}), { history: 60, min: 500, max: 3600000 });
   for (const value of ["-1", "0", "1.5", "Infinity", "1001", "garbage", ""]) {

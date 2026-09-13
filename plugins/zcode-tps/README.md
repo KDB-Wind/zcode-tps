@@ -83,7 +83,7 @@
 | `decodeStats` | 请求级 Decode 分布（基础范围，不含子代理）：`mean`/`median`/`p90`（tok/s）与 `samples`；解码窗口 ≥200ms，分位为 nearest-rank（`index = ceil(p×n)−1`） |
 | `auxiliary` | 本会话非 `main_turn`/`subagent` 的已完成辅助请求（标题/压缩/验证等），按来源分组并标注 `class`（title/system/unknown）；不计入主统计；未识别来源进入 `warnings` |
 
-基础范围优先为当前会话 `main_turn`，没有 main_turn 时回退当前会话全部请求来源，`usage.scope="session_all"`，不再错误标成主对话。`session.scope` 对应 `main_turn`、`main_turn+subagent` 或 `session_all`。无法识别有效会话时返回空统计、`sessionId=null`、`session.scope="unknown"` 和警告，不会汇总全库。
+基础范围严格为当前会话 `main_turn`（`usage.scope="main_turn"`），不再于无 main_turn 时回退全部来源。`session.scope` 对应 `main_turn`、`main_turn+subagent` 或 `unknown`。会话没有主请求时主统计为空（`usage`/`turn`/`latest` 为 null、速率为 null），辅助用量仍经 `auxiliary` 单列。无法识别有效会话时返回空统计、`sessionId=null`、`session.scope="unknown"` 和警告，不会汇总全库。
 
 默认将共享主对话 `trace_id` 的 subagent completed 请求并入 `session`；`includeSubagents=false` 可关闭。`session.subagent` 提供子代理累计和均速；没有有效速率样本时累计仍保留。`usage` 不额外并入子代理，简洁行在并入子代理时标注 `tok(主)`、`%(主)`。`coverage` 的时间范围对应基础范围，不包括其他会话的归因子代理。
 

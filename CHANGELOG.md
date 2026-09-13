@@ -6,6 +6,7 @@
 
 - 会话级 Decode(主对话与子代理)与请求级、分布统计统一最小解码窗口 200ms:`decodeSamples` 与 `decodeStats.samples` 现在同一有效性定义下计数,1–199ms 的极短窗口不再进入会话 Decode。
 - `decodeStats` 分位数改为 nearest-rank 定义(`index = ceil(p×n)−1`):小样本不再偏低,3 个样本的 p90 为最大值;README 与报表说明同步。
+- 修复无 main_turn 会话回退全部来源的边界缺陷:辅助请求(compact/标题/验证)曾被同时计入主统计与 `auxiliary`,并产出虚假的最近轮均/Decode 会话均。主统计现严格限定 `main_turn`,会话没有主请求时 `usage`/`turn`/`latest` 为 null、速率为 null,辅助用量仍经 `auxiliary` 单列(`session_all` scope 值随之移除);新增 auxiliary-only 会话回归测试。
 - 根 README 的版本与示例、插件 README 标题、manifest 描述、hook 注释与 0.5.x 实际行为漂移,全部修正;新增发布一致性测试(README 版本/示例、hook 注释与 `DEFAULT_RATE_FIELDS` 对应)。
 
 ### 改进

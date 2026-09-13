@@ -143,13 +143,10 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
       ` ${schema.columns.has("cache_creation_input_tokens") ? "cache_creation_input_tokens" : "NULL"} cache_creation_input_tokens, first_token_at, completed_at, time_to_first_token_ms, status,` +
       ` ${DURATION_SQL} dur_ms, ${DURATION_SQL} - ${DECODE_SQL} dec_ms` +
       " FROM model_usage WHERE status = 'completed' AND query_source = 'main_turn'";
-    // 主对话优先:无 main_turn 数据时回退为全部请求
-    const hasMain = db
-      .prepare(base + sessionFilter + " LIMIT 1")
-      .get(...args);
-    const scopeSql = hasMain
-      ? base + sessionFilter
-      : base.replace(" AND query_source = 'main_turn'", "") + sessionFilter;
+    // 主统计严格限定 main_turn:辅助来源(compact/标题/验证等)只进 auxiliary,绝不回流主统计。
+    // 会话无主请求时主统计为空(usage/turn/latest 为 null,行输出"暂无已完成的模型请求"),
+    // 辅助用量仍经 auxiliary 单列;旧"无 main_turn 回退全部来源"会让辅助请求双重计入,已移除。
+    const scopeSql = base + sessionFilter;
     // History only limits detail rows; latest/aggregates query the entire retained scope.
     const histRows = db.prepare(scopeSql + " ORDER BY completed_at DESC LIMIT ?").all(...args, HIST);
     const mapRequest = (r) => {
@@ -382,7 +379,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
 
     const usage = sumRow.n
       ? {
-          scope: hasMain ? "main_turn" : "session_all",
+          scope: "main_turn",
           turns: sumRow.unknown_turn_requests ? null : sumRow.turns,
           knownTurns: sumRow.turns,
           unknownTurnRequests: sumRow.unknown_turn_requests ?? 0,
@@ -399,7 +396,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
       : null;
 
     if (sumRow.unknown_turn_requests) warnings.push(`${sumRow.unknown_turn_requests} 条请求缺少 turn_id,轮次数未知`);
-    session.scope = !sid ? "unknown" : useSub ? "main_turn+subagent" : hasMain ? "main_turn" : "session_all";
+    session.scope = !sid ? "unknown" : useSub ? "main_turn+subagent" : "main_turn";
     session.total = session.totalInput + session.totalOutput;
     session.cacheHit = session.totalInput ? Math.round(session.totalCacheRead / session.totalInput * 1000) / 10 : null;
     const coverage = { retainedOnly: true, status: "completed", scope: usage?.scope ?? session.scope,
