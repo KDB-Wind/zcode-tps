@@ -1,5 +1,14 @@
 # 更新记录
 
+## 0.4.4
+
+### 改进
+
+- 新增 Decode 速度(默认显示段):纯生成阶段速率 = 输出 ÷(请求时长 − 首 token 等待),与智谱官方"高峰期平均 Decode 速度"同口径,可直接对比;排队/预填充不计入分母,解释了端到端速率低于官方数值的原因。
+- TTFT 缺失时回退 `first_token_at - started_at` 参与解码窗口计算;两者皆缺的请求不参与 Decode 统计(仍计入端到端口径与用量)。
+- 请求级解码窗口下限 200ms,避免几乎全部时长用于等待首字的请求产生失真速率;会话加权 Decode 与 e2e 会话均使用同一有效样本集,includeSubagents 开启时并入子代理。
+- `rateLineFields` 默认四段 `[rates, decode, session, cache]`,`"all"` 展开七段;JSON 新增 `latest/history[].decodeTps`、`session.decodeTps`、`session.decodeSamples`。
+
 ## 0.4.3
 
 ### 改进

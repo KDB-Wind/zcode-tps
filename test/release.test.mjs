@@ -22,10 +22,15 @@ async function fixture(name, run) {
     cache_read_input_tokens INTEGER, cache_creation_input_tokens INTEGER,
     trace_id TEXT, started_at INTEGER, first_token_at INTEGER,
     completed_at INTEGER, duration_ms INTEGER, time_to_first_token_ms INTEGER)`);
-  const insert = (v = {}) => db.prepare("INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
-    v.turn === undefined ? "turn1" : v.turn, v.sid === undefined ? "s" : v.sid, "completed", v.source ?? "main_turn", "m",
-    v.out ?? 100, v.reasoning ?? 0, v.input ?? 1000, v.cacheRead ?? 900, 0, v.trace === undefined ? "trace1" : v.trace, (v.time ?? 1000) - 1000,
-    (v.time ?? 1000) - 900, v.time ?? 1000, 1000, 100);
+  const insert = (v = {}) => {
+    const dur = v.dur ?? 1000, time = v.time ?? 1000;
+    const ttft = v.ttft === undefined ? 100 : v.ttft; // null = 列缺失
+    const first = v.first !== undefined ? v.first : (ttft == null ? null : time - dur + ttft);
+    return db.prepare("INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      v.turn === undefined ? "turn1" : v.turn, v.sid === undefined ? "s" : v.sid, "completed", v.source ?? "main_turn", "m",
+      v.out ?? 100, v.reasoning ?? 0, v.input ?? 1000, v.cacheRead ?? 900, 0, v.trace === undefined ? "trace1" : v.trace,
+      time - dur, first, time, dur, ttft);
+  };
   process.env.ZCODE_USAGE_DB = file;
   process.env.ZCODE_TPS_LAST_SESSION = path.join(tmp, "last.json");
   process.env.ZCODE_TPS_CONFIG = path.join(tmp, "config.json");
@@ -355,6 +360,40 @@ try {
     count += 1;
     console.log("timezone-display 用例通过");
   });
+  await fixture("decode-speed", async ({ db, insert, load }) => {
+    // 三条主对话:ttft 全缺(不参与 decode) / 默认 dur1000-ttft100(解码窗口 900ms) / ttft 回退 first-started
+    insert({ out: 500, ttft: null, dur: 1500, time: 2000 });
+    insert({ out: 90, time: 3000 });                                   // decode 90/0.9s = 100
+    insert({ out: 200, ttft: 900, dur: 2000, time: 5000 });            // decode 200/1.1s ≈ 181.8
+    db.prepare("INSERT INTO model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(
+      "turn1", "s", "completed", "main_turn", "m", 100, 0, 1000, 900, 0, "trace1",
+      6000 - 1000, 5800, 6000, 1000, null);                            // ttft 列缺失,first-started 回退 800ms → decode 100/0.2s = 500
+    const { query, formatLine } = await load();
+    const r = query("s");
+    // 请求级:最新有效请求是 TTFT 回推行(first-started=800ms,解码窗口 200ms 恰过下限)
+    assert.equal(r.latest.decodeTps, 500);
+    assert.deepEqual(r.history.map(h => h.decodeTps), [500, 181.8, 100, null]);
+    // 会话加权 decode:(90+200+100)/(0.9+1.1+0.2) = 390/2.2 ≈ 177.3;ttft 全缺的 500tok 行不参与
+    assert.equal(r.session.decodeTps, 177.3);
+    assert.equal(r.session.decodeSamples, 3);
+    assert.equal(r.session.samples, 4, "e2e 有效样本仍含 ttft 缺失行");
+    // 速率行:decode 段默认出现
+    assert.ok(formatLine(r).includes("Decode 最近 500 · 会话 177.3 tok/s"));
+    assert.equal(formatLine(r, ["decode"]), "Decode 最近 500 · 会话 177.3 tok/s");
+    // 子代理 decode 并入会话口径
+    insert({ out: 100, source: "subagent", sid: "child", trace: "trace1", time: 7000 });
+    const withSub = query("s");
+    assert.equal(withSub.session.decodeTps, 158.1);  // (390+100)/(2.2+0.9)
+    assert.equal(withSub.session.decodeSamples, 4);
+    // 全部请求 ttft 缺失时 decode 段整体消失,行回落其他段
+    db.exec("UPDATE model_usage SET time_to_first_token_ms = NULL, first_token_at = NULL");
+    const none = query("s");
+    assert.equal(none.session.decodeTps, null);
+    assert.ok(!formatLine(none, ["decode"]).includes("Decode"));
+    assert.ok(formatLine(none).includes("⚡"), "decode 无数据时默认行仍渲染其余段");
+    count += 1;
+    console.log("decode-speed 用例通过");
+  });
   assert.deepEqual(querySettings({}), { history: 60, min: 500, max: 3600000 });
   for (const value of ["-1", "0", "1.5", "Infinity", "1001", "garbage", ""]) {
     assert.throws(() => querySettings({ TOKEN_RATE_HIST: value }), /TOKEN_RATE_HIST/);
@@ -370,7 +409,7 @@ try {
     JSON.parse(fs.readFileSync(path.join(root, "marketplace.json"))).plugins[0].version,
     JSON.parse(fs.readFileSync(path.join(root, "plugins/zcode-tps/.zcode-plugin/plugin.json"))).version,
   ];
-  assert.deepEqual(versions, ["0.4.3", "0.4.3", "0.4.3"]);
+  assert.deepEqual(versions, ["0.4.4", "0.4.4", "0.4.4"]);
   console.log(`release ${count} 个用例通过`);
 } finally {
   for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];

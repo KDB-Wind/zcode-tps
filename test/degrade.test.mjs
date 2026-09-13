@@ -391,16 +391,16 @@ async function loadWith(dbPath) {
 {
   const { resolveRateFields } = await import(pathToFileURL(SCRIPT).href + "?case=fields" + Math.random());
   const eq = (a, b) => assert.deepEqual(a, b);
-  eq(resolveRateFields(undefined), ["rates", "session", "cache"]);
-  eq(resolveRateFields(null), ["rates", "session", "cache"]);
-  eq(resolveRateFields("all"), ["rates", "ttft", "turn", "session", "cache", "time"]);
-  eq(resolveRateFields("ALL"), ["rates", "ttft", "turn", "session", "cache", "time"]);
+  eq(resolveRateFields(undefined), ["rates", "decode", "session", "cache"]);
+  eq(resolveRateFields(null), ["rates", "decode", "session", "cache"]);
+  eq(resolveRateFields("all"), ["rates", "decode", "ttft", "turn", "session", "cache", "time"]);
+  eq(resolveRateFields("ALL"), ["rates", "decode", "ttft", "turn", "session", "cache", "time"]);
   eq(resolveRateFields(["time", "rates"]), ["time", "rates"]);
-  eq(resolveRateFields(["all"]), ["rates", "ttft", "turn", "session", "cache", "time"]);
-  eq(resolveRateFields(["rates", "ALL"]), ["rates", "ttft", "turn", "session", "cache", "time"]);
+  eq(resolveRateFields(["all"]), ["rates", "decode", "ttft", "turn", "session", "cache", "time"]);
+  eq(resolveRateFields(["rates", "ALL"]), ["rates", "decode", "ttft", "turn", "session", "cache", "time"]);
   eq(resolveRateFields(["rates", "nope", "rates"]), ["rates"]);
-  eq(resolveRateFields([]), ["rates", "session", "cache"]);
-  eq(resolveRateFields(42), ["rates", "session", "cache"]);
+  eq(resolveRateFields([]), ["rates", "decode", "session", "cache"]);
+  eq(resolveRateFields(42), ["rates", "decode", "session", "cache"]);
 }
 
 // ---- 用例 18:默认三段 + 自定义顺序/回落(F1) ----
@@ -421,6 +421,8 @@ async function loadWith(dbPath) {
   const r = query(SID);
   const def = formatLine(r);
   assert.ok(def.includes("⚡") && def.includes("会话 900 tok") && def.includes("缓存 87.5%"));
+  // 默认四段含 decode:该样本 ttft=100/dur=1000 有解码窗口
+  assert.ok(def.includes("Decode"), "默认行应含 Decode 段");
   assert.ok(!def.includes("首字") && !def.includes("最近轮 读") && !def.includes("⏱") && !def.includes("ctx"));
 
   const custom = formatLine(r, ["time", "rates"]);
@@ -428,7 +430,7 @@ async function loadWith(dbPath) {
   assert.ok(custom.includes("⚡") && !custom.includes("会话 "), "未选字段不应出现(注意速率组内的会话均不算)");
 
   const all = formatLine(r, "all");
-  for (const s of ["⚡", "首字", "最近轮 读", "会话 900 tok", "缓存 87.5%", "⏱"]) {
+  for (const s of ["⚡", "Decode", "首字", "最近轮 读", "会话 900 tok", "缓存 87.5%", "⏱"]) {
     assert.ok(all.includes(s), `"all" 应含 ${s}`);
   }
   // 无数据的字段被跳过至空时回落默认名单,行恒非空

@@ -27,6 +27,11 @@ const DB_PATH =
 const LEGACY_MIN_GEN_MS = 200;
 const LEGACY_MAX_GEN_MS = 3_600_000;
 const DURATION_SQL = "COALESCE(duration_ms, completed_at - started_at)";
+// Decode 窗口:请求总时长减去首 token 等待;TTFT 缺失时回退 first_token_at - started_at,两者皆缺则为 NULL(不参与统计)。
+// 与智谱官方"高峰期平均 Decode 速度"同口径:只计纯生成阶段,排队/预填充不计入分母。
+const DECODE_SQL = "COALESCE(time_to_first_token_ms, first_token_at - started_at)";
+// 请求级 Decode 有效性的解码窗口下限:总时长已过 MIN_DURATION_MS 门槛,但几乎全花在等待首字时解码窗口过短,速率失真。
+const DECODE_MIN_MS = 200;
 
 function rateTps(tokens, durationMs) {
   return Math.round((tokens / durationMs) * 10000) / 10;
@@ -136,7 +141,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
     const base =
       `SELECT ${schema.columns.has("turn_id") ? "NULLIF(turn_id, '')" : "NULL"} turn_id, model_id, output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens,` +
       ` ${schema.columns.has("cache_creation_input_tokens") ? "cache_creation_input_tokens" : "NULL"} cache_creation_input_tokens, first_token_at, completed_at, time_to_first_token_ms, status,` +
-      ` ${DURATION_SQL} dur_ms` +
+      ` ${DURATION_SQL} dur_ms, ${DURATION_SQL} - ${DECODE_SQL} dec_ms` +
       " FROM model_usage WHERE status = 'completed' AND query_source = 'main_turn'";
     // 主对话优先:无 main_turn 数据时回退为全部请求
     const hasMain = db
@@ -158,6 +163,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
       const valid = durMs != null && durMs >= MIN_DURATION_MS && durMs < MAX_DURATION_MS && tok > 0;
       const legacyTokens = tok + reasoning;
       const legacyValid = genMs != null && genMs >= LEGACY_MIN_GEN_MS && genMs < LEGACY_MAX_GEN_MS && legacyTokens > 0;
+      const decMs = Number.isFinite(r.dec_ms) ? r.dec_ms : null;
       return {
         turnId: r.turn_id,
         model: r.model_id,
@@ -169,6 +175,8 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
         genMs,
         durMs,
         tokPerSec: valid ? rateTps(tok, durMs) : null,
+        // Decode 速度:纯生成阶段(剔除首字等待);TTFT 缺失且无法回退时为 null
+        decodeTps: valid && decMs != null && decMs >= DECODE_MIN_MS ? rateTps(tok, decMs) : null,
         // 严格复现 0.3 错误公式,只用于迁移对比;不代表可解释的物理 burst。
         legacyTps: legacyValid ? rateTps(legacyTokens, genMs) : null,
         completedAt: r.completed_at,
@@ -199,11 +207,19 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
         " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0"
       )
       .get(...args, MIN_DURATION_MS, MAX_DURATION_MS);
+    // Decode(纯生成)会话聚合:与 e2e 有效样本同一请求集,分母剔除首字等待;dec_ms > 0 同时排除无法回退 TTFT 的行
+    const decodeRow = db
+      .prepare(
+        "SELECT COUNT(*) n, SUM(output_tokens) tok, SUM(dec_ms) dec FROM (" + scopeSql + ")" +
+        " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 AND dec_ms > 0"
+      )
+      .get(...args, MIN_DURATION_MS, MAX_DURATION_MS);
 
     // ---- 子代理归因:trace_id 与主会话 main_turn 请求相同的 subagent 请求 ----
     // 独立降级边界:trace 列缺失等情况只影响子代理口径,主对话统计不受影响
     let subAggr = null;
     let subSum = null;
+    let subDecodeRow = null;
     if (includeSub && sid && schema.columns.has("trace_id")) {
       try {
         // 注意:不能用 base 包裹子查询(base 的列清单不含 trace_id),直接过滤 model_usage
@@ -213,13 +229,19 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
           " AND session_id = ? AND " + validIdSql("trace_id");
         const subScopeSql =
           "SELECT output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens," +
-          ` ${DURATION_SQL} dur_ms FROM model_usage` +
+          ` ${DURATION_SQL} dur_ms, ${DURATION_SQL} - ${DECODE_SQL} dec_ms FROM model_usage` +
           " WHERE status = 'completed' AND query_source = 'subagent' AND " + validIdSql("trace_id") +
           " AND trace_id IN (" + traceListSql + ")";
         subAggr = db
           .prepare(
             "SELECT COUNT(*) n, SUM(output_tokens) tok, SUM(dur_ms) dur FROM (" + subScopeSql + ")" +
             " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0"
+          )
+          .get(sid, MIN_DURATION_MS, MAX_DURATION_MS);
+        subDecodeRow = db
+          .prepare(
+            "SELECT COUNT(*) n, SUM(output_tokens) tok, SUM(dec_ms) dec FROM (" + subScopeSql + ")" +
+            " WHERE dur_ms >= ? AND dur_ms < ? AND output_tokens > 0 AND dec_ms > 0"
           )
           .get(sid, MIN_DURATION_MS, MAX_DURATION_MS);
         // 累计与有效速率样本解耦:即使全部子请求 output=0/时长无效,请求与 token 仍归因。
@@ -265,6 +287,14 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
       const dur = (aggrRow?.dur ?? 0) + (useSub ? subAggr?.dur ?? 0 : 0);
       const n = (aggrRow?.n ?? 0) + (useSub ? subAggr?.n ?? 0 : 0);
       if (n && dur) session.avgTps = rateTps(tok, dur);
+    }
+    {
+      // Decode 会话均:同一有效样本集,分母剔除首字等待;与官方"高峰期平均 Decode 速度"同口径
+      const tok = (decodeRow?.tok ?? 0) + (useSub ? subDecodeRow?.tok ?? 0 : 0);
+      const dur = (decodeRow?.dec ?? 0) + (useSub ? subDecodeRow?.dec ?? 0 : 0);
+      const n = (decodeRow?.n ?? 0) + (useSub ? subDecodeRow?.n ?? 0 : 0);
+      session.decodeSamples = n;
+      session.decodeTps = n && dur ? rateTps(tok, dur) : null;
     }
 
     // Only aggregate the latest observed turn. NULL IDs carry no reliable grouping information.
@@ -340,10 +370,10 @@ function fmtK(n) {
   return String(n);
 }
 
-// F1:速率行字段名单。默认三段(rates/session/cache);配置 rateLineFields 自定义顺序与组合,
-// "all" 展开全部六段(标准顺序)。未知字段忽略,空名单/非法值回落默认,保证行恒非空。
-const RATE_SEGMENTS = ["rates", "ttft", "turn", "session", "cache", "time"];
-const DEFAULT_RATE_FIELDS = ["rates", "session", "cache"];
+// F1:速率行字段名单。默认四段(rates/decode/session/cache);配置 rateLineFields 自定义顺序与组合,
+// "all" 展开全部七段(标准顺序)。未知字段忽略,空名单/非法值回落默认,保证行恒非空。
+const RATE_SEGMENTS = ["rates", "decode", "ttft", "turn", "session", "cache", "time"];
+const DEFAULT_RATE_FIELDS = ["rates", "decode", "session", "cache"];
 
 function resolveRateFields(v) {
   if (v === undefined || v === null) return DEFAULT_RATE_FIELDS.slice();
@@ -375,6 +405,12 @@ function formatLine(r, fields) {
       if (r.turn?.avgTps != null) rates.push(`最近轮均 ${r.turn.avgTps}`);
       if (r.session?.avgTps != null) rates.push(`会话均 ${r.session.avgTps}`);
       parts.push(`⚡ ${rates.length ? rates.join(" · ") : "-"} tok/s`);
+    } else if (id === "decode") {
+      // Decode 速度:纯生成阶段(剔除首字等待),与智谱官方"高峰期平均 Decode 速度"同口径可比
+      const dec = [];
+      if (l.decodeTps != null) dec.push(`最近 ${l.decodeTps}`);
+      if (r.session?.decodeTps != null) dec.push(`会话 ${r.session.decodeTps}`);
+      if (dec.length) parts.push(`Decode ${dec.join(" · ")} tok/s`);
     } else if (id === "ttft") {
       if (l.ttftMs != null) {
         // 附上最后请求的上下文规模:首字延迟与它强相关,帮助区分"模型慢"和"上下文大"
@@ -442,6 +478,11 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
       if (q.usage) {
         const scopeNote = q.usage.scope === "main_turn" ? "主对话" : "当前会话全部请求来源";
         console.log(`会话用量(库内留存的已完成请求,${scopeNote}):${q.usage.turns == null ? "轮次数未知" : q.usage.turns + " 个已观察轮次"} · 总计 ${fmtK(q.usage.total)} tok(输入 ${fmtK(q.usage.input)} / 输出 ${fmtK(q.usage.output)}${q.usage.reasoning ? ` / 其中思考 ${fmtK(q.usage.reasoning)}` : ""}) · 缓存命中率 ${q.cacheHit ?? "-"}%`);
+      }
+      if (q.session) {
+        // Decode 与官方"高峰期平均 Decode 速度"同口径:剔除首字等待,排队/预填充不计入分母
+        const smp = q.session.samples || 0;
+        console.log(`Decode 速度(纯生成,剔除首字等待):最近 ${q.latest?.decodeTps ?? "-"} · 会话加权 ${q.session.decodeTps ?? "-"} tok/s(有效样本 ${q.session.decodeSamples ?? 0}/${smp},TTFT 缺失且无法回退的请求不参与)`);
       }
       if (q.session.subagent) {
         console.log(`子代理归因:并入 ${q.session.subagent.requests} 次请求 / 输出 ${fmtK(q.session.subagent.output)} tok(子代理均 ${q.session.subagent.avgTps ?? "-"} tok/s) · 配置 includeSubagents:false 可切回纯主对话口径`);

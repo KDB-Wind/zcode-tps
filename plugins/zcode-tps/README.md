@@ -1,4 +1,4 @@
-# zcode-tps 0.4.3
+# zcode-tps 0.4.4
 
 从 `~/.zcode/cli/db/db.sqlite` 的 `model_usage` 只读计算速率、用量和缓存命中率。无需额外模型调用；自动行由模型根据 hook 上下文引用展示。
 
@@ -17,10 +17,10 @@
 
 ## 自动显示与配置
 
-默认显示三个字段：
+默认显示四个字段：
 
 ```text
-> ⚡ 最近 81.4 · 最近轮均 79.6 · 会话均 80.7 tok/s · 会话 29.13M tok · 缓存 97.3%
+> ⚡ 最近 40.4 · 最近轮均 43.1 · 会话均 30.9 tok/s · Decode 最近 84.8 · 会话 62.4 tok/s · 会话 29.13M tok · 缓存 97.3%
 ```
 
 配置文件：`~/.zcode/zcode-tps.config.json`。配置在每次 hook 或命令执行时读取，不需要为配置变化重启。
@@ -36,14 +36,15 @@
 
 | 字段 | 内容 |
 |---|---|
-| `rates` | 最近有效请求、最近可识别轮次、会话的速率 |
+| `rates` | 最近有效请求、最近可识别轮次、会话的端到端速率 |
+| `decode` | Decode 速度:最近有效请求与会话加权的纯生成速率(剔除首字等待),与智谱官方"高峰期平均 Decode 速度"同口径 |
 | `ttft` | 最近有效请求的 TTFT 与输入上下文规模 |
 | `turn` | 最近可识别轮次的输入、输出 |
 | `session` | `usage.total`，库内留存范围内累计 |
 | `cache` | `usage` 范围内的缓存命中率 |
 | `time` | 最近有效请求完成时间（按 `timezone` 显示日期+时间）；查询采样时间另见 `sampledAt` |
 
-`rateLineFields` 缺省为 `["rates", "session", "cache"]`；`"all"` 展开全部六段。未知字段忽略，空名单或所选字段均无数据时回落默认显示。布尔选项兼容 `"false"`、`"off"` 等字符串。
+`rateLineFields` 缺省为 `["rates", "decode", "session", "cache"]`；`"all"` 展开全部七段。未知字段忽略，空名单或所选字段均无数据时回落默认显示。布尔选项兼容 `"false"`、`"off"` 等字符串。
 
 `timezone` 控制所有时间显示（速率行 `time` 段、采样提示、`/tps` 报表、doctor），默认 `Asia/Shanghai`；可设 `"UTC"`、`"system"`（跟随系统时区）或任意 IANA 时区名（如 `America/New_York`）。无效值回退默认并在 `warnings` 提示。环境变量 `ZCODE_TPS_TIMEZONE` 优先于配置文件。数据库中的时间戳无时区语义，只是显示层的选择。
 
@@ -58,6 +59,7 @@
 - 最近轮均、会话均为 `Σoutput / Σduration`。请求内等待计入；请求间工具执行和编排间隙不计入。并发子代理的请求时长相加，不代表整轮墙钟吞吐。
 - 总量始终为输入 + 输出；reasoning 是输出明细，不再相加。零输出或时长无效的 completed 请求仍计入用量和请求数。
 - 缓存命中率 = 缓存读 / 输入；输入已含缓存读，缓存创建不计命中。
+- Decode 速度 = `output / (durMs − TTFT)`，只计纯生成阶段，排队与预填充不计入分母，因此高于端到端速率且可与智谱官方"高峰期平均 Decode 速度"直接对比。TTFT 取 `time_to_first_token_ms`，缺失时回退 `first_token_at − started_at`；两者皆缺的请求不参与 Decode（仍计入端到端与用量）。请求级解码窗口须 ≥200ms；会话 Decode 为同批有效样本的 `Σoutput / Σ(durMs − TTFT)` 加权值。
 - 不使用 `turn_usage` 计算指标。ZCode 清理旧 `model_usage` 行后累计可能下降，不能当全历史消耗或费用账本。
 
 ## JSON 与时间边界
@@ -72,10 +74,10 @@
 | `coverage` | `retainedOnly=true`、completed 请求、基础统计范围及其最早/最晚完成时间 |
 | `warnings` | 缺可选列、未知轮次和子代理归因降级原因 |
 | `history` | 基础统计范围内最近请求，倒序，默认最多 60 条 |
-| `latest` | 同一范围内最近有效请求，独立于 history 长度；全部无效时回退最新请求，速率为空 |
+| `latest` | 同一范围内最近有效请求，独立于 history 长度；全部无效时回退最新请求，速率为空；含 `decodeTps` |
 | `turn` | 最新已完成请求所属的可识别轮次；`completion="unknown"`，不能证明整轮完成 |
 | `usage` | 基础范围的输入/输出/总量/缓存/轮次数；reasoning 是其中量 |
-| `session` | 基础范围加可归因子代理的累计与加权速率；`total=input+output`，有独立 `cacheHit` 和 `scope` |
+| `session` | 基础范围加可归因子代理的累计与加权速率；`total=input+output`，有独立 `cacheHit` 和 `scope`；`decodeTps`/`decodeSamples` 为会话加权 Decode 及其有效样本数 |
 
 基础范围优先为当前会话 `main_turn`，没有 main_turn 时回退当前会话全部请求来源，`usage.scope="session_all"`，不再错误标成主对话。`session.scope` 对应 `main_turn`、`main_turn+subagent` 或 `session_all`。无法识别有效会话时返回空统计、`sessionId=null`、`session.scope="unknown"` 和警告，不会汇总全库。
 
