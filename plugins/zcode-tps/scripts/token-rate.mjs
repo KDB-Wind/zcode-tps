@@ -28,7 +28,7 @@ const LEGACY_MIN_GEN_MS = 200;
 const LEGACY_MAX_GEN_MS = 3_600_000;
 const DURATION_SQL = "COALESCE(duration_ms, completed_at - started_at)";
 // Decode 窗口:请求总时长减去首 token 等待;TTFT 缺失时回退 first_token_at - started_at,两者皆缺则为 NULL(不参与统计)。
-// 与智谱官方"高峰期平均 Decode 速度"同口径:只计纯生成阶段,排队/预填充不计入分母。
+// 近似智谱官方"高峰期平均 Decode 速度"的纯生成思路:只计纯生成阶段,排队/预填充不计入分母;计时边界与平均方法不同,不保证与官方数字等价。
 const DECODE_SQL = "COALESCE(time_to_first_token_ms, first_token_at - started_at)";
 // 请求级 Decode 有效性的解码窗口下限:总时长已过 MIN_DURATION_MS 门槛,但几乎全花在等待首字时解码窗口过短,速率失真。
 const DECODE_MIN_MS = 200;
@@ -340,7 +340,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
       if (n && dur) session.avgTps = rateTps(tok, dur);
     }
     {
-      // Decode 会话均:同一有效样本集,分母剔除首字等待;与官方"高峰期平均 Decode 速度"同口径
+      // Decode 会话均:同一有效样本集,分母剔除首字等待;近似官方 Decode 口径,趋势可比而非等价
       const tok = (decodeRow?.tok ?? 0) + (useSub ? subDecodeRow?.tok ?? 0 : 0);
       const dur = (decodeRow?.dec ?? 0) + (useSub ? subDecodeRow?.dec ?? 0 : 0);
       const n = (decodeRow?.n ?? 0) + (useSub ? subDecodeRow?.n ?? 0 : 0);
@@ -534,7 +534,7 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
         console.log(`Decode 速度(纯生成,剔除首字等待):会话加权 ${q.session.decodeTps ?? "-"} tok/s(有效样本 ${q.session.decodeSamples ?? 0}/${q.session.samples},解码窗口 ≥200ms,TTFT 缺失且无法回退的请求不参与)`);
       }
       if (q.auxiliary && q.auxiliary.requests) {
-        console.log(`辅助请求(不计入主统计与速率):${q.auxiliary.requests} 次 / 输出 ${fmtK(q.auxiliary.output)} tok(${q.auxiliary.groups.map((g) => `${g.source}×${g.requests}`).join(" · ")})`);
+        console.log(`辅助请求(不计入主统计与速率):${q.auxiliary.requests} 次 · 读 ${fmtK(q.auxiliary.input)} · 出 ${fmtK(q.auxiliary.output)}(${q.auxiliary.groups.map((g) => `${g.source}×${g.requests}`).join(" · ")})`);
       }
       if (q.session.subagent) {
         console.log(`子代理归因:并入 ${q.session.subagent.requests} 次请求 / 输出 ${fmtK(q.session.subagent.output)} tok(子代理均 ${q.session.subagent.avgTps ?? "-"} tok/s) · 配置 includeSubagents:false 可切回纯主对话口径`);

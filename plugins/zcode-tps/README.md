@@ -79,7 +79,7 @@
 | `latest` | 同一范围内最近有效请求，独立于 history 长度；全部无效时回退最新请求，速率为空；含 `decodeTps` |
 | `turn` | 最新已完成请求所属的可识别轮次；`completion="unknown"`，不能证明整轮完成 |
 | `usage` | 基础范围的输入/输出/总量/缓存/轮次数；reasoning 是其中量 |
-| `session` | 基础范围加可归因子代理的累计与加权速率；`total=input+output`，有独立 `cacheHit` 和 `scope`；`decodeTps`/`decodeSamples` 为会话加权 Decode 及其有效样本数 |
+| `session` | 基础范围加可归因子代理的累计与加权速率；`total=input+output`，有独立 `cacheHit` 和 `scope`；`decodeTps`/`decodeSamples` 为会话加权 Decode 及其有效样本数（默认含可归因子代理，与不含子代理的 `decodeStats.samples` 统计范围不同，但有效性门槛相同） |
 | `decodeStats` | 请求级 Decode 分布（基础范围，不含子代理）：`mean`/`median`/`p90`（tok/s）与 `samples`；解码窗口 ≥200ms，分位为 nearest-rank（`index = ceil(p×n)−1`） |
 | `auxiliary` | 本会话非 `main_turn`/`subagent` 的已完成辅助请求（标题/压缩/验证等），按来源分组并标注 `class`（title/system/unknown）；不计入主统计；未识别来源进入 `warnings` |
 

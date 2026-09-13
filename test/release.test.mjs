@@ -482,6 +482,13 @@ try {
   assert.ok(rootReadme.includes(`最近轮均`) && rootReadme.includes(`Decode 会话均`), "根 README 示例应反映默认行内容");
   const hookSrc = fs.readFileSync(path.join(root, "plugins/zcode-tps/hooks/prompt-submit.mjs"), "utf8");
   assert.ok(hookSrc.includes(`默认 ${defaultFields} ${DEFAULT_RATE_FIELDS.length}段`), "hook 注释的字段名单/数量应与 DEFAULT_RATE_FIELDS 一致");
+  for (const [file, desc] of [
+    ["marketplace.json", JSON.parse(fs.readFileSync(path.join(root, "marketplace.json"), "utf8")).plugins[0].description],
+    ["plugins/zcode-tps/.zcode-plugin/plugin.json", JSON.parse(fs.readFileSync(path.join(root, "plugins/zcode-tps/.zcode-plugin/plugin.json"), "utf8")).description],
+  ]) {
+    assert.ok(desc.includes("Decode 会话均"), `${file} 描述应反映默认行的 Decode 会话均`);
+    assert.ok(!desc.includes("TTFT"), `${file} 描述不应把非默认的 TTFT 写成默认显示`);
+  }
   console.log(`release ${count} 个用例通过`);
 } finally {
   for (const key of Object.keys(process.env)) if (!(key in originalEnv)) delete process.env[key];
