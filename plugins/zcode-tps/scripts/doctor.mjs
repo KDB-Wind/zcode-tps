@@ -71,9 +71,14 @@ async function dbCheck() {
     const last = db
       .prepare("SELECT completed_at FROM model_usage WHERE status = 'completed' ORDER BY completed_at DESC LIMIT 1")
       .get();
-    const ageMin = last ? Math.round((Date.now() - last.completed_at) / 60000) : null;
+    // 异常类型(TEXT 等)与未来时间戳不得渲染成 NaN/负数年龄;按审计 P2-1 显式标注
+    let ageLabel = "无";
+    if (last && Number.isFinite(last.completed_at)) {
+      const ageMin = Math.round((Date.now() - last.completed_at) / 60000);
+      ageLabel = ageMin < 0 ? "时间在未来(时钟偏差或脏数据)" : `${ageMin} 分钟前`;
+    }
     const out = [core(true,
-      `核心列完整;最近完成样本 ${ageMin == null ? "无" : ageMin + " 分钟前"}`,
+      `核心列完整;最近完成样本 ${ageLabel}`,
       null)];
     out.push(cols.includes("trace_id")
       ? { name: "子代理归因列(trace_id)", level: "warn", ok: true, detail: "存在,子代理可并入会话统计", hint: null }

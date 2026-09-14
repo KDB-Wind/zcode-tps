@@ -9,7 +9,7 @@
       "name": "zcode-tps",
       "source": "./plugins/zcode-tps",
       "description": "Token 速率与用量监控:每轮回复末尾显示最近轮均速率、Decode 会话均、会话累计 token 与缓存命中率(读取 ZCode usage 数据库);/tps 报表含请求级明细、Decode 分布与辅助请求用量,/tps-doctor 自检。",
-      "version": "0.5.2",
+      "version": "0.5.3",
       "author": {
         "name": "KDB-Wind"
       },

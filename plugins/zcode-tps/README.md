@@ -1,4 +1,4 @@
-# zcode-tps 0.5.2
+# zcode-tps 0.5.3
 
 从 `~/.zcode/cli/db/db.sqlite` 的 `model_usage` 只读计算速率、用量和缓存命中率。无需额外模型调用；自动行由模型根据 hook 上下文引用展示。
 
@@ -122,8 +122,8 @@ doctor 与查询共享必需/可选列定义。缺 `trace_id` 时无法归因；
 
 0.4.0 已把速率从 `(output+reasoning)/(completed-first_token)` 改为 `output/duration`。0.4.2 进一步修正累计总量中的 reasoning 重复计数；若思考量非零，总量会下降，这是纠错。`history.legacyTps` 仅用于显式请求的 0.3 对比，不作为默认性能指标。
 
-在仓库根目录运行 `npm test`，也可单独执行 `node test/degrade.test.mjs`、`node test/doctor.test.mjs`、`node test/release.test.mjs`。测试使用隔离配置和临时 SQLite，包含并发 WAL 写入时快照一致性、CLI 与 hook JSON 契约。
+在仓库根目录运行 `npm test`，也可单独执行 `node test/degrade.test.mjs`、`node test/doctor.test.mjs`、`node test/release.test.mjs`、`node test/correctness.test.mjs`（含三类库 × 七异常的正确性矩阵与查询语句数门禁）。测试使用隔离配置和临时 SQLite，包含并发 WAL 写入时快照一致性、CLI 与 hook JSON 契约。
 
-`npm run benchmark` 默认构建 10 万条合成请求，测量无索引、有测试索引两种情况下的查询中位值/95 分位值，以及持续独占锁的失败耗时。可用 `npm run benchmark -- 1000000` 增大数据量。基准只创建临时数据库，不修改真实用量库或其索引。样本不含 Node 启动和 hook 文件 IO，不能代替宿主实测。
+`npm run benchmark` 默认跑多场景矩阵:小/中/大库(5k/100k/1M 行,含真实分布的缓存命中与 token 长度)× 索引场景(无/旧实验索引/生产真实索引镜像)× 查询模式(典型/最大会话/auto 识别)× 冷/热,并记录内存与持续独占锁耗时;可传位置参数只跑一档,如 `npm run benchmark -- 1000000`。基准只创建临时数据库,不修改真实用量库或其索引。样本不含 Node 启动和 hook 文件 IO,不能代替宿主实测。
 
 基于 [shy3130/zcode-tps-monitor](https://github.com/shy3130/zcode-tps-monitor) 0.7.0（MIT）修改。

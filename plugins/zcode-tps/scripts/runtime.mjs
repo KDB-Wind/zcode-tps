@@ -8,6 +8,8 @@ export const validId = value => typeof value === "string" && value.trim().length
 // Match JavaScript trim whitespace without changing nonblank identifiers or relying on SQLite's space-only trim.
 const ID_WHITESPACE = "char(9,10,11,12,13,32,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,8200,8201,8202,8232,8233,8239,8287,12288,65279)";
 export const validIdSql = column => `typeof(${column}) = 'text' AND length(trim(${column}, ${ID_WHITESPACE})) > 0`;
+// NULL/空白文本归一为统一标签的 SQL 表达式(空白集与 validIdSql 一致);标签必须是带引号的 SQL 字面量。
+export const blankLabelSql = (column, label) => `COALESCE(NULLIF(trim(${column}, ${ID_WHITESPACE}), ''), ${label})`;
 export const parseJson = raw => JSON.parse(raw.replace(/^\uFEFF/, ""));
 
 export const REQUIRED_COLS = [
