@@ -50,7 +50,9 @@
 
 `rateLineFields` 缺省为 `["rates", "decode", "session", "cache"]`；`"all"` 展开全部八段。未知字段忽略，空名单或所选字段均无数据时回落默认显示。布尔选项兼容 `"false"`、`"off"` 等字符串。
 
-`turnEndLine`（默认 `false`）开启回合结束的系统通知（Stop hook）。自动行由 UserPromptSubmit 采样，天然滞后一轮：只发一条消息让 agent 执行长任务的单轮会话，回复末尾不会有任何统计。开启后，回合结束时立即弹系统通知显示统计（Windows toast / macOS 通知中心 / Linux notify-send，零依赖），单轮会话即时可见；通知完全不动会话流，不产生任何额外模型调用，回答主体不受影响（不采用"驱动模型续跑补行"方案——ZCode 会把续跑回合折叠为摘要条，回答被藏起）。通知负责即时性，UserPromptSubmit 注入行照常工作、负责对话流内的历史记录，两渠道互补。数据未前进时不重复通知；任何查询失败静默放行，绝不阻塞回合结束；`tokenRateLine: false` 时本选项一并停用。取值：`true`/`"notify"`/`"toast"` 开启，`false`/`"off"` 关闭。
+**已知限制**：注入行在发消息时采样，只能覆盖到上一轮——如果会话只有一轮对话（常见于新会话直接开启目标任务、执行很长才结束），第一轮回复末尾不会有任何统计，从第二轮对话起正常显示。`turnEndLine` 的系统通知是这一场景的补救选项，但弹窗有打扰感，默认不开启；Windows 下横幅顶部的来源名显示为 PowerShell 的应用标识（AUMID），无法自定义，通知内容本身不受影响。
+
+`turnEndLine`（默认 `false`）开启回合结束的系统通知（Stop hook）。开启后，回合结束时立即弹系统通知显示统计（Windows toast / macOS 通知中心 / Linux notify-send，零依赖），单轮会话即时可见；通知完全不动会话流，不产生任何额外模型调用，回答主体不受影响（不采用"驱动模型续跑补行"方案——ZCode 会把续跑回合折叠为摘要条，回答被藏起）。通知负责即时性，UserPromptSubmit 注入行照常工作、负责对话流内的历史记录，两渠道互补。Windows 下首条通知会自动写入注册表开启 PowerShell 通知的横幅权限（新机器默认可能为关，静默 toast 会被丢弃），之后尊重用户在系统设置里的开关。数据未前进时不重复通知；任何查询失败静默放行，绝不阻塞回合结束；`tokenRateLine: false` 时本选项一并停用。取值：`true`/`"notify"`/`"toast"` 开启，`false`/`"off"` 关闭。
 
 `timezone` 控制所有时间显示（速率行 `time` 段、采样提示、`/tps` 报表、doctor），默认 `Asia/Shanghai`；可设 `"UTC"`、`"system"`（跟随系统时区）或任意 IANA 时区名（如 `America/New_York`）。无效值回退默认并在 `warnings` 提示。环境变量 `ZCODE_TPS_TIMEZONE` 优先于配置文件。数据库中的时间戳无时区语义，只是显示层的选择。
 
