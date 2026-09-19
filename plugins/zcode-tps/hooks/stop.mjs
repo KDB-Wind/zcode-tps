@@ -49,7 +49,8 @@ try {
   }
   const file = lastShownFile();
   const shown = readShown(file);
-  // pending:上一次 Stop 已 block 过,本次 Stop 是补行续跑的收尾,放行并复位(至多连续 block 一次)
+  // pending:上一次 Stop 已 block 过。补行续跑正常结束时本分支放行并复位;若 ZCode 未再触发
+  // Stop(实测行为),prompt-submit 会在下一条用户消息时兜底复位,不会永久吃掉显示。
   if (shown?.pending) {
     writeState(file, { ...shown, pending: false, ts: Date.now() });
     complete({ status: "ok", resolvedSessionId: validId(sid) ? sid : null, error: null, warnings: [] });

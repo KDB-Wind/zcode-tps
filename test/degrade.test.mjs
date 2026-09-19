@@ -799,6 +799,8 @@ async function loadWith(dbPath) {
 }
 
 // ---- 用例 30:turnEndLine 开启时 prompt-submit 让位(显示职责移到 Stop,避免同数据重复) ----
+// 同时覆盖 pending 兜底复位:ZCode 在 Stop block 续跑后不再触发第二次 Stop(2026-09-19 实测),
+// pending 残留会吃掉下一回合显示,故 prompt-submit 每条用户消息时复位。
 {
   const dbPath = path.join(tmp, "turnend-submit.sqlite");
   const db = new DatabaseSync(dbPath);
@@ -807,15 +809,18 @@ async function loadWith(dbPath) {
   db.close();
   const cfgOn = path.join(tmp, "submit-config-on.json");
   fs.writeFileSync(cfgOn, JSON.stringify({ turnEndLine: true }));
+  const shownFile = path.join(tmp, "te-shown.json");
+  const submitEnv = {
+    ...process.env,
+    ZCODE_USAGE_DB: dbPath,
+    ZCODE_SESSION_ID: SID,
+    ZCODE_TPS_CONFIG: cfgOn,
+    ZCODE_TPS_LAST_SESSION: path.join(tmp, "te-last-session.json"),
+    ZCODE_TPS_HEALTH: path.join(tmp, "te-health.json"),
+    ZCODE_TPS_LAST_SHOWN: shownFile,
+  };
   const stdout = execFileSync(process.execPath, [HOOK], {
-    env: {
-      ...process.env,
-      ZCODE_USAGE_DB: dbPath,
-      ZCODE_SESSION_ID: SID,
-      ZCODE_TPS_CONFIG: cfgOn,
-      ZCODE_TPS_LAST_SESSION: path.join(tmp, "te-last-session.json"),
-      ZCODE_TPS_HEALTH: path.join(tmp, "te-health.json"),
-    },
+    env: { ...submitEnv },
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -825,6 +830,22 @@ async function loadWith(dbPath) {
   // 会话识别状态仍照常写入:切会话跟随与 Stop hook 的会话定位依赖它
   const st = JSON.parse(fs.readFileSync(path.join(tmp, "te-last-session.json"), "utf8"));
   assert.equal(st.sessionId, SID, "让位时仍必须写会话识别状态");
+
+  // pending 残留(Stop#2 未触发的实际形态)→ prompt-submit 复位
+  fs.writeFileSync(shownFile, JSON.stringify({ sessionId: SID, shownAt: 111, pending: true, ts: 100 }));
+  execFileSync(process.execPath, [HOOK], { env: { ...submitEnv }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  let shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
+  assert.equal(shown.pending, false, "pending 残留必须被 prompt-submit 兜底复位(否则下一回合显示被吃)");
+  assert.equal(shown.shownAt, 111, "复位只清 pending,不动水位值");
+  // 已复位时不重写(时间戳不前进,避免无谓的文件写入)
+  fs.writeFileSync(shownFile, JSON.stringify({ sessionId: SID, shownAt: 111, pending: false, ts: 555 }));
+  execFileSync(process.execPath, [HOOK], { env: { ...submitEnv }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
+  assert.equal(shown.ts, 555, "pending 已为 false 时不得重写水位文件");
+  // 损坏水位文件:静默忽略,不影响注入
+  fs.writeFileSync(shownFile, "not-json{");
+  const out2 = execFileSync(process.execPath, [HOOK], { env: { ...submitEnv }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  assert.equal(JSON.parse(out2).hookSpecificOutput.additionalContext, "", "水位文件损坏不影响 prompt-submit 主流程");
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

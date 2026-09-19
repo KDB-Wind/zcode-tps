@@ -5,7 +5,8 @@
 // 可选配置 ~/.zcode/zcode-tps.config.json:{"tokenRateLine": false} 可关闭速率行注入;
 // {"turnEndLine": true} 改由回合结束(Stop hook)显示,本 hook 让位不再注入(见下方分支)。
 
-import { readConfig, parseBool, stateFile, writeState, recordHealth, startHealth, validId } from "../scripts/runtime.mjs";
+import fs from "node:fs";
+import { readConfig, parseBool, stateFile, lastShownFile, writeState, recordHealth, startHealth, validId } from "../scripts/runtime.mjs";
 
 const sid = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || "";
 const run = startHealth(sid);
@@ -15,6 +16,16 @@ if (validId(sid)) {
     writeState(stateFile(), { sessionId: sid, ts: Date.now(), source: "prompt-submit" });
   } catch {}
 }
+// Stop hook 的补行续跑结束后,ZCode 实测不会再触发第二次 Stop(2026-09-19 本机验证),
+// 水位 pending 标记会残留并吃掉下一回合的显示。每条用户消息时兜底复位;Stop 侧的
+// 续跑放行分支保留,两者语义一致(block 仍至多一次)。复位与显示开关无关,必须无条件执行。
+try {
+  const shownPath = lastShownFile();
+  const shown = JSON.parse(fs.readFileSync(shownPath, "utf8"));
+  if (shown && shown.pending === true) {
+    writeState(shownPath, { ...shown, pending: false, ts: Date.now(), source: "prompt-submit" });
+  }
+} catch {}
 
 const QUOTE_HINT =
   "\n[zcode-tps 显示规则:仅本条回复末尾用 Markdown 引用块原样附上本次上下文的首行,不要附上采样说明。数字是数据库采样值,勿改写。后续消息若未提供新速率行,不要复用历史行。]";
