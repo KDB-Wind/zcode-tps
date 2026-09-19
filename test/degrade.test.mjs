@@ -398,11 +398,12 @@ async function loadWith(dbPath) {
   const eq = (a, b) => assert.deepEqual(a, b);
   eq(resolveRateFields(undefined), ["rates", "decode", "session", "cache"]);
   eq(resolveRateFields(null), ["rates", "decode", "session", "cache"]);
-  eq(resolveRateFields("all"), ["rates", "decode", "ttft", "turn", "session", "cache", "time"]);
-  eq(resolveRateFields("ALL"), ["rates", "decode", "ttft", "turn", "session", "cache", "time"]);
+  eq(resolveRateFields("all"), ["rates", "last", "decode", "ttft", "turn", "session", "cache", "time"]);
+  eq(resolveRateFields("ALL"), ["rates", "last", "decode", "ttft", "turn", "session", "cache", "time"]);
   eq(resolveRateFields(["time", "rates"]), ["time", "rates"]);
-  eq(resolveRateFields(["all"]), ["rates", "decode", "ttft", "turn", "session", "cache", "time"]);
-  eq(resolveRateFields(["rates", "ALL"]), ["rates", "decode", "ttft", "turn", "session", "cache", "time"]);
+  eq(resolveRateFields(["last", "rates"]), ["last", "rates"]);
+  eq(resolveRateFields(["all"]), ["rates", "last", "decode", "ttft", "turn", "session", "cache", "time"]);
+  eq(resolveRateFields(["rates", "ALL"]), ["rates", "last", "decode", "ttft", "turn", "session", "cache", "time"]);
   eq(resolveRateFields(["rates", "nope", "rates"]), ["rates"]);
   eq(resolveRateFields([]), ["rates", "decode", "session", "cache"]);
   eq(resolveRateFields(42), ["rates", "decode", "session", "cache"]);
@@ -428,19 +429,28 @@ async function loadWith(dbPath) {
   assert.ok(def.includes("⚡") && def.includes("会话 900 tok") && def.includes("缓存 87.5%"));
   // 默认四段含 decode:该样本 ttft=100/dur=1000 有解码窗口
   assert.ok(def.includes("Decode"), "默认行应含 Decode 段");
-  assert.ok(!def.includes("首字") && !def.includes("最近轮 读") && !def.includes("⏱") && !def.includes("ctx"));
+  assert.ok(!def.includes("首字") && !def.includes("最近请求") && !def.includes("最近轮 读") && !def.includes("⏱") && !def.includes("ctx"));
 
   const custom = formatLine(r, ["time", "rates"]);
   assert.ok(custom.startsWith("⏱"), "应尊重自定义顺序");
   assert.ok(custom.includes("⚡") && !custom.includes("会话 "), "未选字段不应出现(注意速率组内的会话均不算)");
 
+  // last 段:最近有效请求的单次端到端速度(ttft 100 + gen 1000 = 1100ms,100 tok → 90.9),不入默认行
+  const lastOnly = formatLine(r, ["last"]);
+  assert.ok(lastOnly.includes("最近请求 90.9 tok/s"), "last 段应显示最近有效请求的单次端到端速度");
+  assert.ok(!lastOnly.includes("⚡"), "last 段不应混入轮均/会话均降级链");
+  assert.ok(lastOnly.startsWith("最近请求"), "last 段标签应为最近请求");
+  assert.equal(lastOnly, formatLine(r, ["last"]), "last 段渲染应稳定");
+
   const all = formatLine(r, "all");
-  for (const s of ["⚡", "Decode", "首字", "最近轮 读", "会话 900 tok", "缓存 87.5%", "⏱"]) {
+  for (const s of ["⚡", "最近请求 90.9 tok/s", "Decode", "首字", "最近轮 读", "会话 900 tok", "缓存 87.5%", "⏱"]) {
     assert.ok(all.includes(s), `"all" 应含 ${s}`);
   }
-  // 无数据的字段被跳过至空时回落默认名单,行恒非空
+  // 无数据的字段被跳过至空时回落默认名单,行恒非空;last 在无有效请求(tokPerSec=null)时静默跳过
   const empty = formatLine({ ...r, latest: { ...r.latest, ttftMs: null }, turn: null, usage: null, cacheHit: null }, ["ttft", "turn"]);
   assert.ok(empty.includes("⚡"), "所选字段无数据时应回落默认渲染");
+  const noLast = formatLine({ ...r, latest: { ...r.latest, tokPerSec: null } }, ["last"]);
+  assert.ok(!noLast.includes("最近请求"), "无有效请求时 last 段应静默跳过");
 }
 
 // ---- 用例 19:turn_id 为 NULL 时不推测轮次;会话累计仍可用 ----
@@ -707,5 +717,115 @@ async function loadWith(dbPath) {
   assert.equal(r.cacheHit, 90, "缓存命中率 = 1800/2000(新鲜口径)");
 }
 
+// ---- 用例 29:Stop hook(回合结束显示)—— 默认关、开启后 block/防循环/水位去重 ----
+{
+  const STOP = path.join(path.dirname(SCRIPT), "..", "hooks", "stop.mjs");
+  const dbPath = path.join(tmp, "stop.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000, turnId: "turn_stop" });
+  db.close();
+  const cfgOff = path.join(tmp, "stop-config-off.json");
+  fs.writeFileSync(cfgOff, JSON.stringify({}));
+  const cfgOn = path.join(tmp, "stop-config-on.json");
+  fs.writeFileSync(cfgOn, JSON.stringify({ turnEndLine: true }));
+  const shownFile = path.join(tmp, "stop-shown.json");
+  const baseEnv = {
+    ...process.env,
+    ZCODE_USAGE_DB: dbPath,
+    ZCODE_SESSION_ID: SID,
+    ZCODE_TPS_LAST_SESSION: path.join(tmp, "stop-last-session.json"),
+    ZCODE_TPS_HEALTH: path.join(tmp, "stop-health.json"),
+    ZCODE_TPS_LAST_SHOWN: shownFile,
+  };
+  const runStop = (cfg, stdin = {}) => execFileSync(process.execPath, [STOP], {
+    env: { ...baseEnv, ZCODE_TPS_CONFIG: cfg },
+    input: JSON.stringify({ session_id: SID, ...stdin }),
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  // 默认关闭:无输出,不驱动模型
+  let out = runStop(cfgOff);
+  assert.equal(out, "", "turnEndLine 缺省时 Stop hook 必须放行且无输出");
+  assert.ok(!fs.existsSync(shownFile), "关闭时不得写水位文件");
+
+  // 开启后首次:block + reason 携带速率行,水位落盘 pending=true
+  out = runStop(cfgOn);
+  const payload = JSON.parse(out);
+  assert.equal(payload.decision, "block", "有新数据且开启时应 block 驱动模型补行");
+  assert.ok(payload.reason.includes("本回合已结束") && payload.reason.includes("最近轮均") && payload.reason.includes(">"),
+    "reason 应含显示指令与速率行原文");
+  let shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
+  assert.equal(shown.sessionId, SID);
+  assert.equal(shown.pending, true, "block 前必须先落 pending 水位(防循环的根基)");
+  assert.ok(Number.isFinite(shown.shownAt) && shown.shownAt > 0, "水位应为 coverage.lastCompletedAt");
+
+  // 续跑收尾:pending 存在时一律放行并复位(即使补行请求让水位前进)
+  out = runStop(cfgOn);
+  assert.equal(out, "", "pending 未复位前第二次 Stop 必须放行(防无限续跑)");
+  shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
+  assert.equal(shown.pending, false, "放行时应复位 pending");
+
+  // 水位未前进:不重复显示
+  out = runStop(cfgOn);
+  assert.equal(out, "", "数据无新增时不得重复显示");
+
+  // stop_hook_active:宿主标记的续跑直接放行
+  fs.writeFileSync(shownFile, JSON.stringify({ sessionId: SID, shownAt: 0, pending: false, ts: 0 }));
+  out = runStop(cfgOn, { stop_hook_active: true });
+  assert.equal(out, "", "stop_hook_active=true 必须放行");
+  shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
+  assert.equal(shown.pending, false, "放行路径不得写 pending");
+
+  // 水位前进(模拟新增完成请求):再次 block,行内容为最新数据
+  const db2 = new DatabaseSync(dbPath);
+  insertRequest(db2, { t0: 2_000_000, out: 200, ttft: 100, gen: 900, durMs: 1000, turnId: "turn_stop2" });
+  db2.close();
+  out = runStop(cfgOn);
+  assert.equal(JSON.parse(out).decision, "block", "水位前进后应再次显示");
+
+  // 主开关优先:tokenRateLine=false 时 turnEndLine 也不生效
+  const cfgMaster = path.join(tmp, "stop-config-master.json");
+  fs.writeFileSync(cfgMaster, JSON.stringify({ tokenRateLine: false, turnEndLine: true }));
+  fs.writeFileSync(shownFile, JSON.stringify({ sessionId: SID, shownAt: 0, pending: false, ts: 0 }));
+  out = runStop(cfgMaster);
+  assert.equal(out, "", "tokenRateLine=false 时 Stop hook 必须停用");
+
+  // 损坏水位文件:按无水位处理(防循环靠 pending 重建),不应抛错
+  fs.writeFileSync(shownFile, "not-json{");
+  out = runStop(cfgOn);
+  assert.ok(out === "" || JSON.parse(out).decision === "block", "损坏水位按无水位降级,不抛错");
+}
+
+// ---- 用例 30:turnEndLine 开启时 prompt-submit 让位(显示职责移到 Stop,避免同数据重复) ----
+{
+  const dbPath = path.join(tmp, "turnend-submit.sqlite");
+  const db = new DatabaseSync(dbPath);
+  createModelUsage(db);
+  insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000, turnId: "turn_te" });
+  db.close();
+  const cfgOn = path.join(tmp, "submit-config-on.json");
+  fs.writeFileSync(cfgOn, JSON.stringify({ turnEndLine: true }));
+  const stdout = execFileSync(process.execPath, [HOOK], {
+    env: {
+      ...process.env,
+      ZCODE_USAGE_DB: dbPath,
+      ZCODE_SESSION_ID: SID,
+      ZCODE_TPS_CONFIG: cfgOn,
+      ZCODE_TPS_LAST_SESSION: path.join(tmp, "te-last-session.json"),
+      ZCODE_TPS_HEALTH: path.join(tmp, "te-health.json"),
+    },
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  const payload = JSON.parse(stdout);
+  assert.equal(payload.hookSpecificOutput.additionalContext, "",
+    "turnEndLine 接管显示时 prompt-submit 必须注入空上下文(采样滞后一轮,会与 Stop 行重复)");
+  // 会话识别状态仍照常写入:切会话跟随与 Stop hook 的会话定位依赖它
+  const st = JSON.parse(fs.readFileSync(path.join(tmp, "te-last-session.json"), "utf8"));
+  assert.equal(st.sessionId, SID, "让位时仍必须写会话识别状态");
+}
+
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log("全部 28 个用例通过 ✅(请求端到端口径 / 0.3 旧值 / duration 回退与边界 / 零输出 / 无 first-token / 子代理累计 / hook 契约 / model_usage 单一数据源)");
+console.log("全部 30 个用例通过 ✅(请求端到端口径 / 0.3 旧值 / duration 回退与边界 / 零输出 / 无 first-token / 子代理累计 / hook 契约 / model_usage 单一数据源 / Stop 回合结束行)");

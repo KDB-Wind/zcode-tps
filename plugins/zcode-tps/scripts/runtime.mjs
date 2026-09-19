@@ -41,6 +41,8 @@ export function parseBool(v, def) {
 }
 
 export const stateFile = () => process.env.ZCODE_TPS_LAST_SESSION || path.join(os.homedir(), ".zcode", "zcode-tps.last-session.json");
+// Stop hook 已展示水位(coverage.lastCompletedAt):回合结束显示行与发消息注入的去重依据
+export const lastShownFile = () => process.env.ZCODE_TPS_LAST_SHOWN || path.join(os.homedir(), ".zcode", "zcode-tps.last-shown.json");
 export const configFile = () => process.env.ZCODE_TPS_CONFIG || path.join(os.homedir(), ".zcode", "zcode-tps.config.json");
 export function healthFile(sessionId) {
   const base = process.env.ZCODE_TPS_HEALTH || `${stateFile()}.health.json`;

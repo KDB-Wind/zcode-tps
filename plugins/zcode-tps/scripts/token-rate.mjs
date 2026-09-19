@@ -468,8 +468,8 @@ function fmtK(n) {
 }
 
 // F1:速率行字段名单。默认四段(rates/decode/session/cache);配置 rateLineFields 自定义顺序与组合,
-// "all" 展开全部七段(标准顺序)。未知字段忽略,空名单/非法值回落默认,保证行恒非空。
-const RATE_SEGMENTS = ["rates", "decode", "ttft", "turn", "session", "cache", "time"];
+// "all" 展开全部八段(标准顺序)。未知字段忽略,空名单/非法值回落默认,保证行恒非空。
+const RATE_SEGMENTS = ["rates", "last", "decode", "ttft", "turn", "session", "cache", "time"];
 const DEFAULT_RATE_FIELDS = ["rates", "decode", "session", "cache"];
 
 function resolveRateFields(v) {
@@ -503,6 +503,10 @@ function formatLine(r, fields) {
         : l.tokPerSec != null ? ["最近", l.tokPerSec]
         : ["最近轮均", null];
       parts.push(`⚡ ${label} ${v ?? "-"} tok/s`);
+    } else if (id === "last") {
+      // 上轮对照:最近有效请求的单次端到端速度(latest.tokPerSec),供与 ⚡ 轮均交叉验证单次波动。
+      // 请求级波动大故不入默认名单;无有效请求(如 tokPerSec 为 null)时同其他可选段一样静默跳过。
+      if (l.tokPerSec != null) parts.push(`最近请求 ${l.tokPerSec} tok/s`);
     } else if (id === "decode") {
       // Decode 速度:会话加权纯生成速率(剔除首字等待),近似官方 Decode 口径。
       // "会话均"明示统计范围(整个留存会话,非最近轮),单请求波动大不上行;请求级见 JSON/报表

@@ -2,7 +2,8 @@
 // UserPromptSubmit hook: 每次用户发消息时
 // 1) 记录"用户最后所处的会话"到状态文件(切会话后第一条消息即跟随)
 // 2) 从 ZCode usage 数据库读取真实 token 速率/用量,注入为上下文。输出必须为严格 JSON。
-// 可选配置 ~/.zcode/zcode-tps.config.json:{"tokenRateLine": false} 可关闭速率行注入。
+// 可选配置 ~/.zcode/zcode-tps.config.json:{"tokenRateLine": false} 可关闭速率行注入;
+// {"turnEndLine": true} 改由回合结束(Stop hook)显示,本 hook 让位不再注入(见下方分支)。
 
 import { readConfig, parseBool, stateFile, writeState, recordHealth, startHealth, validId } from "../scripts/runtime.mjs";
 
@@ -29,9 +30,14 @@ try {
   if (!parseBool(cfg.tokenRateLine, true)) {
     complete({ status: "disabled", error: null, warnings: [] });
     emit("");
+  } else if (parseBool(cfg.turnEndLine, false)) {
+    // 回合结束行(turnEndLine)接管显示:发消息时的注入采样滞后一轮,会与 Stop 行重复,故让位。
+    // 会话识别状态与健康记录仍照常写入,保证 S1 会话跟随与 /tps-doctor 可诊断。
+    complete({ status: "disabled", error: null, warnings: [] });
+    emit("");
   } else {
     // includeSubagents 默认开启(缺省视为 true):trace 归因把主会话派生的子代理请求并入会话统计
-    // rateLineFields 自定义速率行字段(默认 rates/decode/session/cache 4段,"all"=全部7段)
+    // rateLineFields 自定义速率行字段(默认 rates/decode/session/cache 4段,"all"=全部8段)
     // timezone 显示时区(默认 Asia/Shanghai,可设 "UTC"/"system"/IANA 名,环境变量 ZCODE_TPS_TIMEZONE 优先)
     const { query, formatLine, resolveRateFields } = await import("../scripts/token-rate.mjs");
     const fields = resolveRateFields(cfg.rateLineFields);

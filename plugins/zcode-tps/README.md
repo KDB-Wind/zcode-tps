@@ -1,4 +1,4 @@
-# zcode-tps 0.5.3
+# zcode-tps 0.5.4
 
 从 `~/.zcode/cli/db/db.sqlite` 的 `model_usage` 只读计算速率、用量和缓存命中率。无需额外模型调用；自动行由模型根据 hook 上下文引用展示。
 
@@ -30,6 +30,7 @@
 ```json
 {
   "tokenRateLine": true,
+  "turnEndLine": false,
   "includeSubagents": true,
   "rateLineFields": ["rates", "ttft", "turn", "session", "cache", "time"],
   "timezone": "Asia/Shanghai"
@@ -39,6 +40,7 @@
 | 字段 | 内容 |
 |---|---|
 | `rates` | 最近一轮的端到端速度(无轮次数据时降级为 会话均→最近请求,标签跟随来源) |
+| `last` | `最近请求`:最近一次有效请求的单次端到端速度(`latest.tokPerSec`),供与 `rates` 轮均交叉验证单次波动;波动大不入默认名单 |
 | `decode` | `Decode 会话均`:整个留存会话的纯生成加权速度(剔除首字等待);请求级分布见 JSON `decodeStats` 与 `/tps` 报表 |
 | `ttft` | 最近有效请求的 TTFT 与输入上下文规模 |
 | `turn` | 最近可识别轮次的输入、输出 |
@@ -46,7 +48,9 @@
 | `cache` | `usage` 范围内的缓存命中率 |
 | `time` | 最近有效请求完成时间（按 `timezone` 显示日期+时间）；查询采样时间另见 `sampledAt` |
 
-`rateLineFields` 缺省为 `["rates", "decode", "session", "cache"]`；`"all"` 展开全部七段。未知字段忽略，空名单或所选字段均无数据时回落默认显示。布尔选项兼容 `"false"`、`"off"` 等字符串。
+`rateLineFields` 缺省为 `["rates", "decode", "session", "cache"]`；`"all"` 展开全部八段。未知字段忽略，空名单或所选字段均无数据时回落默认显示。布尔选项兼容 `"false"`、`"off"` 等字符串。
+
+`turnEndLine`（默认 `false`）把显示时机从"下一次发消息时"改为"回合结束时"（Stop hook）。自动行由 UserPromptSubmit 采样，天然滞后一轮：只发一条消息让 agent 执行长任务的单轮会话，回复末尾不会有任何统计。开启后，回合结束即驱动模型在本轮回复末尾原样补上统计行（含 `last` 段的字段配置不变），单轮会话同样立即可见；代价是每次显示多一次小模型调用，且 prompt-submit 不再注入显示行（其数据滞后一轮，会与本行重复），但会话识别状态照常写入。任何查询失败时静默放行，绝不阻塞回合结束；`tokenRateLine: false` 时本选项一并停用。
 
 `timezone` 控制所有时间显示（速率行 `time` 段、采样提示、`/tps` 报表、doctor），默认 `Asia/Shanghai`；可设 `"UTC"`、`"system"`（跟随系统时区）或任意 IANA 时区名（如 `America/New_York`）。无效值回退默认并在 `warnings` 提示。环境变量 `ZCODE_TPS_TIMEZONE` 优先于配置文件。数据库中的时间戳无时区语义，只是显示层的选择。
 

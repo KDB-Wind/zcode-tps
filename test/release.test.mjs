@@ -492,7 +492,7 @@ try {
     JSON.parse(fs.readFileSync(path.join(root, "marketplace.json"))).plugins[0].version,
     JSON.parse(fs.readFileSync(path.join(root, "plugins/zcode-tps/.zcode-plugin/plugin.json"))).version,
   ];
-  assert.deepEqual(versions, ["0.5.3", "0.5.3", "0.5.3"]);
+  assert.deepEqual(versions, ["0.5.4", "0.5.4", "0.5.4"]);
   // 发布一致性:README 版本与示例、hook 注释与字段常量对应,防止再次漂移
   const pkgVersion = versions[0];
   const { DEFAULT_RATE_FIELDS } = await import(pathToFileURL(path.join(root, "plugins/zcode-tps/scripts/token-rate.mjs")).href + "?drift");

@@ -1,5 +1,5 @@
 {
-  "description": "zcode-tps: 会话初始化提示 + 每次发消息时注入 token 速率/用量行",
+  "description": "zcode-tps: 会话初始化提示 + 每次发消息时注入 token 速率/用量行 + 回合结束显示(可选,turnEndLine)",
   "hooks": {
     "SessionStart": [
       {
@@ -28,6 +28,21 @@
             ],
             "timeoutMs": 8000,
             "statusMessage": "zcode-tps: 采集 token 速率…"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/stop.mjs"
+            ],
+            "timeoutMs": 8000,
+            "statusMessage": "zcode-tps: 回合结束采集…"
           }
         ]
       }
