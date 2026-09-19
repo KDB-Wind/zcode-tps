@@ -33,18 +33,29 @@ function readShown(file) {
 
 // 系统通知:detached spawn,hook 立即退出不等结果;任何平台失败静默。
 // 测试与 CI 设 ZCODE_TPS_NOTIFY_SUPPRESS=1 跳过真实弹窗。
-function sendNotify(line) {
+// Windows 首次通知前写 HKCU 注册表开启 PowerShell AUMID 的横幅权限(新机器默认可能为关,
+// 静默 toast 会被丢弃);仅 ensurePermission=true(首条通知)时写入,之后尊重用户在系统设置里的开关。
+function sendNotify(line, ensurePermission) {
   if (process.env.ZCODE_TPS_NOTIFY_SUPPRESS === "1") return;
   try {
     let command, args;
     if (process.platform === "win32") {
+      const aumid = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
       // Windows.UI.Notifications 免依赖 toast;AppId 复用 PowerShell 的已注册身份,否则不显示。
+      const perm = ensurePermission
+        ? "$p='HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings\\" + aumid + "';" +
+          "if(-not(Test-Path $p)){New-Item $p -Force|Out-Null};" +
+          "Set-ItemProperty $p -Name Enabled -Value 1 -Type DWord;" +
+          "Set-ItemProperty $p -Name ShowBanner -Value 1 -Type DWord;" +
+          "Set-ItemProperty $p -Name ShowInActionCenter -Value 1 -Type DWord;"
+        : "";
       const script =
+        perm +
         "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null;" +
         "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);" +
         "$x=$t.GetElementsByTagName('text').Item(0);$x.AppendChild($t.CreateTextNode('zcode-tps'))|Out-Null;" +
         "$x=$t.GetElementsByTagName('text').Item(1);$x.AppendChild($t.CreateTextNode(" + JSON.stringify(line) + "))|Out-Null;" +
-        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($t))";
+        "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('" + aumid + "').Show([Windows.UI.Notifications.ToastNotification]::new($t))";
       command = "powershell";
       args = ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand",
         Buffer.from(script, "utf16le").toString("base64")];
@@ -88,7 +99,7 @@ try {
   writeState(file, { sessionId: result.sessionId, shownAt: lastCompletedAt, ts: Date.now(), source: "stop" });
   complete({ status: "ok", resolvedSessionId: result.sessionId, lastSuccessAt: Date.now(),
     sampledAt: result.sampledAt, error: null, warnings: result.warnings });
-  sendNotify(formatLine(result, resolveRateFields(cfg.rateLineFields)));
+  sendNotify(formatLine(result, resolveRateFields(cfg.rateLineFields)), !shown);
 } catch {
   process.exit(0);
 }
