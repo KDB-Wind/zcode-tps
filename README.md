@@ -23,7 +23,7 @@ ZCode 插件：从本地 SQLite 用量库读取 token 速率与用量，在回�
 - `/tps-doctor`：依赖、配置、数据库与最近 hook 采集结果自检。
 - `~/.zcode/zcode-tps.config.json` 写入 `{"tokenRateLine": false}` 可关闭自动行，下一次 hook 即生效。
 - `{"rateLineFields": "all"}` 展示全部字段；如 `["rates", "turn", "time"]` 可自定义字段和顺序。
-- `{"turnEndLine": true}` 把显示时机改为回合结束（Stop hook）：单轮会话（发一条消息执行长任务）的回复末尾也能立即看到统计，不再要等第二条消息；代价是每次显示多一次小模型调用，且长回合会被 ZCode 折叠为摘要条。改用 `{"turnEndLine": "notify"}` 则以系统通知显示统计——不动会话流、零额外调用，但不在对话历史里。
+- `{"turnEndLine": true}` 开启回合结束的系统通知（Stop hook）：单轮会话（发一条消息执行长任务）结束立即弹通知显示统计，不用等第二条消息；不动会话流、零额外模型调用，对话流内的注入行照常保留。
 
 ## 数据含义
 

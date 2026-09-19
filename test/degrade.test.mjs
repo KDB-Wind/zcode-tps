@@ -717,7 +717,9 @@ async function loadWith(dbPath) {
   assert.equal(r.cacheHit, 90, "缓存命中率 = 1800/2000(新鲜口径)");
 }
 
-// ---- 用例 29:Stop hook(回合结束显示)—— 默认关、开启后 block/防循环/水位去重 ----
+// ---- 用例 29:Stop hook(回合结束系统通知)—— 默认关、开启后通知/水位去重/主开关优先 ----
+// 设计说明:曾经存在 block 续跑补行形态,因 ZCode 会把续跑回合折叠为摘要条(回答主体不可见)
+// 已按用户裁决移除;通知模式无续跑、无循环,pending/stop_hook_active 机制随之删除。
 {
   const STOP = path.join(path.dirname(SCRIPT), "..", "hooks", "stop.mjs");
   const dbPath = path.join(tmp, "stop.sqlite");
@@ -737,6 +739,7 @@ async function loadWith(dbPath) {
     ZCODE_TPS_LAST_SESSION: path.join(tmp, "stop-last-session.json"),
     ZCODE_TPS_HEALTH: path.join(tmp, "stop-health.json"),
     ZCODE_TPS_LAST_SHOWN: shownFile,
+    ZCODE_TPS_NOTIFY_SUPPRESS: "1", // 测试不弹真实系统通知
   };
   const runStop = (cfg, stdin = {}) => execFileSync(process.execPath, [STOP], {
     env: { ...baseEnv, ZCODE_TPS_CONFIG: cfg },
@@ -745,99 +748,73 @@ async function loadWith(dbPath) {
     stdio: ["pipe", "pipe", "pipe"],
   });
 
-  // 默认关闭:无输出,不驱动模型
+  // 默认关闭:无输出,不弹通知
   let out = runStop(cfgOff);
   assert.equal(out, "", "turnEndLine 缺省时 Stop hook 必须放行且无输出");
   assert.ok(!fs.existsSync(shownFile), "关闭时不得写水位文件");
 
-  // 开启后首次:block + reason 携带速率行,水位落盘 pending=true
+  // 开启后首次:输出空(不驱动模型续跑),水位落盘
   out = runStop(cfgOn);
-  const payload = JSON.parse(out);
-  assert.equal(payload.decision, "block", "有新数据且开启时应 block 驱动模型补行");
-  assert.ok(payload.reason.includes("本回合已结束") && payload.reason.includes("最近轮均") && payload.reason.includes(">"),
-    "reason 应含显示指令与速率行原文");
+  assert.equal(out, "", "notify 模式必须放行且无输出(不驱动模型续跑,不折叠回合)");
   let shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
   assert.equal(shown.sessionId, SID);
-  assert.equal(shown.pending, true, "block 前必须先落 pending 水位(防循环的根基)");
   assert.ok(Number.isFinite(shown.shownAt) && shown.shownAt > 0, "水位应为 coverage.lastCompletedAt");
+  assert.equal(shown.pending, undefined, "通知模式无 pending 机制(无循环风险)");
 
-  // 续跑收尾:pending 存在时一律放行并复位(即使补行请求让水位前进)
+  // 水位未前进:不重复通知
   out = runStop(cfgOn);
-  assert.equal(out, "", "pending 未复位前第二次 Stop 必须放行(防无限续跑)");
-  shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-  assert.equal(shown.pending, false, "放行时应复位 pending");
+  assert.equal(out, "", "数据无新增时不得重复通知");
 
-  // 水位未前进:不重复显示
-  out = runStop(cfgOn);
-  assert.equal(out, "", "数据无新增时不得重复显示");
-
-  // stop_hook_active:宿主标记的续跑直接放行
-  fs.writeFileSync(shownFile, JSON.stringify({ sessionId: SID, shownAt: 0, pending: false, ts: 0 }));
-  out = runStop(cfgOn, { stop_hook_active: true });
-  assert.equal(out, "", "stop_hook_active=true 必须放行");
-  shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-  assert.equal(shown.pending, false, "放行路径不得写 pending");
-
-  // 水位前进(模拟新增完成请求):再次 block,行内容为最新数据
+  // 水位前进(新增完成请求):再次通知,水位前进
   const db2 = new DatabaseSync(dbPath);
   insertRequest(db2, { t0: 2_000_000, out: 200, ttft: 100, gen: 900, durMs: 1000, turnId: "turn_stop2" });
   db2.close();
   out = runStop(cfgOn);
-  assert.equal(JSON.parse(out).decision, "block", "水位前进后应再次显示");
+  assert.equal(out, "", "有新数据时再次通知(抑制模式下输出为空)");
+  shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
+  assert.ok(shown.shownAt > 1_000_000, "水位应前进到最新完成请求");
 
-  // 主开关优先:tokenRateLine=false 时 turnEndLine 也不生效
+  // 字符串形式与布尔等价
+  const cfgStr = path.join(tmp, "stop-config-str.json");
+  fs.writeFileSync(cfgStr, JSON.stringify({ turnEndLine: "notify" }));
+  out = runStop(cfgStr);
+  assert.equal(out, "", "notify 字符串与 true 等价(水位未前进时无输出)");
+
+  // 主开关优先:tokenRateLine=false 时通知也不生效
   const cfgMaster = path.join(tmp, "stop-config-master.json");
   fs.writeFileSync(cfgMaster, JSON.stringify({ tokenRateLine: false, turnEndLine: true }));
-  fs.writeFileSync(shownFile, JSON.stringify({ sessionId: SID, shownAt: 0, pending: false, ts: 0 }));
+  fs.writeFileSync(shownFile, JSON.stringify({ sessionId: SID, shownAt: 0, ts: 0 }));
   out = runStop(cfgMaster);
   assert.equal(out, "", "tokenRateLine=false 时 Stop hook 必须停用");
+  assert.equal(JSON.parse(fs.readFileSync(shownFile, "utf8")).shownAt, 0, "停用时不得更新水位");
 
-  // 损坏水位文件:按无水位处理(防循环靠 pending 重建),不应抛错
+  // 损坏水位文件:按无水位处理,不应抛错
   fs.writeFileSync(shownFile, "not-json{");
   out = runStop(cfgOn);
-  assert.ok(out === "" || JSON.parse(out).decision === "block", "损坏水位按无水位降级,不抛错");
-
-  // notify 模式:不 block、输出空、水位照写(去重)、不写 pending;ZCODE_TPS_NOTIFY_SUPPRESS 跳过真实弹窗
-  const cfgNotify = path.join(tmp, "stop-config-notify.json");
-  fs.writeFileSync(cfgNotify, JSON.stringify({ turnEndLine: "notify" }));
-  fs.rmSync(shownFile, { force: true });
-  const notifyEnv = { ...baseEnv, ZCODE_TPS_CONFIG: cfgNotify, ZCODE_TPS_NOTIFY_SUPPRESS: "1" };
-  const runStopNotify = (stdin = {}) => execFileSync(process.execPath, [STOP], {
-    env: notifyEnv, input: JSON.stringify({ session_id: SID, ...stdin }),
-    encoding: "utf8", stdio: ["pipe", "pipe", "pipe"],
-  });
-  out = runStopNotify();
-  assert.equal(out, "", "notify 模式必须放行且无输出(不驱动模型续跑)");
-  shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-  assert.equal(shown.pending, false, "notify 模式不得写 pending(无循环风险)");
-  assert.equal(shown.source, "stop-notify", "notify 模式水位来源应可辨识");
-  out = runStopNotify();
-  assert.equal(out, "", "notify 模式数据未前进时不得重复弹通知");
+  assert.equal(out, "", "损坏水位按无水位降级,不抛错");
 }
 
-// ---- 用例 29b:turnEndLine 三态解析 ----
+// ---- 用例 29b:turnEndLine 两态解析 ----
 {
   const { resolveTurnEndMode } = await import(pathToFileURL(path.join(SCRIPT, "..", "runtime.mjs")).href + "?case=tem" + Math.random());
   const eq = (a, b) => assert.equal(a, b);
   eq(resolveTurnEndMode(undefined), "off");
   eq(resolveTurnEndMode(null), "off");
   eq(resolveTurnEndMode(false), "off");
-  eq(resolveTurnEndMode(true), "block");
-  eq(resolveTurnEndMode(1), "block");
   eq(resolveTurnEndMode(0), "off");
+  eq(resolveTurnEndMode(true), "notify");
+  eq(resolveTurnEndMode(1), "notify");
   eq(resolveTurnEndMode("notify"), "notify");
   eq(resolveTurnEndMode(" NOTIFY "), "notify");
   eq(resolveTurnEndMode("toast"), "notify");
-  eq(resolveTurnEndMode("block"), "block");
-  eq(resolveTurnEndMode("on"), "block");
+  eq(resolveTurnEndMode("on"), "notify");
   eq(resolveTurnEndMode("off"), "off");
   eq(resolveTurnEndMode("nope"), "off");
   eq(resolveTurnEndMode({}), "off");
 }
 
-// ---- 用例 30:turnEndLine 开启时 prompt-submit 让位(显示职责移到 Stop,避免同数据重复) ----
-// 同时覆盖 pending 兜底复位:ZCode 在 Stop block 续跑后不再触发第二次 Stop(2026-09-19 实测),
-// pending 残留会吃掉下一回合显示,故 prompt-submit 每条用户消息时复位。
+// ---- 用例 30:turnEndLine 开启时 prompt-submit 照常注入 ----
+// 通知在系统侧、注入行在对话流内,两渠道互补:通知管即时,注入行管历史记录,互不替代。
 {
   const dbPath = path.join(tmp, "turnend-submit.sqlite");
   const db = new DatabaseSync(dbPath);
@@ -845,50 +822,24 @@ async function loadWith(dbPath) {
   insertRequest(db, { t0: 1_000_000, out: 100, ttft: 100, gen: 900, durMs: 1000, turnId: "turn_te" });
   db.close();
   const cfgOn = path.join(tmp, "submit-config-on.json");
-  fs.writeFileSync(cfgOn, JSON.stringify({ turnEndLine: true }));
-  const shownFile = path.join(tmp, "te-shown.json");
-  const submitEnv = {
-    ...process.env,
-    ZCODE_USAGE_DB: dbPath,
-    ZCODE_SESSION_ID: SID,
-    ZCODE_TPS_CONFIG: cfgOn,
-    ZCODE_TPS_LAST_SESSION: path.join(tmp, "te-last-session.json"),
-    ZCODE_TPS_HEALTH: path.join(tmp, "te-health.json"),
-    ZCODE_TPS_LAST_SHOWN: shownFile,
-  };
+  fs.writeFileSync(cfgOn, JSON.stringify({ turnEndLine: "notify" }));
   const stdout = execFileSync(process.execPath, [HOOK], {
-    env: { ...submitEnv },
+    env: {
+      ...process.env,
+      ZCODE_USAGE_DB: dbPath,
+      ZCODE_SESSION_ID: SID,
+      ZCODE_TPS_CONFIG: cfgOn,
+      ZCODE_TPS_LAST_SESSION: path.join(tmp, "te-last-session.json"),
+      ZCODE_TPS_HEALTH: path.join(tmp, "te-health.json"),
+    },
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
   });
   const payload = JSON.parse(stdout);
-  assert.equal(payload.hookSpecificOutput.additionalContext, "",
-    "turnEndLine 接管显示时 prompt-submit 必须注入空上下文(采样滞后一轮,会与 Stop 行重复)");
-  // 会话识别状态仍照常写入:切会话跟随与 Stop hook 的会话定位依赖它
+  assert.ok(payload.hookSpecificOutput.additionalContext.includes("⚡"),
+    "notify 模式下 prompt-submit 照常注入(对话流历史记录仍由注入行负责)");
   const st = JSON.parse(fs.readFileSync(path.join(tmp, "te-last-session.json"), "utf8"));
-  assert.equal(st.sessionId, SID, "让位时仍必须写会话识别状态");
-
-  // pending 残留(Stop#2 未触发的实际形态)→ prompt-submit 复位
-  fs.writeFileSync(shownFile, JSON.stringify({ sessionId: SID, shownAt: 111, pending: true, ts: 100 }));
-  execFileSync(process.execPath, [HOOK], { env: { ...submitEnv }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  let shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-  assert.equal(shown.pending, false, "pending 残留必须被 prompt-submit 兜底复位(否则下一回合显示被吃)");
-  assert.equal(shown.shownAt, 111, "复位只清 pending,不动水位值");
-  // 已复位时不重写(时间戳不前进,避免无谓的文件写入)
-  fs.writeFileSync(shownFile, JSON.stringify({ sessionId: SID, shownAt: 111, pending: false, ts: 555 }));
-  execFileSync(process.execPath, [HOOK], { env: { ...submitEnv }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-  assert.equal(shown.ts, 555, "pending 已为 false 时不得重写水位文件");
-  // 损坏水位文件:静默忽略,不影响注入
-  fs.writeFileSync(shownFile, "not-json{");
-  const out2 = execFileSync(process.execPath, [HOOK], { env: { ...submitEnv }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  assert.equal(JSON.parse(out2).hookSpecificOutput.additionalContext, "", "水位文件损坏不影响 prompt-submit 主流程");
-
-  // notify 模式下 prompt-submit 同样让位(否则会与系统通知重复)
-  const cfgNotify = path.join(tmp, "submit-config-notify.json");
-  fs.writeFileSync(cfgNotify, JSON.stringify({ turnEndLine: "notify" }));
-  const out3 = execFileSync(process.execPath, [HOOK], { env: { ...submitEnv, ZCODE_TPS_CONFIG: cfgNotify }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
-  assert.equal(JSON.parse(out3).hookSpecificOutput.additionalContext, "", "turnEndLine=notify 时 prompt-submit 同样让位");
+  assert.equal(st.sessionId, SID, "会话识别状态照常写入");
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

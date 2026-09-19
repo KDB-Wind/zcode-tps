@@ -1,5 +1,5 @@
 {
-  "description": "zcode-tps: 会话初始化提示 + 每次发消息时注入 token 速率/用量行 + 回合结束显示(可选,turnEndLine)",
+  "description": "zcode-tps: 会话初始化提示 + 每次发消息时注入 token 速率/用量行 + 回合结束系统通知(可选,turnEndLine)",
   "hooks": {
     "SessionStart": [
       {
