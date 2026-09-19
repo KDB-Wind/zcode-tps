@@ -6,7 +6,7 @@
 // {"turnEndLine": true} 改由回合结束(Stop hook)显示,本 hook 让位不再注入(见下方分支)。
 
 import fs from "node:fs";
-import { readConfig, parseBool, stateFile, lastShownFile, writeState, recordHealth, startHealth, validId } from "../scripts/runtime.mjs";
+import { readConfig, parseBool, resolveTurnEndMode, stateFile, lastShownFile, writeState, recordHealth, startHealth, validId } from "../scripts/runtime.mjs";
 
 const sid = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || "";
 const run = startHealth(sid);
@@ -41,9 +41,9 @@ try {
   if (!parseBool(cfg.tokenRateLine, true)) {
     complete({ status: "disabled", error: null, warnings: [] });
     emit("");
-  } else if (parseBool(cfg.turnEndLine, false)) {
-    // 回合结束行(turnEndLine)接管显示:发消息时的注入采样滞后一轮,会与 Stop 行重复,故让位。
-    // 会话识别状态与健康记录仍照常写入,保证 S1 会话跟随与 /tps-doctor 可诊断。
+  } else if (resolveTurnEndMode(cfg.turnEndLine) !== "off") {
+    // 回合结束行(turnEndLine 的 block/notify 模式)接管显示:发消息时的注入采样滞后一轮,
+    // 会与回合结束的显示重复,故让位。会话识别状态与健康记录仍照常写入。
     complete({ status: "disabled", error: null, warnings: [] });
     emit("");
   } else {

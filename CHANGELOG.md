@@ -6,6 +6,7 @@
 
 - 新增可选的回合结束显示（`turnEndLine`，默认关闭）：新增 Stop hook（`hooks/stop.mjs`），在回合结束时驱动模型在本轮回复末尾原样补上统计行。修复单轮会话的显示空窗——此前自动行由发消息时的 UserPromptSubmit 采样，天然滞后一轮，只发一条消息执行长任务时回复末尾没有任何统计。开启后 prompt-submit 不再注入显示行（数据滞后一轮会与 Stop 行重复），会话识别状态照常写入；防循环双保险（宿主 `stop_hook_active` 标记 + last-shown 水位 `pending` 标记，至多连续 block 一次）；任何失败静默放行，不阻塞回合结束；已展示水位（`coverage.lastCompletedAt`，`zcode-tps.last-shown.json`）保证不重复显示。代价是每次显示多一次小模型调用，故默认关闭。
 - 修复隔轮不显示：ZCode 在 Stop block 续跑结束后不再触发第二次 Stop（2026-09-19 本机实测，水位文件时间线确证），`pending` 标记残留导致下一回合被续跑放行分支误放行，呈"显示一轮、漏一轮"交替。prompt-submit 现于每条用户消息时兜底复位 `pending`（只清标记不动水位值），Stop 侧续跑放行分支保留。
+- `turnEndLine` 新增 `"notify"` 模式：弹系统通知（Windows toast / macOS / Linux notify-send，零依赖）显示统计。源码确证 ZCode 的 Stop hook 无免续跑的会话内显示通道（`systemMessage` 不 block 时被忽略、纯 `additionalContext` 只写消息历史），续跑补行会使回合被 ZCode 折叠为"已工作"摘要条；通知模式完全不动会话流、零额外模型调用，规避折叠，代价是统计不在对话历史里。`true`（补行）与 `"notify"` 可随时配置切换，二者都让 prompt-submit 让位、共用同一水位去重。
 - 速率行新增可选 `last` 段：最近有效请求的单次端到端速度（`latest.tokPerSec`），供与 ⚡ 轮均交叉验证单次波动。请求级波动大，不入默认名单；无有效请求（速率为 null）时同其他可选段一样静默跳过。`rateLineFields: "all"` 由此展开为八段（`rates/last/decode/ttft/turn/session/cache/time`）。字段解析与渲染测试同步覆盖：默认行不含 `last`、`"all"` 含、自定义顺序生效、无数据跳过。
 - CI 矩阵新增 macOS（`macos-latest` × Node 22.13/24）：插件为跨平台纯 Node（`node:sqlite` + `homedir` 路径），此前仅 Windows/Linux 有 CI 实测；根 README 平台说明同步。
 - 测试新增 Stop hook 用例（默认关/开启 block/续跑放行/水位去重/`stop_hook_active`/主开关优先/损坏水位降级）与 prompt-submit 让位用例。

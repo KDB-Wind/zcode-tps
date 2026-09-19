@@ -796,6 +796,43 @@ async function loadWith(dbPath) {
   fs.writeFileSync(shownFile, "not-json{");
   out = runStop(cfgOn);
   assert.ok(out === "" || JSON.parse(out).decision === "block", "损坏水位按无水位降级,不抛错");
+
+  // notify 模式:不 block、输出空、水位照写(去重)、不写 pending;ZCODE_TPS_NOTIFY_SUPPRESS 跳过真实弹窗
+  const cfgNotify = path.join(tmp, "stop-config-notify.json");
+  fs.writeFileSync(cfgNotify, JSON.stringify({ turnEndLine: "notify" }));
+  fs.rmSync(shownFile, { force: true });
+  const notifyEnv = { ...baseEnv, ZCODE_TPS_CONFIG: cfgNotify, ZCODE_TPS_NOTIFY_SUPPRESS: "1" };
+  const runStopNotify = (stdin = {}) => execFileSync(process.execPath, [STOP], {
+    env: notifyEnv, input: JSON.stringify({ session_id: SID, ...stdin }),
+    encoding: "utf8", stdio: ["pipe", "pipe", "pipe"],
+  });
+  out = runStopNotify();
+  assert.equal(out, "", "notify 模式必须放行且无输出(不驱动模型续跑)");
+  shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
+  assert.equal(shown.pending, false, "notify 模式不得写 pending(无循环风险)");
+  assert.equal(shown.source, "stop-notify", "notify 模式水位来源应可辨识");
+  out = runStopNotify();
+  assert.equal(out, "", "notify 模式数据未前进时不得重复弹通知");
+}
+
+// ---- 用例 29b:turnEndLine 三态解析 ----
+{
+  const { resolveTurnEndMode } = await import(pathToFileURL(path.join(SCRIPT, "..", "runtime.mjs")).href + "?case=tem" + Math.random());
+  const eq = (a, b) => assert.equal(a, b);
+  eq(resolveTurnEndMode(undefined), "off");
+  eq(resolveTurnEndMode(null), "off");
+  eq(resolveTurnEndMode(false), "off");
+  eq(resolveTurnEndMode(true), "block");
+  eq(resolveTurnEndMode(1), "block");
+  eq(resolveTurnEndMode(0), "off");
+  eq(resolveTurnEndMode("notify"), "notify");
+  eq(resolveTurnEndMode(" NOTIFY "), "notify");
+  eq(resolveTurnEndMode("toast"), "notify");
+  eq(resolveTurnEndMode("block"), "block");
+  eq(resolveTurnEndMode("on"), "block");
+  eq(resolveTurnEndMode("off"), "off");
+  eq(resolveTurnEndMode("nope"), "off");
+  eq(resolveTurnEndMode({}), "off");
 }
 
 // ---- 用例 30:turnEndLine 开启时 prompt-submit 让位(显示职责移到 Stop,避免同数据重复) ----
@@ -846,6 +883,12 @@ async function loadWith(dbPath) {
   fs.writeFileSync(shownFile, "not-json{");
   const out2 = execFileSync(process.execPath, [HOOK], { env: { ...submitEnv }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   assert.equal(JSON.parse(out2).hookSpecificOutput.additionalContext, "", "水位文件损坏不影响 prompt-submit 主流程");
+
+  // notify 模式下 prompt-submit 同样让位(否则会与系统通知重复)
+  const cfgNotify = path.join(tmp, "submit-config-notify.json");
+  fs.writeFileSync(cfgNotify, JSON.stringify({ turnEndLine: "notify" }));
+  const out3 = execFileSync(process.execPath, [HOOK], { env: { ...submitEnv, ZCODE_TPS_CONFIG: cfgNotify }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  assert.equal(JSON.parse(out3).hookSpecificOutput.additionalContext, "", "turnEndLine=notify 时 prompt-submit 同样让位");
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });

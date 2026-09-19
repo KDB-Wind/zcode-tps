@@ -50,7 +50,13 @@
 
 `rateLineFields` 缺省为 `["rates", "decode", "session", "cache"]`；`"all"` 展开全部八段。未知字段忽略，空名单或所选字段均无数据时回落默认显示。布尔选项兼容 `"false"`、`"off"` 等字符串。
 
-`turnEndLine`（默认 `false`）把显示时机从"下一次发消息时"改为"回合结束时"（Stop hook）。自动行由 UserPromptSubmit 采样，天然滞后一轮：只发一条消息让 agent 执行长任务的单轮会话，回复末尾不会有任何统计。开启后，回合结束即驱动模型在本轮回复末尾原样补上统计行（含 `last` 段的字段配置不变），单轮会话同样立即可见；代价是每次显示多一次小模型调用，且 prompt-submit 不再注入显示行（其数据滞后一轮，会与本行重复），但会话识别状态照常写入。任何查询失败时静默放行，绝不阻塞回合结束；`tokenRateLine: false` 时本选项一并停用。
+`turnEndLine`（默认 `false`）把显示时机从"下一次发消息时"改为"回合结束时"（Stop hook）。自动行由 UserPromptSubmit 采样，天然滞后一轮：只发一条消息让 agent 执行长任务的单轮会话，回复末尾不会有任何统计。三种取值：
+
+- `true`（或 `"block"`）：回合结束时驱动模型在本轮回复末尾原样补上统计行，单轮会话立即出现在会话流里；代价是一次续跑模型调用，且 ZCode 会将该回合折叠为"已工作"摘要条（点开查看），此为 ZCode 对续跑回合的固定渲染。
+- `"notify"`（或 `"toast"`）：改为弹系统通知（Windows toast / macOS 通知中心 / Linux notify-send）显示统计，完全不动会话流、零续跑调用；统计不在对话历史里。Windows 通知复用 PowerShell 的应用身份，无第三方依赖。
+- `false`：关闭。
+
+开启任一模式后 prompt-submit 不再注入显示行（其数据滞后一轮，会与回合结束显示重复），但会话识别状态照常写入。数据未前进（水位未更新）时不重复显示；block 模式防循环双保险（宿主 `stop_hook_active` 标记 + last-shown 水位 `pending` 标记，至多连续 block 一次，由 prompt-submit 兜底复位）；任何查询失败静默放行，绝不阻塞回合结束；`tokenRateLine: false` 时本选项一并停用。
 
 `timezone` 控制所有时间显示（速率行 `time` 段、采样提示、`/tps` 报表、doctor），默认 `Asia/Shanghai`；可设 `"UTC"`、`"system"`（跟随系统时区）或任意 IANA 时区名（如 `America/New_York`）。无效值回退默认并在 `warnings` 提示。环境变量 `ZCODE_TPS_TIMEZONE` 优先于配置文件。数据库中的时间戳无时区语义，只是显示层的选择。
 
