@@ -198,7 +198,8 @@ export function startHealth(sessionId, hook = null) {
   // 本次运行的易变字段在启动时清零(审核 R05):上一轮的 notified/notifyStatus/错误不得
   // 泄漏进新记录冒充本次结果。lastSuccessAt 是跨轮历史字段("最后成功"),保留。
   recordHealth({ ...run, status: "running", durationMs: null, totalMs: null, stdinMs: null, queryMs: null,
-    sampledAt: null, resolvedSessionId: null, error: null, warnings: [], notified: null, notifyStatus: null });
+    sampledAt: null, resolvedSessionId: null, error: null, warnings: [],
+    notified: null, notifyStatus: null, skipReason: null });
   return run;
 }
 

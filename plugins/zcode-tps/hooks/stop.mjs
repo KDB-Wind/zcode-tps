@@ -16,6 +16,8 @@
 //   同步 SQLite 无法从同线程中断,查询放入有界子进程,超时终止,墙钟上限不再依赖锁等待叠加(R03);
 // - 通知等待退出码:非零退出/信号 = 提交失败,不落水位,下次 Stop 重试(R01);
 // - 去重水位按会话哈希独立文件,并发 Stop 互不覆盖(R04);旧共享多槽文件只作迁移读;
+// - 同会话"比较→发送→写水位"以原子 claim 串行化:相同内容不重复发送,旧采样晚完成
+//   不倒写新水位;占用后重验,拿不到锁即让位(不等待、不耗预算),残留锁由 pid/过期回收;
 // - 指纹覆盖实际展示所需的原始聚合(速率分母/缓存分子/最新请求/字段选择),不只哈希四舍五入后的行文本(R02)。
 // 任何失败静默放行(exit 0),绝不阻塞回合结束。
 import fs from "node:fs";
@@ -96,7 +98,11 @@ function readLegacyShown(file) {
 
 function slotFrom(slot) {
   return slot
-    ? { fingerprint: typeof slot.fingerprint === "string" ? slot.fingerprint : null, shownAt: Number(slot.shownAt) || 0 }
+    ? {
+        fingerprint: typeof slot.fingerprint === "string" ? slot.fingerprint : null,
+        shownAt: Number(slot.shownAt) || 0,
+        ts: Number(slot.ts) || 0, // 水位写入时刻:占用后重验的"更新采样已提交"判据(§12.3)
+      }
     : null;
 }
 
@@ -116,6 +122,56 @@ function writeShownSlot(sessionId, fingerprint, shownAt) {
   const file = shownSlotFile(sessionId);
   if (!file) return;
   writeState(file, { version: 3, sessionId, shownAt, fingerprint, ts: Date.now(), source: "stop" });
+}
+
+// ---- 同会话原子占用(审核 §12.3):claim 文件 + 占用后重验 + 防倒写 ----
+// "比较水位→发送通知→写水位"对同会话并不原子:并发 Stop 会重复发送相同内容,
+// 旧采样晚完成的运行还会倒写新水位。修复:发送前以 O_EXCL 原子创建 claim(带 pid/runId/ts),
+// 只有占用者发送与写水位;占用后重读水位,发现内容已被并发通知(指纹一致)、已有更新的
+// 完成水位、或水位写入时刻晚于本次采样开始(即占用前已有基于更新采样的提交)时让位。
+// 拿不到锁不等待(等待会消耗预算),直接让位;持有者被强杀由 pid 活性 + 过期时限回收兜底;
+// 通知失败/异常路径释放锁,下次 Stop 可重试。跨会话本就互不影响(独立水位文件)。
+const CLAIM_STALE_MS = 15000;
+
+const claimPath = (sessionId) => {
+  const f = shownSlotFile(sessionId);
+  return f ? `${f}.claim` : null;
+};
+
+function pidAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
+}
+
+function acquireClaim(file, runId) {
+  if (!file) return true; // 无法定位会话文件时不设锁(水位写入本身仍是原子的单文件替换)
+  const create = () => {
+    const fd = fs.openSync(file, "wx");
+    try { fs.writeFileSync(fd, JSON.stringify({ runId, pid: process.pid, ts: Date.now() })); }
+    finally { fs.closeSync(fd); }
+  };
+  try {
+    create();
+    return true;
+  } catch (e) {
+    if (e.code !== "EEXIST") return false;
+  }
+  try {
+    // 已存在:持有者进程仍在且未过期 → 让位;否则回收(残留锁)后重试一次
+    const c = parseJson(fs.readFileSync(file, "utf8"));
+    const live = c && pidAlive(c.pid) && Date.now() - (Number(c.ts) || 0) <= CLAIM_STALE_MS;
+    if (live) return false;
+    try { fs.unlinkSync(file); } catch {}
+    create();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function releaseClaim(file) {
+  if (!file) return;
+  try { fs.unlinkSync(file); } catch {}
 }
 
 // "曾成功通知过"标记:决定是否在首次通知前补写 Windows 注册表横幅权限(幂等,仅一次)
@@ -211,6 +267,7 @@ const sid = input.session_id || process.env.ZCODE_SESSION_ID || process.env.CLAU
 // 健康记录按 会话+hook 分文件(F02);stdin/查询/全程耗时分段记录(R03)
 const run = startHealth(sid, HOOK_STOP);
 let queryMs = null;
+let heldClaim = null; // 同会话占用锁(持有中;所有退出路径必须释放,含异常路径)
 const complete = (update) => {
   try {
     recordHealth({ ...run, ...update, stdinMs, queryMs,
@@ -248,19 +305,49 @@ try {
   // F05/R01:先提交并确认退出结果,成功后才落水位——非零退出/信号不前进水位,下回合 Stop 自然重试。
   // (代价:通知已提交但水位写失败时可能重复通知一次;按 F05 裁定,重试机会优先于严格一次。)
   // ensurePermission 仅首次:注册表开启横幅权限只做一次,之后尊重用户系统设置。
+  // §12.3:同会话原子占用——比较→发送→写水位只允许一个持有者;占用后重验,
+  // 拿到锁的旧采样不再覆盖新结果(倒写),相同内容不被并发重复发送。
+  const claim = claimPath(result.sessionId);
+  if (!acquireClaim(claim, run.runId)) {
+    complete({ status: "ok", resolvedSessionId: result.sessionId ?? null, lastSuccessAt: Date.now(),
+      sampledAt: result.sampledAt, notified: false, skipReason: "locked",
+      error: null, warnings: result.warnings });
+    process.exit(0);
+  }
+  heldClaim = claim;
+  // 占用后重验:并发者可能恰在本 run 查询期间完成了通知与写入
+  const reread = readShownSlot(result.sessionId);
+  let skipReason = null;
+  if (reread && reread.fingerprint === fingerprint) skipReason = "concurrent";      // 相同内容已被并发通知
+  else if (reread && (reread.shownAt ?? 0) > lastCompletedAt) skipReason = "stale"; // 已有更新的完成水位
+  else if (reread && (reread.ts ?? 0) > queryStart) skipReason = "stale";           // 已有基于更新采样的提交
+  if (skipReason) {
+    releaseClaim(heldClaim);
+    heldClaim = null;
+    complete({ status: "ok", resolvedSessionId: result.sessionId ?? null, lastSuccessAt: Date.now(),
+      sampledAt: result.sampledAt, notified: false, skipReason,
+      error: null, warnings: result.warnings });
+    process.exit(0);
+  }
   const confirmMs = Math.max(200, Math.min(NOTIFY_CONFIRM_MS, remainMs() - WRITE_RESERVE_MS));
   const notifyStatus = await submitNotify({ line, ensurePermission: !everNotified(), confirmMs });
   if (typeof notifyStatus === "string" && notifyStatus.startsWith("failed")) {
+    releaseClaim(heldClaim);
+    heldClaim = null;
     complete({ status: "notify-failed", error: `通知提交失败(${notifyStatus.slice("failed:".length)});水位未前进,下次 Stop 重试`,
       sampledAt: result.sampledAt, warnings: result.warnings });
     process.exit(0);
   }
   writeShownSlot(result.sessionId, fingerprint, lastCompletedAt);
   markNotifiedOnce();
+  releaseClaim(heldClaim);
+  heldClaim = null;
   complete({ status: "ok", resolvedSessionId: result.sessionId ?? null, lastSuccessAt: Date.now(),
     sampledAt: result.sampledAt, notified: true, notifyStatus, error: null, warnings: result.warnings });
 } catch (e) {
   // F03:可捕获的失败必须记录终态与原因;宿主强制终止(SIGKILL)才会残留 running
+  // (同会话占用锁随之残留,由 pid 活性/过期回收兜底,不影响下次重试)
+  if (heldClaim) releaseClaim(heldClaim);
   complete({ status: "error", error: e?.message ?? String(e), warnings: [] });
   process.exit(0);
 }

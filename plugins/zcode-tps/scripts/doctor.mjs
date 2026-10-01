@@ -261,10 +261,22 @@ function healthChecks() {
       detail: `${scope}${run.detail}`,
       hint: /中断|超时/.test(run.status) ? "上次运行未记录完成(可能被宿主超时终止);结束新回合后重查" : "采集仍在进行;稍后重查" };
     const ok = fresh(hs) && hs.status === "ok";
-    const notify = hs.notified ? `通知已提交(${describeNotifyStatus(hs.notifyStatus)})` : "无新增数据,未通知";
+    let notify;
+    if (hs.notified) notify = `通知已提交(${describeNotifyStatus(hs.notifyStatus)})`;
+    else if (hs.skipReason === "locked") notify = "同会话另一回合结束处理中,本次让位";
+    else if (hs.skipReason === "concurrent") notify = "相同内容已被并发通知,本次让位";
+    else if (hs.skipReason === "stale") notify = "已有更新的并发通知,本次让位";
+    else notify = "无新增数据,未通知";
     return { name: stopName, level: "warn", ok, sessionId: hs.sessionId ?? null, status: hs.status,
       detail: `${scope}采集成功;${notify};${run.detail}`,
-      hint: "提交通知只承诺命令执行完成(退出码 0),横幅是否可见由系统通知权限与用户设置决定" };
+      // P3 对齐:提示语按本次通知结果区分,unknown 不得被解释为"命令执行完成(退出码 0)"
+      hint: hs.notified && hs.notifyStatus === "ok"
+        ? "提交通知只承诺命令执行完成(退出码 0),横幅是否可见由系统通知权限与用户设置决定"
+        : hs.notified && hs.notifyStatus === "unknown"
+        ? "通知命令限时内未退出,按已提交处理且不自动重发(避免重复弹窗);结果已如实记录"
+        : hs.notified && hs.notifyStatus === "suppressed"
+        ? "测试抑制模式,未调用真实系统通知"
+        : null };
   })();
 
   return [promptCheck, stopCheck];

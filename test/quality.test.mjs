@@ -231,10 +231,13 @@ async function loadWith(dbPath) {
   const readSlot = (sid) => JSON.parse(fs.readFileSync(slotFile(sid), "utf8"));
 
   // 可控通知命令(R01):覆盖命令的参数恰为 ["zcode-tps", line],cwd 内放一个名为 zcode-tps 的
-  // 脚本,以 ZCODE_TPS_NOTIFY_BIN=node 运行即执行它;QSLEEP/QEXIT 控制退出时机与退出码。
+  // 脚本,以 ZCODE_TPS_NOTIFY_BIN=node 运行即执行它;QSLEEP/QEXIT 控制退出时机与退出码,
+  // QCOUNT 把每次真实调用追加到计数文件(§12.3 并发去重断言"命令恰好执行一次")。
   fs.writeFileSync(path.join(tmp, "zcode-tps"),
+    "const fs=require('fs');" +
     "const ms=Number(process.env.QSLEEP||0);const ec=Number(process.env.QEXIT||0);" +
-    "if(ms){setTimeout(()=>process.exit(ec),ms)}else{process.exit(ec)}\n");
+    "const go=()=>{if(process.env.QCOUNT){try{fs.appendFileSync(process.env.QCOUNT,'1\\n')}catch{}}process.exit(ec)};" +
+    "if(ms){setTimeout(go,ms)}else{go()}\n");
 
   const runHook = (hookFile, { cfg, sid = "sqa", db = dbPath, stdin = {}, extraEnv = {}, realNotify = false } = {}) => {
     const env = {
@@ -430,6 +433,96 @@ async function loadWith(dbPath) {
     assert.ok(fs.existsSync(slotFile("sqc")) && fs.existsSync(slotFile("sqd")), "并发 Stop 后两个会话水位都在(R04)");
     assert.equal(readHealth("sqc", HOOK_STOP).status, "ok");
     assert.equal(readHealth("sqd", HOOK_STOP).status, "ok");
+  }
+
+  // ---- §12.3:同会话原子占用与防倒写(跨会话 R04 之外的既定验收项) ----
+  {
+    const cDb = path.join(tmp, "concurrent.sqlite");
+    { const { db: d } = makeDb("concurrent.sqlite"); insert(d, { sess: "sconc", trace: "TC" }); d.close(); }
+    const cfgC = path.join(tmp, "conc-on.json");
+    fs.writeFileSync(cfgC, JSON.stringify({ turnEndLine: true }));
+    const countFile = path.join(tmp, "notify-count.txt");
+    const calls = () => (fs.existsSync(countFile) ? fs.readFileSync(countFile, "utf8").trim().split("\n").filter(Boolean).length : 0);
+    const cEnv = (over = {}) => ({ ZCODE_TPS_NOTIFY_BIN: process.execPath, QCOUNT: countFile, QEXIT: "0", ...over });
+    const runC = (over) => runStop({ cfg: cfgC, sid: "sconc", db: cDb, realNotify: true, extraEnv: cEnv(over) });
+    const spawnC = (over) => spawnStop("sconc", { extraEnv: { ZCODE_TPS_CONFIG: cfgC, ZCODE_USAGE_DB: cDb, ...cEnv(over) } });
+    const slotC = slotFile("sconc");
+    const claimC = `${slotC}.claim`;
+
+    // 复现 A:同会话相同快照并发 ×3,通知命令恰好各执行一次(旧实现 3/3 执行两次)
+    for (let round = 1; round <= 3; round++) {
+      fs.rmSync(slotC, { force: true }); fs.rmSync(claimC, { force: true }); fs.rmSync(countFile, { force: true });
+      await Promise.all([spawnC({ QSLEEP: "800" }), spawnC({ QSLEEP: "800" })]);
+      assert.equal(calls(), 1, `第 ${round} 轮同会话并发 Stop 通知命令恰好执行一次`);
+      assert.ok(fs.existsSync(slotC), "占用者完成通知并落水位");
+      assert.ok(!fs.existsSync(claimC), "锁已释放");
+    }
+
+    // 复现 B(倒写):旧采样慢通知期间数据前进 → 并发者让位,不倒写、不重复
+    {
+      fs.rmSync(slotC, { force: true }); fs.rmSync(claimC, { force: true }); fs.rmSync(countFile, { force: true });
+      const slow = spawnC({ QSLEEP: "1500" });
+      await delay(500); // 慢通知者已持锁、正在通知旧内容
+      const d2 = new DatabaseSync(cDb);
+      d2.exec("UPDATE model_usage SET output_tokens = 200"); // 数据前进(回填,completed_at 不变)
+      d2.close();
+      await spawnC(); // 并发者:拿不到锁(或让位),不发送不写水位
+      await slow;
+      assert.equal(calls(), 1, "持锁期间并发者让位,旧内容只通知一次");
+      const v1 = JSON.parse(fs.readFileSync(slotC, "utf8"));
+      // 第三个 Stop:新数据尚未通知过 → 通知一次并前进水位(不倒写回旧指纹)
+      await runC();
+      assert.equal(calls(), 2, "新数据由下一个 Stop 通知一次");
+      const v2 = JSON.parse(fs.readFileSync(slotC, "utf8"));
+      assert.notEqual(v2.fingerprint, v1.fingerprint, "水位前进到新指纹,未被旧结果倒写");
+      // 第四个 Stop:快照不再变化 → 不重复通知(旧实现此处会因倒写多通知一次)
+      await runC();
+      assert.equal(calls(), 2, "快照不变不重复通知");
+    }
+
+    // ts 让位(交错:并发者在本次采样开始之后才完成写入)——拖住查询,期间写入"更新"水位
+    {
+      fs.rmSync(slotC, { force: true }); fs.rmSync(claimC, { force: true });
+      const lock = new DatabaseSync(cDb);
+      lock.exec("BEGIN EXCLUSIVE");
+      const p = spawnC();
+      await delay(500); // 被测 Stop 正在查询中(busy 等待)
+      const manual = JSON.stringify({ version: 3, sessionId: "sconc", shownAt: 999,
+        fingerprint: "manual-newer", ts: Date.now(), source: "stop" });
+      fs.writeFileSync(slotC, manual); // 模拟并发者基于更新采样完成的通知写入
+      lock.exec("ROLLBACK"); lock.close();
+      await p;
+      assert.equal(fs.readFileSync(slotC, "utf8"), manual, "旧采样不得倒写并发者刚写入的水位(ts 让位)");
+      const h = readHealth("sconc", HOOK_STOP);
+      assert.equal(h.notified, false);
+      assert.equal(h.skipReason, "stale");
+    }
+
+    // claim 残留:持有者已死 → 回收后照常通知;持有者存活 → 让位且不删他人锁;失败释放可重试
+    {
+      fs.rmSync(slotC, { force: true }); fs.rmSync(claimC, { force: true }); fs.rmSync(countFile, { force: true });
+      const dead = spawn(process.execPath, ["-e", "process.exit(0)"]);
+      await once(dead, "close");
+      fs.writeFileSync(claimC, JSON.stringify({ runId: "dead", pid: dead.pid, ts: Date.now() }));
+      await runC();
+      assert.equal(calls(), 1, "死 pid 残留锁被回收,通知照常");
+      assert.ok(!fs.existsSync(claimC), "成功路径释放锁");
+
+      fs.rmSync(slotC, { force: true });
+      fs.writeFileSync(claimC, JSON.stringify({ runId: "live", pid: process.pid, ts: Date.now() }));
+      await runC();
+      assert.equal(calls(), 1, "活持有者持锁期间让位不通知");
+      assert.equal(readHealth("sconc", HOOK_STOP).skipReason, "locked");
+      assert.ok(fs.existsSync(claimC), "不得删除他人持有的锁");
+
+      fs.rmSync(slotC, { force: true }); fs.rmSync(claimC, { force: true });
+      await runC({ QEXIT: "1" });
+      assert.ok(!fs.existsSync(claimC), "notify-failed 释放锁,允许下次重试");
+      assert.equal(readHealth("sconc", HOOK_STOP).status, "notify-failed");
+      const failedCalls = calls();
+      await runC();
+      assert.equal(calls(), failedCalls + 1, "锁释放后重试通知成功(失败尝试本身也算一次命令调用)");
+    }
   }
 
   // F06(迁移):旧共享多槽文件 → 迁移读为独立文件,共享文件本身不再写入
