@@ -52,7 +52,7 @@
 
 **已知限制**：注入行在发消息时采样，只能覆盖到上一轮——如果会话只有一轮对话（常见于新会话直接开启目标任务、执行很长才结束），第一轮回复末尾不会有任何统计，从第二轮对话起正常显示。`turnEndLine` 的系统通知是这一场景的补救选项，但弹窗有打扰感，默认不开启；Windows 下横幅顶部的来源名显示为 PowerShell 的应用标识（AUMID），无法自定义，通知内容本身不受影响。
 
-`turnEndLine`（默认 `false`）开启回合结束的系统通知（Stop hook）。开启后，回合结束时立即弹系统通知显示统计（Windows toast / macOS 通知中心 / Linux notify-send，零依赖），单轮会话即时可见；通知完全不动会话流，不产生任何额外模型调用，回答主体不受影响（不采用"驱动模型续跑补行"方案——ZCode 会把续跑回合折叠为摘要条，回答被藏起）。通知负责即时性，UserPromptSubmit 注入行照常工作、负责对话流内的历史记录，两渠道互补。Windows 下首条通知会自动写入注册表开启 PowerShell 通知的横幅权限（新机器默认可能为关，静默 toast 会被丢弃），之后尊重用户在系统设置里的开关。通知在 Stop 时对库内已落库的 completed 快照采样——通常恰为刚结束这轮，但不含 Stop 之后才提交的用量，不宣称"本轮最终完整用量"。去重按会话独立槽位 + 展示内容指纹：同一会话展示的统计无变化（含切走再切回）不重复通知，子代理迟到并入等内容变化会再次通知。通知先提交并确认拉起、成功才记水位：提交失败记 `notify-failed` 且不前进水位，下次回合结束自动重试；"已提交"只承诺命令已交给系统，横幅是否可见由通知权限与用户设置决定。任何查询失败静默放行，绝不阻塞回合结束；`tokenRateLine: false` 时本选项一并停用。取值：`true`/`"notify"`/`"toast"` 开启，`false`/`"off"` 关闭。
+`turnEndLine`（默认 `false`）开启回合结束的系统通知（Stop hook）。开启后，回合结束时立即弹系统通知显示统计（Windows toast / macOS 通知中心 / Linux notify-send，零依赖），单轮会话即时可见；通知完全不动会话流，不产生任何额外模型调用，回答主体不受影响（不采用"驱动模型续跑补行"方案——ZCode 会把续跑回合折叠为摘要条，回答被藏起）。通知负责即时性，UserPromptSubmit 注入行照常工作、负责对话流内的历史记录，两渠道互补。Windows 下首条通知会自动写入注册表开启 PowerShell 通知的横幅权限（新机器默认可能为关，静默 toast 会被丢弃），之后尊重用户在系统设置里的开关。通知在 Stop 时对库内已落库的 completed 快照采样——通常恰为刚结束这轮，但不含 Stop 之后才提交的用量，不宣称"本轮最终完整用量"。整个 Stop 在 7s 全程预算内运行（宿主 8s）：关闭态短限时退出，查询放有界子进程、超预算终止并记 error 终态，绝不阻塞回合结束。去重按**会话独立水位文件** + 展示内容指纹：同一会话展示的统计无变化（含切走再切回）不重复通知；指纹覆盖实际展示所需的原始聚合（速率分子/时长分母、缓存分子、轮次与最新请求、字段选择），总量不变但速率或缓存被回填变化也会再次通知。通知先提交并确认**退出码**：退出码 0 记"命令执行完成"；非零退出/被信号终止/命令缺失记 `notify-failed` 且不前进水位，下次回合结束自动重试；限时内未退出记 `unknown` 按已提交处理（避免对可能已展示的通知重复弹窗）。"执行完成"不保证用户看到横幅，可见性由通知权限与用户设置决定；`tokenRateLine: false` 时本选项一并停用。取值：`true`/`"notify"`/`"toast"` 开启，`false`/`"off"` 关闭。
 
 `timezone` 控制所有时间显示（速率行 `time` 段、采样提示、`/tps` 报表、doctor），默认 `Asia/Shanghai`；可设 `"UTC"`、`"system"`（跟随系统时区）或任意 IANA 时区名（如 `America/New_York`）。无效值回退默认并在 `warnings` 提示。环境变量 `ZCODE_TPS_TIMEZONE` 优先于配置文件。数据库中的时间戳无时区语义，只是显示层的选择。
 
@@ -87,7 +87,7 @@
 | `latest` | 同一范围内最近有效请求，独立于 history 长度；全部无效时回退最新请求，速率为空；含 `decodeTps` |
 | `turn` | 最新已完成请求所属的可识别轮次；`completion="unknown"`，不能证明整轮完成 |
 | `usage` | 基础范围的输入/输出/总量/缓存/轮次数；reasoning 是其中量 |
-| `session` | 基础范围加可归因子代理的累计与加权速率；`total=input+output`，有独立 `cacheHit` 和 `scope`；`decodeTps`/`decodeSamples` 为会话加权 Decode 及其有效样本数（默认含可归因子代理，与不含子代理的 `decodeStats.samples` 统计范围不同，但有效性门槛相同） |
+| `session` | 基础范围加可归因子代理的累计与加权速率；`total=input+output`，有独立 `cacheHit` 和 `scope`；`decodeTps`/`decodeSamples` 为会话加权 Decode 及其有效样本数（默认含可归因子代理，与不含子代理的 `decodeStats.samples` 统计范围不同，但有效性门槛相同）；`e2eOutputTokens`/`e2eDurationMs`/`decodeOutputTokens`/`decodeDurationMs` 为对应速率的原始分子与时长分母（未经四舍五入，0.5.5 起供展示指纹比对） |
 | `decodeStats` | 请求级 Decode 分布（基础范围，不含子代理）：`mean`/`median`/`p90`（tok/s）与 `samples`；解码窗口 ≥200ms，分位为 nearest-rank（`index = ceil(p×n)−1`） |
 | `auxiliary` | 本会话非 `main_turn`/`subagent` 的已完成辅助请求（标题/压缩/验证等），按来源分组并标注 `class`（title/system/unknown）；不计入主统计；未识别来源进入 `warnings` |
 
@@ -117,14 +117,16 @@ NULL/空轮次 ID 不能证明轮次归属：最新请求缺 ID 时 `turn=null`�
 | `TOKEN_RATE_MAX_MS` | 有限正数，默认 3600000；必须大于 MIN |
 | `ZCODE_TPS_NOTIFY_SUPPRESS` | 置 `1` 跳过真实系统通知（测试/CI 用；健康记录如实标注 `suppressed`） |
 | `ZCODE_TPS_NOTIFY_BIN` | 覆盖通知命令（诊断/测试用，如指向缺失路径验证提交失败路径） |
+| `ZCODE_TPS_NOTIFY_CONFIRM_MS` | 通知命令退出结果的确认限时，200–3000ms，默认 2000（超时记 `unknown` 按已提交处理） |
+| `ZCODE_TPS_LAST_SHOWN` | 覆盖去重水位基础路径；实际文件按会话追加 `.SHA256(sessionId).json`，曾通知标记为 `…last-shown.json.once` |
 
-只读连接设置 2 秒 busy timeout，整个查询遇锁错误重试一次，取消轮次查询的嵌套重试。SQLite 锁等待与查询 CPU 时间不是同一个预算；hook 的 8 秒宿主超时仍是最终限制。
+只读连接设置 2 秒 busy timeout，整个查询遇锁错误重试一次，取消轮次查询的嵌套重试。SQLite 锁等待与查询 CPU 时间不是同一个预算；UserPromptSubmit 的 8 秒宿主超时仍是最终限制。Stop hook 额外按 7s 全程预算统筹（stdin 等待、查询、通知确认与终态写入共享同一条 deadline），查询放在有界子进程中执行，超预算直接终止——库被持续锁定时 Stop 以带原因的 error 终态退出，不会越过宿主超时。
 
 doctor 与查询共享必需/可选列定义。缺 `trace_id` 时无法归因；缺 `turn_id` 时轮次未知；缺 `cache_creation_input_tokens` 时缓存写入为 null，其余累计仍可用。以上为 warn；核心列缺失为 error。`turn_usage` 缺失不影响指标。
 
-状态文件存在只说明曾写入，不能证明采集成功或当前 hook 已注册。hook 在查询数据库前记录 `running`、`runId`、PID、hook 类型和开始时间，完成后再更新为 `ok`、`disabled`、`notify-failed` 或 `error`；任何可捕获失败（缺库、持续锁、配置损坏、通知命令不可用）都有带原因的终态，只有宿主强制终止才会残留 `running`。尚未完成的记录总是警告；进程已退出或运行超过 8 秒时提示疑似中断/超时，不沿用上一次成功状态。
+状态文件存在只说明曾写入，不能证明采集成功或当前 hook 已注册。hook 在查询数据库前记录 `running`、`runId`、PID、hook 类型和开始时间，完成后再更新为 `ok`、`disabled`、`notify-failed` 或 `error`；任何可捕获失败（缺库、持续锁、配置损坏、通知命令不可用）都有带原因的终态，只有宿主强制终止才会残留 `running`。每次运行启动时清空上一轮的 `notified`/`notifyStatus`/错误等易变字段，新运行不被上一轮通知结果解释；`lastSuccessAt` 作为历史字段保留（doctor 的"最后成功"）。Stop 的健康记录另分段记录 `stdinMs`/`queryMs`/`totalMs`，全程耗时含输入等待与前置启动。尚未完成的记录总是警告；进程已退出或运行超过 8 秒时提示疑似中断/超时，不沿用上一次成功状态。
 
-健康记录按 会话哈希 + hook 类型 分文件保存（0.5.5）：Stop 通道的关闭态/失败不会覆盖 prompt 通道的诊断，反之亦然；同一会话两个 hook 交错完成互不合并。doctor 分"注入链路采集(UserPromptSubmit)"与"通知链路(Stop)"两项展示，通知链路区分采集成功（附提交结果 submitted/suppressed/unknown）、通知关闭、未观察到（可能回合未结束、插件刚更新未重开会话或宿主未触发 Stop——以记录为准，不预设）与提交失败四态。doctor 优先选择显式会话 ID，其次新鲜状态文件中的会话；不使用其他会话的成功记录替代当前会话。无显式 ID 的 hook 会记录到无会话文件，并在成功查询后附 `resolvedSessionId`；在获得实际会话前不会猜测归属。
+健康记录按 会话哈希 + hook 类型 分文件保存（0.5.5）：Stop 通道的关闭态/失败不会覆盖 prompt 通道的诊断，反之亦然；同一会话两个 hook 交错完成互不合并。doctor 分"注入链路采集(UserPromptSubmit)"与"通知链路(Stop)"两项展示，通知链路按本次运行状态渲染：采集成功（附通知命令结果 ok/suppressed/unknown）、通知关闭、未观察到（可能回合未结束、插件刚更新未重开会话或宿主未触发 Stop——以记录为准，不预设）、采集失败（error，附原因与重试提示）、提交失败（notify-failed，下次回合结束自动重试）、采集中/中断（running）。error/running 不再出现"采集成功"或上一轮通知结果的表述。doctor 优先选择显式会话 ID，其次新鲜状态文件中的会话；不使用其他会话的成功记录替代当前会话。无显式 ID 的 hook 会记录到无会话文件，并在成功查询后附 `resolvedSessionId`；在获得实际会话前不会猜测归属。
 
 记录不包含对话正文。doctor 对缺失、过期、未完成和降级记录提示警告，error 才影响退出码。会话健康文件按每个会话一份保留；并行窗口隔离不等于同一会话并发执行的事务日志。
 
@@ -132,7 +134,7 @@ doctor 与查询共享必需/可选列定义。缺 `trace_id` 时无法归因；
 
 0.4.0 已把速率从 `(output+reasoning)/(completed-first_token)` 改为 `output/duration`。0.4.2 进一步修正累计总量中的 reasoning 重复计数；若思考量非零，总量会下降，这是纠错。`history.legacyTps` 仅用于显式请求的 0.3 对比，不作为默认性能指标。
 
-在仓库根目录运行 `npm test`，也可单独执行 `node test/degrade.test.mjs`、`node test/doctor.test.mjs`、`node test/release.test.mjs`、`node test/correctness.test.mjs`、`node test/quality.test.mjs`（0.5.5 修复回归：索引选择、字段类型校验、Stop 终态与通知提交、多槽水位、stdin 限时限长）。测试使用隔离配置和临时 SQLite，包含并发 WAL 写入时快照一致性、CLI 与 hook JSON 契约。
+在仓库根目录运行 `npm test`，也可单独执行 `node test/degrade.test.mjs`、`node test/doctor.test.mjs`、`node test/release.test.mjs`、`node test/correctness.test.mjs`、`node test/quality.test.mjs`（0.5.5 修复回归：索引选择、字段类型校验、Stop 终态与通知退出码矩阵、按会话独立水位与展示指纹、全程预算墙钟门禁、并发 Stop、stdin 限时限长）。测试使用隔离配置和临时 SQLite，包含并发 WAL 写入时快照一致性、CLI 与 hook JSON 契约。
 
 `npm run benchmark` 默认跑多场景矩阵:小/中/大库(5k/100k/1M 行,含真实分布的缓存命中与 token 长度)× 索引场景(无/旧实验索引/生产真实索引镜像)× 查询模式(典型/最大会话/auto 识别)× 冷/热,并记录内存与持续独占锁耗时;可传位置参数只跑一档,如 `npm run benchmark -- 1000000`。基准只创建临时数据库,不修改真实用量库或其索引。样本不含 Node 启动和 hook 文件 IO,不能代替宿主实测。
 

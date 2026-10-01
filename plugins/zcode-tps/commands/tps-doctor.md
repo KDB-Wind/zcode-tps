@@ -41,7 +41,7 @@ node "$tps_script" --json
 - turn_usage 不参与统计，缺失不应要求用户修复。
 - 会话状态文件仅证明曾被写入，不能据此断言当前插件已注册或统计成功。状态文件可由 ZCODE_TPS_LAST_SESSION 覆盖。
 - 最近采集记录提供状态、耗时、最后成功时间和错误/降级原因；它可能来自其他会话或已经过期，应保留提示。
-- 健康记录按 会话+hook 分链路展示（0.5.5）：「注入链路采集(UserPromptSubmit)」是默认显示行的采集；「通知链路(Stop)」是回合结束通知，四态区分——采集成功（附通知提交结果 submitted/suppressed/unknown）、通知关闭（turnEndLine 未开启，属预期）、未观察到（回合未结束过/插件刚更新未重开会话/宿主未触发 Stop，以记录为准不预设）、提交失败（notify-failed，下次回合结束自动重试）。保留报告中的 sessionId/runId；其他会话的成功不能替代当前会话。running 表示本次尚未完成，即使有 lastSuccessAt 也不能报正常；进程退出或超过 8 秒时应解释为可能中断/超时。
+- 健康记录按 会话+hook 分链路展示（0.5.5）：「注入链路采集(UserPromptSubmit)」是默认显示行的采集；「通知链路(Stop)」是回合结束通知，按本次运行状态渲染——采集成功（附通知命令结果 ok/suppressed/unknown）、通知关闭（turnEndLine 未开启，属预期）、未观察到（回合未结束过/插件刚更新未重开会话/宿主未触发 Stop，以记录为准不预设）、采集失败（error，附原因与"随下次回合结束自动重试"提示）、提交失败（notify-failed，下次回合结束自动重试）、采集中/中断。error/running 状态绝不出现"采集成功"或上一轮通知结果的表述（新运行启动时清空上一轮 notified/notifyStatus，lastSuccessAt 保留用于"最后成功"）。保留报告中的 sessionId/runId；其他会话的成功不能替代当前会话。running 表示本次尚未完成，即使有 lastSuccessAt 也不能报正常；进程退出或超过 8 秒时应解释为可能中断/超时。
 - 配置缺失使用默认值，损坏 JSON、非对象配置和非法 TOKEN_RATE_* 环境变量应修正。tokenRateLine=false 是预期关闭，不是故障。
 - Node 22 系列最低为 22.13，23 系列最低为 23.4，24+ 支持无实验启动参数导入 node:sqlite。
 

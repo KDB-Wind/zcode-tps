@@ -42,8 +42,19 @@ export function parseBool(v, def) {
 }
 
 export const stateFile = () => process.env.ZCODE_TPS_LAST_SESSION || path.join(os.homedir(), ".zcode", "zcode-tps.last-session.json");
-// Stop hook 已展示水位(coverage.lastCompletedAt):回合结束显示行与发消息注入的去重依据
+// Stop hook 已展示水位:回合结束通知与发消息注入的去重依据。
+// 0.5.5(审核 R04)起按会话哈希独立文件(zcode-tps.last-shown.json.<sha256>.json),
+// 不同会话的 Stop 并发读改写互不覆盖;0.5.4 的共享多槽文件只作迁移读,不再写入。
 export const lastShownFile = () => process.env.ZCODE_TPS_LAST_SHOWN || path.join(os.homedir(), ".zcode", "zcode-tps.last-shown.json");
+// 指定会话的独立水位文件;会话 ID 非法时返回 null(调用方按无水位处理)。
+export function shownSlotFile(sessionId) {
+  if (!validId(sessionId)) return null;
+  const base = lastShownFile();
+  return `${base}.${createHash("sha256").update(sessionId).digest("hex")}.json`;
+}
+// "曾经成功通知过至少一次"的全局标记(替代旧共享文件里的 everNotified):
+// 仅用于决定首次通知前是否补写 Windows 注册表横幅权限(幂等,之后尊重用户系统设置)。
+export const notifiedOnceFile = () => `${lastShownFile()}.once`;
 // turnEndLine 两态:false/off 关闭;true/"notify"/"toast" 回合结束弹系统通知。
 // (曾经的 block 续跑补行形态已按用户裁决移除:ZCode 会把续跑回合折叠为摘要条,回答主体不可见。)
 export function resolveTurnEndMode(v) {
@@ -184,7 +195,10 @@ export function recordHealth(update) {
 export function startHealth(sessionId, hook = null) {
   const run = { sessionId: validId(sessionId) ? sessionId : null, hook,
     runId: randomUUID(), pid: process.pid, startedAt: Date.now() };
-  recordHealth({ ...run, status: "running", durationMs: null, sampledAt: null, error: null, warnings: [] });
+  // 本次运行的易变字段在启动时清零(审核 R05):上一轮的 notified/notifyStatus/错误不得
+  // 泄漏进新记录冒充本次结果。lastSuccessAt 是跨轮历史字段("最后成功"),保留。
+  recordHealth({ ...run, status: "running", durationMs: null, totalMs: null, stdinMs: null, queryMs: null,
+    sampledAt: null, resolvedSessionId: null, error: null, warnings: [], notified: null, notifyStatus: null });
   return run;
 }
 
@@ -226,12 +240,13 @@ export function buildNotifyCommand(line, { ensurePermission = false, platform = 
   return { command: "notify-send", args: ["zcode-tps", line] };
 }
 
-// 提交通知并如实报告提交结果(F05):detached 子进程不阻塞回合,但等待有界的拉起确认——
-// spawn 成功/"error"(如命令缺失)。返回:
-//   "suppressed"(测试抑制)/ "submitted"(子进程已拉起)/ "unknown"(限时内未确认,按已提交处理但如实标注)/
-//   "failed:<原因>"(拉起失败;水位不前进,下次 Stop 自然重试)
-// 提交成功只承诺命令已提交,不保证用户看到横幅(通知权限由系统与用户设置决定)。
-export function submitNotify({ line, ensurePermission = false, confirmMs = 250 } = {}) {
+// 提交通知并确认有界执行结果(F05/审核 R01):在限时内等待子进程退出码,非零退出/被信号
+// 终止是命令失败的确定性证据(脚本错误/通知服务拒绝),不得冒充成功。返回:
+//   "suppressed"(测试抑制)/ "ok"(命令执行完成,退出码 0)/
+//   "unknown"(限时内未退出:命令可能已展示——为避免重试造成重复弹窗,按已提交处理,健康记录如实标注)/
+//   "failed:<原因>"(启动失败 ENOENT 等 / exit N / signal X;水位不前进,下次 Stop 自然重试)
+// 提交成功只承诺命令执行完成,不保证用户看到横幅(通知权限由系统与用户设置决定)。
+export function submitNotify({ line, ensurePermission = false, confirmMs = 2000 } = {}) {
   if (process.env.ZCODE_TPS_NOTIFY_SUPPRESS === "1") return Promise.resolve("suppressed");
   return new Promise((resolve) => {
     let settled = false;
@@ -241,8 +256,13 @@ export function submitNotify({ line, ensurePermission = false, confirmMs = 250 }
       const { command, args } = buildNotifyCommand(line, { ensurePermission });
       const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
       timer = setTimeout(() => done("unknown"), confirmMs);
-      child.once("spawn", () => done("submitted"));
       child.once("error", (e) => done(`failed:${e?.code ?? e?.message ?? "spawn error"}`));
+      child.once("exit", (code, signal) => {
+        if (signal) done(`failed:signal ${signal}`);
+        else if (code === 0) done("ok");
+        else done(`failed:exit ${code ?? "unknown"}`);
+      });
+      // 超时不杀子进程:toast 可能正在展示;detached+unref 使其独立存活至自然结束
       child.unref();
     } catch (e) {
       done(`failed:${e?.message ?? e}`);

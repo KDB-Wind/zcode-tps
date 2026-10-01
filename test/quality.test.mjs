@@ -211,7 +211,7 @@ async function loadWith(dbPath) {
   assert.equal(bad.decodeTps, null);
 }
 
-// ================= Stop hook:F03 异常终态 / F02 链路隔离 / F05 提交失败 / F06 多槽水位 / stdin 限时限长 =================
+// ================= Stop hook:F02 链路隔离 / F03 异常终态 / F05+R01 通知退出码 / F06+R02/R04 指纹与水位 / R03 全程预算 / stdin 限时限长 =================
 {
   const dbPath = path.join(tmp, "stop-quality.sqlite");
   const { db } = makeDb("stop-quality.sqlite");
@@ -223,9 +223,18 @@ async function loadWith(dbPath) {
   fs.writeFileSync(cfgOff, JSON.stringify({}));
   const cfgBroken = path.join(tmp, "stop-broken.json");
   const shownFile = path.join(tmp, "quality-shown.json");
+  process.env.ZCODE_TPS_LAST_SHOWN = shownFile; // 测试进程与 stop 子进程按同一路径解析水位文件
   const healthBase = process.env.ZCODE_TPS_HEALTH; // 与 readHealth 在同一进程 env 下解析,路径一致
   const promptHook = path.join(root, "plugins", "zcode-tps", "hooks", "prompt-submit.mjs");
-  const { healthFile, HOOK_PROMPT, HOOK_STOP } = await import(pathToFileURL(RUNTIME).href + "?q-hook");
+  const { healthFile, shownSlotFile, HOOK_PROMPT, HOOK_STOP } = await import(pathToFileURL(RUNTIME).href + "?q-hook");
+  const slotFile = (sid) => shownSlotFile(sid);
+  const readSlot = (sid) => JSON.parse(fs.readFileSync(slotFile(sid), "utf8"));
+
+  // 可控通知命令(R01):覆盖命令的参数恰为 ["zcode-tps", line],cwd 内放一个名为 zcode-tps 的
+  // 脚本,以 ZCODE_TPS_NOTIFY_BIN=node 运行即执行它;QSLEEP/QEXIT 控制退出时机与退出码。
+  fs.writeFileSync(path.join(tmp, "zcode-tps"),
+    "const ms=Number(process.env.QSLEEP||0);const ec=Number(process.env.QEXIT||0);" +
+    "if(ms){setTimeout(()=>process.exit(ec),ms)}else{process.exit(ec)}\n");
 
   const runHook = (hookFile, { cfg, sid = "sqa", db = dbPath, stdin = {}, extraEnv = {}, realNotify = false } = {}) => {
     const env = {
@@ -236,23 +245,54 @@ async function loadWith(dbPath) {
     };
     if (realNotify) delete env.ZCODE_TPS_NOTIFY_SUPPRESS;
     return execFileSync(process.execPath, [hookFile], {
-      env, input: JSON.stringify({ session_id: sid, ...stdin }),
+      env, cwd: tmp, input: JSON.stringify({ session_id: sid, ...stdin }),
       encoding: "utf8",
       stdio: ["pipe", "pipe", "pipe"],
     });
   };
   const runStop = (opts) => runHook(STOP, opts);
   const readHealth = (sid, hook) => JSON.parse(fs.readFileSync(healthFile(sid, hook), "utf8"));
+  const doctorStopCheck = (sid) => {
+    const out = execFileSync(process.execPath, [DOCTOR, "--json"], {
+      env: { ...process.env, ZCODE_SESSION_ID: sid, ZCODE_TPS_HEALTH: healthBase,
+        ZCODE_TPS_CONFIG: cfgOn, ZCODE_TPS_LAST_SESSION: path.join(tmp, "quality-last.json") },
+      encoding: "utf8",
+    });
+    return JSON.parse(out).checks.find((c) => c.name === "通知链路(Stop)");
+  };
+  const spawnStop = (sid, { extraEnv = {}, hang = false } = {}) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [STOP], {
+      cwd: tmp,
+      env: { ...process.env, ZCODE_USAGE_DB: dbPath, ZCODE_SESSION_ID: sid, ZCODE_TPS_CONFIG: cfgOn,
+        ZCODE_TPS_HEALTH: healthBase, ZCODE_TPS_LAST_SHOWN: shownFile,
+        ZCODE_TPS_LAST_SESSION: path.join(tmp, "quality-last.json"), ...extraEnv },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    child.stdin.on("error", () => {}); // 子进程限时销毁 stdin 后,父端残余写入报 EOF 属预期
+    child.stderr.setEncoding("utf8");
+    let err = "";
+    child.stderr.on("data", (d) => { err += d; });
+    child.once("close", (code) => (code === 0 ? resolve() : reject(new Error(`stop exit ${code}:${err}`))));
+    if (hang) child.stdin.write('{"session_id":"' + sid + '"'); // 不结束输入
+    else child.stdin.end(JSON.stringify({ session_id: sid }));
+  });
 
-  // F03:缺库/不可打开 → 退出 0、stdout 空,但健康记录必须是 error 终态(旧实现残留 running/error=null)
+  // F03:缺库/不可打开 → 退出 0、stdout 空,但健康记录必须是 error 终态(查询子进程失败同样落终态)
   let out = runStop({ cfg: cfgOn, db: path.join(tmp, "no-such-dir", "db.sqlite") });
   assert.equal(out, "", "任何失败静默放行");
   let h = readHealth("sqa", HOOK_STOP);
   assert.equal(h.status, "error", "缺库必须留下 error 终态");
   assert.ok(typeof h.error === "string" && h.error.length > 0, "error 必须带原因");
   assert.ok(Number.isFinite(h.durationMs), "error 终态带耗时");
+  assert.ok(Number.isFinite(h.totalMs) && h.totalMs >= h.durationMs, "全程耗时须覆盖 stdin 等前置步骤(R03)");
+  // R05:error 终态不得渲染"采集成功",也不得带入上一轮通知结果
+  let stopCheck = doctorStopCheck("sqa");
+  assert.equal(stopCheck.ok, false);
+  assert.match(stopCheck.detail, /采集失败/);
+  assert.ok(!stopCheck.detail.includes("采集成功"), "error 不得写采集成功(R05)");
+  assert.ok(!stopCheck.detail.includes("通知已提交"), "新 run 不得带入上一轮通知结果(R05)");
 
-  // F03(补):配置损坏 → 同样有 error 终态(startHealth 先于读配置)
+  // F03(补):配置损坏 → 同样有 error 终态(不提前退出,完整路径留终态)
   fs.writeFileSync(cfgBroken, "{not-json");
   runStop({ cfg: cfgBroken });
   assert.equal(readHealth("sqa", HOOK_STOP).status, "error", "配置损坏也须记录终态");
@@ -265,96 +305,199 @@ async function loadWith(dbPath) {
   assert.equal(readHealth("sqa", HOOK_STOP).status, "disabled");
   assert.equal(readHealth("sqa", HOOK_PROMPT).status, "error", "disabled 的 Stop 不得掩盖 prompt 的 error(F02)");
   fs.rmSync(shownFile, { force: true });
+  for (const sid of ["sqa", "sqb", "sqc", "sqd", "sqf"]) fs.rmSync(slotFile(sid), { force: true });
 
-  // F05:通知命令不可用(ZCODE_TPS_NOTIFY_BIN 指向缺失路径 → spawn ENOENT,跨平台确定)
+  // F05:通知命令不存在(ZCODE_TPS_NOTIFY_BIN 指向缺失路径 → spawn ENOENT,跨平台确定)
   // (Windows 上清空 PATH 不可靠:CreateProcess 会搜索系统目录,实测仍能找到 powershell)
   const missingBin = path.join(tmp, "definitely-missing-notifier" + (process.platform === "win32" ? ".exe" : ""));
   out = runStop({ cfg: cfgOn, realNotify: true, extraEnv: { ZCODE_TPS_NOTIFY_BIN: missingBin } });
   assert.equal(out, "");
   h = readHealth("sqa", HOOK_STOP);
-  assert.equal(h.status, "notify-failed", "提交失败必须区分于成功(旧实现未提交已记 ok)");
-  assert.match(h.error, /通知提交失败/);
-  assert.ok(!fs.existsSync(shownFile), "提交失败不得落水位(下次 Stop 重试)");
+  assert.equal(h.status, "notify-failed", "命令缺失必须判失败(旧实现未提交已记 ok)");
+  assert.match(h.error, /ENOENT/);
+  assert.ok(!fs.existsSync(slotFile("sqa")), "提交失败不得落水位(下次 Stop 重试)");
 
-  // doctor:提交失败四态中的"通知提交失败"可诊断
-  const docOut = execFileSync(process.execPath, [DOCTOR, "--json"], {
-    env: { ...process.env, ZCODE_SESSION_ID: "sqa", ZCODE_TPS_HEALTH: healthBase,
-      ZCODE_TPS_CONFIG: cfgOn, ZCODE_TPS_LAST_SESSION: path.join(tmp, "quality-last.json") },
-    encoding: "utf8",
-  });
-  const stopCheck = JSON.parse(docOut).checks.find((c) => c.name === "通知链路(Stop)");
+  // R01:通知命令非零退出 → notify-failed,不落水位(审核复现:旧实现只确认拉起,exit 1 仍记 ok)
+  out = runStop({ cfg: cfgOn, realNotify: true, extraEnv: { ZCODE_TPS_NOTIFY_BIN: process.execPath, QEXIT: "1" } });
+  assert.equal(out, "");
+  h = readHealth("sqa", HOOK_STOP);
+  assert.equal(h.status, "notify-failed", "非零退出必须判失败");
+  assert.match(h.error, /exit 1/);
+  assert.ok(!fs.existsSync(slotFile("sqa")), "非零退出不得落水位(下次 Stop 重试)");
+  stopCheck = doctorStopCheck("sqa");
   assert.equal(stopCheck.ok, false);
   assert.match(stopCheck.detail, /通知提交失败/);
 
-  // F05(续):命令恢复可用(suppress)后重试成功 → ok + 水位前进
-  out = runStop({ cfg: cfgOn });
-  assert.equal(out, "");
+  // R01:退出码 0 → ok + 水位前进
+  out = runStop({ cfg: cfgOn, realNotify: true, extraEnv: { ZCODE_TPS_NOTIFY_BIN: process.execPath, QEXIT: "0" } });
   h = readHealth("sqa", HOOK_STOP);
   assert.equal(h.status, "ok");
   assert.equal(h.notified, true);
-  assert.equal(h.notifyStatus, "suppressed", "suppress 须如实标注,不冒充已提交");
-  assert.ok(fs.existsSync(shownFile), "成功后水位落盘");
+  assert.equal(h.notifyStatus, "ok", "退出码 0 = 命令执行完成");
+  assert.ok(fs.existsSync(slotFile("sqa")), "成功后水位落盘");
+
+  // R01:退出码 3 → failed:exit 3,水位不动(需新数据才会走通知路径)
+  {
+    const db2 = new DatabaseSync(dbPath);
+    insert(db2, { t0: 6_000_000, out: 150, ttft: 100, dur: 1000, sess: "sqa", trace: "TQA" });
+    db2.close();
+    const slotBefore = readSlot("sqa");
+    out = runStop({ cfg: cfgOn, realNotify: true, extraEnv: { ZCODE_TPS_NOTIFY_BIN: process.execPath, QEXIT: "3" } });
+    h = readHealth("sqa", HOOK_STOP);
+    assert.equal(h.status, "notify-failed");
+    assert.match(h.error, /exit 3/);
+    assert.deepEqual(readSlot("sqa"), slotBefore, "失败重试期间水位不得改写");
+  }
+
+  // R01:限时内未退出 → unknown:如实标注、水位前进(避免对可能已展示的通知重复弹窗)
+  {
+    const db2 = new DatabaseSync(dbPath);
+    insert(db2, { t0: 7_000_000, out: 300, ttft: 100, dur: 1000, sess: "sqa", trace: "TQA" });
+    db2.close();
+    const shownBefore = readSlot("sqa").shownAt;
+    out = runStop({ cfg: cfgOn, realNotify: true,
+      extraEnv: { ZCODE_TPS_NOTIFY_BIN: process.execPath, QSLEEP: "1500", QEXIT: "0", ZCODE_TPS_NOTIFY_CONFIRM_MS: "300" } });
+    h = readHealth("sqa", HOOK_STOP);
+    assert.equal(h.status, "ok");
+    assert.equal(h.notified, true);
+    assert.equal(h.notifyStatus, "unknown", "超时按已提交处理但如实标注");
+    assert.ok(readSlot("sqa").shownAt > shownBefore, "unknown 水位前进(有界策略:不重试以免重复弹窗)");
+    stopCheck = doctorStopCheck("sqa");
+    assert.match(stopCheck.detail, /限时内未确认退出/);
+  }
+
+  // R02:指纹必须覆盖速率分母与缓存分子(审核复现:单请求 out=100/input=800/cacheRead=700/dur=1000)
+  {
+    const fpDb = path.join(tmp, "fingerprint.sqlite");
+    { const { db: d } = makeDb("fingerprint.sqlite"); insert(d, { sess: "sqf" }); d.close(); }
+    const cfgFp = path.join(tmp, "fp-on.json");
+    fs.writeFileSync(cfgFp, JSON.stringify({ turnEndLine: true }));
+    const runFp = () => runStop({ cfg: cfgFp, sid: "sqf", db: fpDb, realNotify: true,
+      extraEnv: { ZCODE_TPS_NOTIFY_BIN: process.execPath, QEXIT: "0" } });
+    runFp();
+    assert.equal(readHealth("sqf", HOOK_STOP).notified, true, "首次通知");
+    // 只回填 duration(1000→2000):token/完成时间全不变,轮均 100→50、Decode 111.1→52.6
+    let db2 = new DatabaseSync(fpDb);
+    db2.exec("UPDATE model_usage SET duration_ms = 2000");
+    db2.close();
+    runFp();
+    assert.equal(readHealth("sqf", HOOK_STOP).notified, true, "时长回填改变展示速率,必须再次通知(R02)");
+    // 再只回填 cacheRead(700→400):缓存 87.5%→50%
+    db2 = new DatabaseSync(fpDb);
+    db2.exec("UPDATE model_usage SET cache_read_input_tokens = 400");
+    db2.close();
+    runFp();
+    assert.equal(readHealth("sqf", HOOK_STOP).notified, true, "缓存分子回填改变缓存率,必须再次通知(R02)");
+    // 快照不再变化 → 不重复通知
+    runFp();
+    assert.equal(readHealth("sqf", HOOK_STOP).notified, false, "稳定快照不重复通知");
+  }
 
   // F06:子代理并入改变展示内容 → 指纹变化 → 再次通知(旧实现水位不动,变化被拦截)
   {
     const db2 = new DatabaseSync(dbPath);
     insert(db2, { t0: 9_000_000, out: 200, ttft: 100, dur: 1000, qs: "subagent", sess: "sq_child", trace: "TQA" });
     db2.close();
-    const before = JSON.parse(fs.readFileSync(shownFile, "utf8")).sessions.sqa;
+    const before = readSlot("sqa");
     runStop({ cfg: cfgOn });
-    const after = JSON.parse(fs.readFileSync(shownFile, "utf8")).sessions.sqa;
+    const after = readSlot("sqa");
     assert.notEqual(after.fingerprint, before.fingerprint, "子代理并入后指纹必须变化");
     assert.equal(readHealth("sqa", HOOK_STOP).notified, true);
+    assert.equal(readHealth("sqa", HOOK_STOP).notifyStatus, "suppressed", "suppress 须如实标注,不冒充已提交");
   }
 
-  // F06:A→B→A 无新增 → A 槽不动,不重复通知(旧实现 A 的水位会被再次提交刷新)
+  // F06:A→B→A 无新增 → A 水位不动,不重复通知;B 为独立文件(R04)
   {
     const db2 = new DatabaseSync(dbPath);
     insert(db2, { t0: 5_000_000, out: 100, ttft: 100, dur: 1000, sess: "sqb", trace: "TQB" });
     db2.close();
     runStop({ cfg: cfgOn, sid: "sqb" });
-    const shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-    assert.ok(shown.sessions.sqb, "B 会话独立槽位");
-    const aBefore = shown.sessions.sqa;
+    assert.ok(fs.existsSync(slotFile("sqb")), "B 会话独立水位文件(R04)");
+    const aBefore = readSlot("sqa");
     runStop({ cfg: cfgOn, sid: "sqa" });
-    const aAfter = JSON.parse(fs.readFileSync(shownFile, "utf8")).sessions.sqa;
-    assert.equal(aAfter.ts, aBefore.ts, "A 无新增时重复 Stop 不得改写其槽位(A→B→A 场景)");
+    assert.equal(readSlot("sqa").ts, aBefore.ts, "A 无新增时重复 Stop 不得改写其水位(A→B→A 场景)");
   }
 
-  // F06(迁移):旧单槽水位文件 → 迁移为多槽,至多多通知一次
+  // R04:并发 Stop(A/B 同时提交)→ 两个会话的水位都保留(旧共享多槽文件实测 3/3 只剩 B)
   {
-    fs.writeFileSync(shownFile, JSON.stringify({ sessionId: "sqa", shownAt: 1_001_100, ts: 1 }));
-    runStop({ cfg: cfgOn });
-    const shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-    assert.equal(shown.version, 2);
-    assert.ok(shown.sessions.sqa, "旧水位迁移为该会话槽位");
-    assert.equal(shown.everNotified, true, "旧文件已通知过,不再重复写注册表权限");
-    runStop({ cfg: cfgOn });
-    const shown2 = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-    assert.equal(shown2.sessions.sqa.ts, shown.sessions.sqa.ts, "迁移后指纹稳定,不反复通知");
+    const db2 = new DatabaseSync(dbPath);
+    insert(db2, { t0: 11_000_000, out: 100, ttft: 100, dur: 1000, sess: "sqc", trace: "TQC" });
+    insert(db2, { t0: 12_000_000, out: 100, ttft: 100, dur: 1000, sess: "sqd", trace: "TQD" });
+    db2.close();
+    // 通知命令慢退出 + 确认限时,把两个 Stop 的"通知-写水位"窗口拉宽到数百毫秒重叠
+    const env = { ZCODE_TPS_NOTIFY_BIN: process.execPath, QSLEEP: "800", QEXIT: "0", ZCODE_TPS_NOTIFY_CONFIRM_MS: "600" };
+    await Promise.all([spawnStop("sqc", { extraEnv: env }), spawnStop("sqd", { extraEnv: env })]);
+    assert.ok(fs.existsSync(slotFile("sqc")) && fs.existsSync(slotFile("sqd")), "并发 Stop 后两个会话水位都在(R04)");
+    assert.equal(readHealth("sqc", HOOK_STOP).status, "ok");
+    assert.equal(readHealth("sqd", HOOK_STOP).status, "ok");
   }
 
-  // stdin 限时长:宿主异常保持 stdin 开启,关闭态也要在限时内退出(旧实现会挂到 8s 宿主超时)
+  // F06(迁移):旧共享多槽文件 → 迁移读为独立文件,共享文件本身不再写入
   {
-    const child = spawn(process.execPath, [STOP], {
-      env: { ...process.env, ZCODE_USAGE_DB: dbPath, ZCODE_SESSION_ID: "sqa", ZCODE_TPS_CONFIG: cfgOff,
-        ZCODE_TPS_HEALTH: healthBase, ZCODE_TPS_LAST_SHOWN: shownFile,
-        ZCODE_TPS_LAST_SESSION: path.join(tmp, "quality-last.json") },
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    child.stdin.on("error", () => {}); // 子进程限时销毁 stdin 后,父端残余写入报 EOF 属预期
-    child.stdin.write('{"session_id":"sqa"'); // 不结束输入
-    const closed = once(child, "close");
+    const legacy = JSON.stringify({ version: 2, everNotified: true,
+      sessions: { sqa: { shownAt: 1_001_100, fingerprint: "legacy", ts: 5 } } });
+    fs.writeFileSync(shownFile, legacy);
+    fs.rmSync(slotFile("sqa"), { force: true });
+    runStop({ cfg: cfgOn });
+    assert.ok(fs.existsSync(slotFile("sqa")), "旧共享水位迁移为该会话独立文件");
+    assert.equal(fs.readFileSync(shownFile, "utf8"), legacy, "共享文件只作迁移读,不再写入(R04)");
+    const s1 = readSlot("sqa").ts;
+    runStop({ cfg: cfgOn });
+    assert.equal(readSlot("sqa").ts, s1, "迁移后指纹稳定,不反复通知");
+  }
+
+  // stdin 限时长:宿主异常保持 stdin 开启——关闭态走短限时,不等全限时(R03)
+  {
     const start = Date.now();
-    const [code] = await Promise.race([closed, delay(5000).then(() => [-9])]);
-    assert.equal(code, 0, "stdin 悬挂时进程仍须自行退出");
-    assert.ok(Date.now() - start < 4500, "退出时间受 stdin 上限约束(约 1.5s + 查询),不得挂满 8s");
-    try { child.kill(); } catch {}
+    await spawnStop("sqa", { extraEnv: { ZCODE_TPS_CONFIG: cfgOff }, hang: true });
+    assert.ok(Date.now() - start < 1600, "关闭态悬挂 stdin 须在短限时内退出(约 300ms,不得等 1.5s 全限时)");
+    assert.equal(readHealth("sqa", HOOK_STOP).status, "disabled");
+  }
+
+  // R03:开启态悬挂 stdin + 正常库 → stdin 超时按无输入处理,env sid 兜底,流程照常 ok
+  {
+    const start = Date.now();
+    await spawnStop("sqb", { hang: true });
+    assert.ok(Date.now() - start < 4000, "悬挂 stdin + 正常查询须远小于宿主 8s 预算");
+    assert.equal(readHealth("sqb", HOOK_STOP).status, "ok");
+    assert.ok(readHealth("sqb", HOOK_STOP).stdinMs >= 1400, "stdin 等待计入分段耗时");
+  }
+
+  // R03:悬挂 stdin + 持续独占锁 → 查询子进程按剩余预算终止,墙钟硬性有界,终态 error 不残留 running
+  {
+    const lock = new DatabaseSync(dbPath); // 默认 DELETE journal:BEGIN EXCLUSIVE 阻塞只读连接
+    lock.exec("BEGIN EXCLUSIVE");
+    try {
+      const start = Date.now();
+      await Promise.race([spawnStop("sqa", { hang: true }), delay(9500).then(() => { throw new Error("stop 未在 9.5s 内退出"); })]);
+      const wall = Date.now() - start;
+      assert.ok(wall < 7500, `全程墙钟 ${wall}ms 必须显著小于宿主 8s 预算(审核复现旧实现 8095ms)`);
+      h = readHealth("sqa", HOOK_STOP);
+      assert.equal(h.status, "error", "预算内无法完成 → error 终态,不残留 running");
+      assert.match(h.error, /查询超时/, "子进程终止原因可诊断");
+      assert.ok(h.stdinMs >= 1400, "输入等待与查询共享同一预算");
+      assert.ok(Number.isFinite(h.queryMs) && h.queryMs > 0, "查询耗时分段记录");
+      assert.ok(Number.isFinite(h.totalMs) && h.totalMs < 7500);
+    } finally {
+      lock.exec("ROLLBACK");
+      lock.close();
+    }
+  }
+
+  // R05:running 记录显示"采集中",不写采集成功
+  {
+    const { startHealth } = await import(pathToFileURL(RUNTIME).href + "?q-run");
+    startHealth("sqrun", HOOK_STOP);
+    const c = doctorStopCheck("sqrun");
+    assert.equal(c.ok, false);
+    assert.match(c.detail, /采集中/);
+    assert.ok(!c.detail.includes("采集成功"));
   }
 
   // stdin 限长度:超过 64KB 的输入按无输入处理,不崩溃
   {
     const child = spawn(process.execPath, [STOP], {
+      cwd: tmp,
       env: { ...process.env, ZCODE_USAGE_DB: dbPath, ZCODE_SESSION_ID: "sqa", ZCODE_TPS_CONFIG: cfgOff,
         ZCODE_TPS_HEALTH: healthBase, ZCODE_TPS_LAST_SHOWN: shownFile,
         ZCODE_TPS_LAST_SESSION: path.join(tmp, "quality-last.json") },
@@ -407,4 +550,4 @@ async function loadWith(dbPath) {
 }
 
 fs.rmSync(tmp, { recursive: true, force: true });
-console.log("quality 0.5.5 修复回归全部通过 ✅(F01 部分索引 / F02 链路隔离 / F03 异常终态 / F04 通知构造 / F05 提交结果 / F06 多槽水位 / F07 TTFT / F08 坏日期 / F09 空白轮 / F10 token 类型 / stdin 限时限长)");
+console.log("quality 0.5.5 修复回归全部通过 ✅(F01 部分索引 / F02 链路隔离 / F03 异常终态 / F04 通知构造 / F05+R01 通知退出码 / F06+R02/R04 指纹与独立水位 / F07 TTFT / F08 坏日期 / F09 空白轮 / F10 token 类型 / R03 全程预算 / R05 诊断文案 / stdin 限时长)");

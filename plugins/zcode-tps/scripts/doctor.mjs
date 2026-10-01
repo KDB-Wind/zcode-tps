@@ -207,6 +207,15 @@ function describeRun(h, zone) {
   return { status, detail: `${status};耗时 ${h.durationMs ?? "未知"}ms;最后成功 ${last}${extra}` };
 }
 
+// 通知命令执行结果的如实描述(R01 起有退出码确认);未知值不冒充成功
+function describeNotifyStatus(s) {
+  if (s === "ok") return "命令正常退出";
+  if (s === "suppressed") return "测试抑制";
+  if (s === "unknown") return "限时内未确认退出";
+  if (typeof s === "string" && s.startsWith("failed:")) return `失败(${s.slice("failed:".length)})`;
+  return s ?? "未知确认";
+}
+
 function healthChecks() {
   const sessionId = resolveHealthSessionId();
   const zone = displayTimezone();
@@ -229,7 +238,8 @@ function healthChecks() {
       hint: fresh(hp) ? "这是最近一次 hook 的结果,并非当前会话注册状态的证明" : "记录过期或时间异常,发送新消息后重试" };
   })();
 
-  // 通知链路(Stop):回合结束系统通知,四态区分——采集成功/通知关闭/未观察到/提交失败(F02/F05)
+  // 通知链路(Stop):按本次 run 的状态分支渲染(R05)——error/running 不得出现"采集成功"字样,
+  // 通知动作只解释真正成功的那次运行(startHealth 已清空上一轮的 notified/notifyStatus)。
   const stopName = "通知链路(Stop)";
   const hs = sessionId != null && !validId(sessionId) ? null : readHealthRecord(sessionId, HOOK_STOP);
   const stopCheck = (() => {
@@ -237,17 +247,24 @@ function healthChecks() {
       detail: `会话 ${sessionId ?? "未知"} 未观察到 Stop hook 运行`,
       hint: "回合结束过至少会留下记录(含关闭态);无记录可能为插件刚更新未重开会话,或宿主未触发 Stop——以记录为准,不预设" };
     const run = describeRun(hs, zone);
+    const scope = `会话 ${hs.sessionId ?? "未知"};`;
     if (hs.status === "disabled") return { name: stopName, level: "warn", ok: true, sessionId: hs.sessionId ?? null, status: hs.status,
-      detail: `会话 ${hs.sessionId ?? "未知"};通知关闭(turnEndLine 未开启,属预期);${run.detail}`,
+      detail: `${scope}通知关闭(turnEndLine 未开启,属预期);${run.detail}`,
       hint: "需要回合结束通知时,配置 turnEndLine 为 true" };
     if (hs.status === "notify-failed") return { name: stopName, level: "warn", ok: false, sessionId: hs.sessionId ?? null, status: hs.status,
-      detail: `会话 ${hs.sessionId ?? "未知"};${run.detail}`,
-      hint: "通知命令提交失败;检查平台通知命令可用性(powershell/osascript/notify-send),下次回合结束会自动重试" };
-    const ok = fresh(hs) && ["ok"].includes(hs.status);
-    const notify = hs.notified ? `通知已提交(${hs.notifyStatus ?? "未知确认"})` : "无新增数据,未通知";
+      detail: `${scope}通知提交失败;${run.detail}`,
+      hint: "通知命令执行失败;检查平台通知命令可用性(powershell/osascript/notify-send),下次回合结束会自动重试" };
+    if (hs.status === "error") return { name: stopName, level: "warn", ok: false, sessionId: hs.sessionId ?? null, status: hs.status,
+      detail: `${scope}采集失败;${run.detail}`,
+      hint: "本次采集未能完成,多为用量库被锁定或不可读;随下次回合结束自动重试,持续失败可运行 /tps 查看查询错误" };
+    if (hs.status === "running") return { name: stopName, level: "warn", ok: false, sessionId: hs.sessionId ?? null, status: hs.status,
+      detail: `${scope}${run.detail}`,
+      hint: /中断|超时/.test(run.status) ? "上次运行未记录完成(可能被宿主超时终止);结束新回合后重查" : "采集仍在进行;稍后重查" };
+    const ok = fresh(hs) && hs.status === "ok";
+    const notify = hs.notified ? `通知已提交(${describeNotifyStatus(hs.notifyStatus)})` : "无新增数据,未通知";
     return { name: stopName, level: "warn", ok, sessionId: hs.sessionId ?? null, status: hs.status,
-      detail: `会话 ${hs.sessionId ?? "未知"};采集成功;${notify};${run.detail}`,
-      hint: "提交通知只承诺命令已提交,横幅是否可见由系统通知权限与用户设置决定" };
+      detail: `${scope}采集成功;${notify};${run.detail}`,
+      hint: "提交通知只承诺命令执行完成(退出码 0),横幅是否可见由系统通知权限与用户设置决定" };
   })();
 
   return [promptCheck, stopCheck];

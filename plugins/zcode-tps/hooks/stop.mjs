@@ -9,23 +9,44 @@
 // 不动会话流、零续跑调用;对话流内的历史记录仍由 UserPromptSubmit 注入行负责(照常注入)。
 // 配置 turnEndLine(默认 false):true/"notify"/"toast" 开启通知,false/off 关闭。
 //
-// 0.5.5 可信度修复(审核 F02–F06):
-// - 健康记录按 会话+hook 分文件:关闭态/失败不再覆盖 prompt 链路的诊断;
-// - 关闭态在读配置后尽早退出,只写自己通道的状态;
-// - 异常路径记录 error 终态与原因(此前 running 残留);
-// - 通知先提交、确认结果后落水位:提交失败不前进水位,下回合 Stop 自然重试;
-// - 去重水位按会话多槽保存,并对"实际展示范围的稳定指纹"比对(子代理并入/会话切换不误判);
-// - stdin 限时/限长,宿主异常不关 stdin 时不会挂满 hook 预算。
+// 0.5.5 可信度修复(审核 F02–F06 + 复核 R01–R04):
+// - 健康记录按 会话+hook 分文件:关闭态/失败不再覆盖 prompt 链路的诊断(F02);
+// - 异常路径记录 error 终态与原因,健康记录区分 stdin/查询/全程耗时(R03);
+// - 全程统一预算(默认 7s < 宿主 8s):stdin 等待、查询、通知确认与终态写入共享同一条 deadline;
+//   同步 SQLite 无法从同线程中断,查询放入有界子进程,超时终止,墙钟上限不再依赖锁等待叠加(R03);
+// - 通知等待退出码:非零退出/信号 = 提交失败,不落水位,下次 Stop 重试(R01);
+// - 去重水位按会话哈希独立文件,并发 Stop 互不覆盖(R04);旧共享多槽文件只作迁移读;
+// - 指纹覆盖实际展示所需的原始聚合(速率分母/缓存分子/最新请求/字段选择),不只哈希四舍五入后的行文本(R02)。
 // 任何失败静默放行(exit 0),绝不阻塞回合结束。
 import fs from "node:fs";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
-  readConfig, parseBool, parseJson, resolveTurnEndMode, lastShownFile, writeState,
-  recordHealth, startHealth, submitNotify, validId, HOOK_STOP,
+  readConfig, parseBool, parseJson, resolveTurnEndMode, lastShownFile, shownSlotFile, notifiedOnceFile,
+  writeState, recordHealth, startHealth, submitNotify, validId, HOOK_STOP,
 } from "../scripts/runtime.mjs";
 
-// stdin 限时/限长(默认 1.5s / 64KB):正常宿主在 Stop 时写入小 JSON 后关闭;
-// 若宿主异常保持 stdin 开启,超时销毁流并按无输入处理,不挂 8s 宿主超时。
-async function readStdinJson({ limitMs = 1500, maxBytes = 65536 } = {}) {
+const QUERY_SCRIPT = fileURLToPath(new URL("../scripts/token-rate.mjs", import.meta.url));
+
+// ---- 全程预算(R03):宿主给 Stop 的超时为 8s(hooks.json),hook 自身按 7s 统筹
+// stdin 等待、查询、通知确认与终态写入,预留 ~1s 进程启动/宿主终止余量。各环节按
+// 剩余预算收缩,任何单项变慢都会压缩后续预算而不是叠加到 8s 之外。
+const HOOK_BUDGET_MS = 7000;
+const STDIN_LIMIT_MS = 1500;          // 正常宿主写入小 JSON 后立即关闭;悬挂 stdin 超时销毁按无输入处理
+const STDIN_LIMIT_DISABLED_MS = 300;  // 关闭态只需尽力抓 sid,不等满全限时
+const NOTIFY_CONFIRM_DEFAULT_MS = 2000;
+const NOTIFY_CONFIRM_MAX_MS = 3000;
+const WRITE_RESERVE_MS = 400;         // 水位/健康记录落盘余量
+const MIN_QUERY_MS = 800;             // 查询子进程至少分到的预算(正常查询远小于此)
+
+const entryAt = Date.now();
+const deadline = entryAt + HOOK_BUDGET_MS;
+const remainMs = () => deadline - Date.now();
+const rawConfirm = Number(process.env.ZCODE_TPS_NOTIFY_CONFIRM_MS);
+const NOTIFY_CONFIRM_MS = Number.isFinite(rawConfirm) && rawConfirm >= 200 && rawConfirm <= NOTIFY_CONFIRM_MAX_MS
+  ? rawConfirm : NOTIFY_CONFIRM_DEFAULT_MS;
+
+async function readStdinJson({ limitMs = STDIN_LIMIT_MS, maxBytes = 65536 } = {}) {
   let timer = null;
   let timedOut = false;
   try {
@@ -53,13 +74,11 @@ async function readStdinJson({ limitMs = 1500, maxBytes = 65536 } = {}) {
   }
 }
 
-// ---- 去重水位(F06):按会话多槽 + 展示范围稳定指纹 ----
+// ---- 去重水位(F06/R04):按会话哈希独立文件 ----
 // 语义:同一会话"展示的统计内容"变化时通知一次;内容未变(哪怕切走再切回)不重复通知。
-// 指纹只含数据本体(覆盖主对话+子代理+轮次的展示范围),排除 sampledAt 等每次变化的字段。
-// 兼容:旧单槽文件 {sessionId, shownAt} 迁移为该会话的已知水位(指纹视为未知,至多多通知一次)。
-const SHOWN_MAX_SESSIONS = 32;
-
-function readShown(file) {
+// 每会话一个文件,不同会话并发的 Stop 读改写互不覆盖(旧共享多槽文件存在跨会话覆盖竞态)。
+// 兼容:0.5.4 共享多槽/单槽文件仅作迁移读(指纹视为未知,至多多通知一次),不再写入。
+function readLegacyShown(file) {
   try {
     const v = parseJson(fs.readFileSync(file, "utf8"));
     if (!v || typeof v !== "object" || Array.isArray(v)) return null;
@@ -75,76 +94,170 @@ function readShown(file) {
   }
 }
 
-function shownFingerprint(r) {
+function slotFrom(slot) {
+  return slot
+    ? { fingerprint: typeof slot.fingerprint === "string" ? slot.fingerprint : null, shownAt: Number(slot.shownAt) || 0 }
+    : null;
+}
+
+function readShownSlot(sessionId) {
+  const file = shownSlotFile(sessionId);
+  if (file) {
+    try {
+      const v = parseJson(fs.readFileSync(file, "utf8"));
+      if (v && typeof v === "object" && v.sessionId === sessionId) return slotFrom(v);
+    } catch {} // 损坏水位按无水位处理,重建
+  }
+  const legacy = readLegacyShown(lastShownFile());
+  return legacy ? slotFrom(legacy.sessions?.[sessionId]) : null;
+}
+
+function writeShownSlot(sessionId, fingerprint, shownAt) {
+  const file = shownSlotFile(sessionId);
+  if (!file) return;
+  writeState(file, { version: 3, sessionId, shownAt, fingerprint, ts: Date.now(), source: "stop" });
+}
+
+// "曾成功通知过"标记:决定是否在首次通知前补写 Windows 注册表横幅权限(幂等,仅一次)
+function everNotified() {
+  try { fs.accessSync(notifiedOnceFile()); return true; } catch {}
+  const legacy = readLegacyShown(lastShownFile());
+  return !!(legacy && (legacy.everNotified || Object.keys(legacy.sessions).length > 0));
+}
+function markNotifiedOnce() {
+  try { writeState(notifiedOnceFile(), { ts: Date.now() }); } catch {}
+}
+
+// ---- 展示范围稳定指纹(F06/R02) ----
+// 覆盖实际展示所需的原始聚合值:e2e/Decode 的分子与时长分母、主统计 input/cacheRead、
+// 轮次/最新请求标识、字段选择与时区,外加格式化行本身(所见即所比)。排除 sampledAt。
+// 原始聚合不经四舍五入:总量不变的 duration/TTFT/cache 回填会改变速率与缓存率,必须触发通知。
+function shownFingerprint(r, fields, line) {
+  const s = r.session ?? {}, u = r.usage ?? {}, t = r.turn ?? {}, l = r.latest ?? {};
   return JSON.stringify([
+    3,
+    r.sessionId ?? null, s.scope ?? null, fields.join(","), r.timezone ?? null,
     r.coverage?.lastCompletedAt ?? null,
-    r.session?.requests ?? 0,
-    r.session?.totalInput ?? 0,
-    r.session?.totalOutput ?? 0,
-    r.session?.decodeSamples ?? 0,
-    r.usage?.total ?? null,
-    r.turn?.turnId ?? null,
-    r.turn?.total ?? null,
+    s.requests ?? 0, s.samples ?? 0, s.totalInput ?? 0, s.totalOutput ?? 0, s.totalCacheRead ?? 0,
+    s.avgTps ?? null, s.decodeSamples ?? 0, s.decodeTps ?? null,
+    s.e2eOutputTokens ?? null, s.e2eDurationMs ?? null, s.decodeOutputTokens ?? null, s.decodeDurationMs ?? null,
+    u.input ?? null, u.output ?? null, u.cacheRead ?? null, r.cacheHit ?? null,
+    t.turnId ?? null, t.requests ?? 0, t.durationMs ?? 0, t.input ?? 0, t.output ?? 0,
+    t.avgTps ?? null, t.cacheHit ?? null, t.completedAt ?? null,
+    l.completedAt ?? null, l.durMs ?? null, l.tokPerSec ?? null, l.ttftMs ?? null, l.inputTokens ?? 0,
+    line,
   ]);
 }
 
-function writeShown(file, shown, sessionId, fingerprint, shownAt) {
-  const sessions = { ...(shown?.sessions ?? {}) };
-  sessions[sessionId] = { shownAt, fingerprint, ts: Date.now(), source: "stop" };
-  // 会话槽上限:按 ts 淘汰最旧,避免长期使用下文件无限增长
-  const keys = Object.keys(sessions);
-  if (keys.length > SHOWN_MAX_SESSIONS) {
-    for (const k of keys.sort((a, b) => (sessions[a].ts ?? 0) - (sessions[b].ts ?? 0)).slice(0, keys.length - SHOWN_MAX_SESSIONS)) {
-      delete sessions[k];
+// ---- 有界查询子进程(R03) ----
+// 同线程 setTimeout 无法中断同步 SQLite(锁等待按语句叠加曾实测 6.5s+),查询放进子进程,
+// 超出剩余预算直接终止:hook 的墙钟上限由本函数的 timeoutMs 硬性保证,与库内锁行为无关。
+// 子进程即 token-rate CLI(--json),自身按 ZCODE_SESSION_ID/配置/环境变量执行同一查询逻辑。
+function queryViaChild(sid, timeoutMs) {
+  return new Promise((resolve) => {
+    const env = { ...process.env };
+    if (validId(sid)) env.ZCODE_SESSION_ID = sid;
+    else { delete env.ZCODE_SESSION_ID; delete env.CLAUDE_SESSION_ID; }
+    let child;
+    try {
+      child = spawn(process.execPath, [QUERY_SCRIPT, "--json"], {
+        env, stdio: ["ignore", "pipe", "pipe"], windowsHide: true,
+      });
+    } catch (e) {
+      resolve({ error: `查询子进程无法启动: ${e?.message ?? e}` });
+      return;
     }
-  }
-  writeState(file, { version: 2, everNotified: true, sessions });
+    let out = "", errText = "", settled = false, timer = null;
+    const finish = (v) => { if (settled) return; settled = true; if (timer) clearTimeout(timer); resolve(v); };
+    timer = setTimeout(() => {
+      try { child.kill(); } catch {}
+      finish({ error: `查询超时(${Math.round(timeoutMs)}ms 内未完成,已终止查询子进程;用量库可能被持续锁定)` });
+    }, Math.max(0, timeoutMs));
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { errText += d; });
+    child.once("error", (e) => finish({ error: `查询子进程启动失败: ${e?.code ?? e?.message ?? e}` }));
+    child.once("close", (code) => {
+      const raw = out.trim();
+      let v = null;
+      try { v = raw ? parseJson(raw) : null; } catch { v = null; }
+      if (v && typeof v === "object" && !Array.isArray(v)) {
+        if (v.error) finish({ error: String(v.error) });
+        else finish({ result: v });
+      } else {
+        finish({ error: `查询子进程输出不可解析(退出码 ${code})${errText ? ":" + errText.trim().slice(0, 200) : ""}` });
+      }
+    });
+  });
 }
 
-const input = await readStdinJson();
+// ---- 主流程 ----
+// 配置先行(R03):关闭态在等待 stdin 之前即可判定,用短限时抓 sid 后立即退出;
+// 配置损坏不能提前退出——须走完整路径留下 error 终态(F03,任何失败都有终态与原因)。
+let cfg = null;
+let cfgError = null;
+try { cfg = readConfig(); } catch (e) { cfgError = e; }
+const disabled = !cfgError && (!parseBool(cfg.tokenRateLine, true) || resolveTurnEndMode(cfg.turnEndLine) !== "notify");
+
+const stdinLimit = disabled
+  ? STDIN_LIMIT_DISABLED_MS
+  : Math.max(200, Math.min(STDIN_LIMIT_MS, remainMs() - (NOTIFY_CONFIRM_MAX_MS + WRITE_RESERVE_MS + MIN_QUERY_MS)));
+const stdinStart = Date.now();
+const input = await readStdinJson({ limitMs: stdinLimit });
+const stdinMs = Date.now() - stdinStart;
 const sid = input.session_id || process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || "";
 
-// startHealth 先于一切可能失败的步骤:配置损坏/缺库等任何异常都必须留下 error 终态(F03)。
-// 健康记录按 会话+hook 分文件(F02),此处写入不覆盖 prompt 链路的诊断。
+// 健康记录按 会话+hook 分文件(F02);stdin/查询/全程耗时分段记录(R03)
 const run = startHealth(sid, HOOK_STOP);
+let queryMs = null;
 const complete = (update) => {
-  try { recordHealth({ ...run, ...update, durationMs: Date.now() - run.startedAt }); } catch {}
+  try {
+    recordHealth({ ...run, ...update, stdinMs, queryMs,
+      durationMs: Date.now() - run.startedAt, totalMs: Date.now() - entryAt });
+  } catch {}
 };
 
 try {
-  const cfg = readConfig();
-  // 关闭态尽早退出:只更新自己通道(Stop)的健康状态,不碰 prompt 链路的诊断文件
-  if (!parseBool(cfg.tokenRateLine, true) || resolveTurnEndMode(cfg.turnEndLine) !== "notify") {
+  if (cfgError) throw cfgError;
+  if (disabled) {
     complete({ status: "disabled", error: null, warnings: [] });
     process.exit(0);
   }
-  const file = lastShownFile();
-  const shown = readShown(file);
-  const { query, formatLine, resolveRateFields } = await import("../scripts/token-rate.mjs");
-  const result = query(sid || null, { includeSubagents: parseBool(cfg.includeSubagents, true), timezone: cfg.timezone });
+  const { formatLine, resolveRateFields } = await import("../scripts/token-rate.mjs");
+  const fields = resolveRateFields(cfg.rateLineFields);
+  const queryBudget = Math.max(MIN_QUERY_MS, remainMs() - (NOTIFY_CONFIRM_MAX_MS + WRITE_RESERVE_MS));
+  const queryStart = Date.now();
+  const q = await queryViaChild(sid, queryBudget);
+  queryMs = Date.now() - queryStart;
+  if (q.error) {
+    complete({ status: "error", error: q.error, warnings: [] });
+    process.exit(0);
+  }
+  const result = q.result;
   const lastCompletedAt = result.coverage?.lastCompletedAt ?? null;
-  const fingerprint = shownFingerprint(result);
-  const slot = shown?.sessions?.[result.sessionId];
+  const line = formatLine(result, fields);
+  const fingerprint = shownFingerprint(result, fields, line);
+  const slot = readShownSlot(result.sessionId);
   // 无会话/无已完成请求时不通知;同会话展示内容未变化(指纹一致)也不重复通知
   if (!result.sessionId || lastCompletedAt == null || (slot && slot.fingerprint === fingerprint)) {
-    complete({ status: "ok", resolvedSessionId: result.sessionId, lastSuccessAt: Date.now(),
+    complete({ status: "ok", resolvedSessionId: result.sessionId ?? null, lastSuccessAt: Date.now(),
       sampledAt: result.sampledAt, notified: false, error: null, warnings: result.warnings });
     process.exit(0);
   }
-  // F05:先提交通知并确认结果,成功后才落水位——提交失败不前进水位,下回合 Stop 自然重试。
+  // F05/R01:先提交并确认退出结果,成功后才落水位——非零退出/信号不前进水位,下回合 Stop 自然重试。
   // (代价:通知已提交但水位写失败时可能重复通知一次;按 F05 裁定,重试机会优先于严格一次。)
   // ensurePermission 仅首次:注册表开启横幅权限只做一次,之后尊重用户系统设置。
-  const notifyStatus = await submitNotify({
-    line: formatLine(result, resolveRateFields(cfg.rateLineFields)),
-    ensurePermission: !(shown && (shown.everNotified || Object.keys(shown.sessions).length > 0)),
-  });
+  const confirmMs = Math.max(200, Math.min(NOTIFY_CONFIRM_MS, remainMs() - WRITE_RESERVE_MS));
+  const notifyStatus = await submitNotify({ line, ensurePermission: !everNotified(), confirmMs });
   if (typeof notifyStatus === "string" && notifyStatus.startsWith("failed")) {
     complete({ status: "notify-failed", error: `通知提交失败(${notifyStatus.slice("failed:".length)});水位未前进,下次 Stop 重试`,
       sampledAt: result.sampledAt, warnings: result.warnings });
     process.exit(0);
   }
-  writeShown(file, shown, result.sessionId, fingerprint, lastCompletedAt);
-  complete({ status: "ok", resolvedSessionId: result.sessionId, lastSuccessAt: Date.now(),
+  writeShownSlot(result.sessionId, fingerprint, lastCompletedAt);
+  markNotifiedOnce();
+  complete({ status: "ok", resolvedSessionId: result.sessionId ?? null, lastSuccessAt: Date.now(),
     sampledAt: result.sampledAt, notified: true, notifyStatus, error: null, warnings: result.warnings });
 } catch (e) {
   // F03:可捕获的失败必须记录终态与原因;宿主强制终止(SIGKILL)才会残留 running

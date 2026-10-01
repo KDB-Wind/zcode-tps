@@ -446,6 +446,10 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption, force
       const dur = (aggrRow?.dur ?? 0) + (useSub ? subAggr?.dur ?? 0 : 0);
       const n = (aggrRow?.n ?? 0) + (useSub ? subAggr?.n ?? 0 : 0);
       if (n && dur) session.avgTps = rateTps(tok, dur);
+      // 原始分子/分母(未经 rateTps 四舍五入):供 Stop 展示指纹比对(审核 R02),
+      // 时长回填这类"总量不变、速率分母变化"的数据变化不再被指纹漏掉。
+      session.e2eOutputTokens = tok;
+      session.e2eDurationMs = dur;
     }
     {
       // Decode 会话均:同一有效样本集,分母剔除首字等待;近似官方 Decode 口径,趋势可比而非等价
@@ -454,6 +458,8 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption, force
       const n = (decodeRow?.n ?? 0) + (useSub ? subDecodeRow?.n ?? 0 : 0);
       session.decodeSamples = n;
       session.decodeTps = n && dur ? rateTps(tok, dur) : null;
+      session.decodeOutputTokens = tok;
+      session.decodeDurationMs = dur;
     }
 
     // Only aggregate the latest observed turn. NULL IDs carry no reliable grouping information.

@@ -108,3 +108,23 @@
 - 真实库只读冒烟(token-rate + doctor)正常;数值守卫无可见性能代价。
 - 红线遵守:真实库仅只读;合成库在临时目录;未 push、未发布;未用 pkill。
 - 遗留:origin/marketplace 推送与 tag 留待用户明确授权(报告 §8.2);0.6.0(wrapUpSample 收尾采样/workflow 分账)未动。
+
+# v0.5.5 复核修复轮(2026-10-01,报告 §11 R01–R05)
+
+d18dab5 的独立复核(报告第 11 节)发现 5 项未闭环(1 P1 + 4 P2),本轮全部修复并独立探针复演。版本保持 0.5.5(未发布,不产生 0.5.6)。
+
+## 改动
+
+- **R01 通知退出码确认(P1)**:`submitNotify` 由"250ms 内 spawn 事件即记 submitted"改为等待退出结果——exit 0 → `ok`;非零退出/信号 → `failed:exit N/signal X` → stop 记 `notify-failed` 不落水位(下回合重试);限时(默认 2000ms,`ZCODE_TPS_NOTIFY_CONFIRM_MS` 200–3000)未退出 → `unknown` 按已提交处理且如实标注(避免对可能已展示的通知重复弹窗)。超时不杀子进程(toast 可能正在展示)。
+- **R02 指纹覆盖展示聚合(P2)**:token-rate `session` 新增 `e2eOutputTokens/e2eDurationMs/decodeOutputTokens/decodeDurationMs`(未经四舍五入的分子/分母);stop 指纹扩为 session/usage/turn/latest 原始聚合 + 字段选择 + 时区 + 格式化行本身(排除 sampledAt)——duration 回填(轮均 100→50)与 cacheRead 回填(缓存 87.5%→50%)均触发再通知。
+- **R03 Stop 全程预算(P2)**:入口设 7s deadline(< 宿主 8s),stdin/查询/通知确认/落盘按剩余预算收缩;配置先行,关闭态 300ms 短限时抓 sid 即退出;查询放有界子进程(token-rate CLI --json,超时 kill),墙钟上限不再依赖 SQLite 锁等待叠加(审核复现 8095ms → 复演 3670ms,error 终态);健康记录分段 `stdinMs/queryMs/totalMs`。
+- **R04 每会话独立水位文件(P2)**:`shownSlotFile(sid)` = `…last-shown.json.<SHA256(sid)>.json`(version 3),并发 Stop 互不覆盖(审核复现 3/3 丢 A 槽 → 复演 A/B 双水位保留);旧共享多槽/单槽文件仅迁移读;`everNotified` 改独立 `.once` 标记文件。
+- **R05 doctor 状态文案(P2)**:Stop 链路按本次 run 状态分支渲染(ok/disabled/notify-failed/error/running),error/running 不再出现"采集成功";`startHealth` 清空上一轮 `notified/notifyStatus` 等易变字段(`lastSuccessAt` 历史字段保留);`describeNotifyStatus` 如实映射 ok/suppressed/unknown/failed:*。
+
+## 门禁(2026-10-01 23:40,Node v24.14.0,win32)
+
+- npm test 5 文件全绿(quality 扩至退出码矩阵/回填指纹/预算墙钟/并发水位/doctor 文案,~16.7s)。
+- 独立探针复演审核反例(临时目录合成库 + 可控通知命令,未碰真实库、未弹真实通知):R01 找不到脚本 exit 1 → notify-failed 无水位;R02 100→50/111.1→52.6/87.5%→50% 每次再通知、快照不变不通知;R03 墙钟 3670ms + error 终态 + 分段耗时;R04 双水位;R05 notified true→null、lastSuccessAt 保留、无"采集成功"。
+- 基准未重跑(查询路径仅增 4 个已聚合字段的赋值,无新 SQL;benchmark 预算路径未动)。
+- 红线遵守:真实库未打开;合成库临时目录;未 push、未发布;未用 pkill。
+- 遗留:发布(origin/marketplace-local/tag + /plugin 更新)仍等用户授权;0.6.0 路线不变。

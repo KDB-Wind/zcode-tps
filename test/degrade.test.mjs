@@ -720,8 +720,11 @@ async function loadWith(dbPath) {
 // ---- 用例 29:Stop hook(回合结束系统通知)—— 默认关、开启后通知/水位去重/主开关优先 ----
 // 设计说明:曾经存在 block 续跑补行形态,因 ZCode 会把续跑回合折叠为摘要条(回答主体不可见)
 // 已按用户裁决移除;通知模式无续跑、无循环,pending/stop_hook_active 机制随之删除。
+// 0.5.5(审核 R04)起水位按会话哈希独立文件(zcode-tps.last-shown.json.<hash>.json),
+// 并发 Stop 互不覆盖;旧共享多槽/单槽文件只作迁移读。
 {
   const STOP = path.join(path.dirname(SCRIPT), "..", "hooks", "stop.mjs");
+  const { shownSlotFile } = await import(pathToFileURL(path.join(SCRIPT, "..", "runtime.mjs")).href + "?case=shown" + Math.random());
   const dbPath = path.join(tmp, "stop.sqlite");
   const db = new DatabaseSync(dbPath);
   createModelUsage(db);
@@ -732,6 +735,8 @@ async function loadWith(dbPath) {
   const cfgOn = path.join(tmp, "stop-config-on.json");
   fs.writeFileSync(cfgOn, JSON.stringify({ turnEndLine: true }));
   const shownFile = path.join(tmp, "stop-shown.json");
+  process.env.ZCODE_TPS_LAST_SHOWN = shownFile; // 测试进程与 stop 子进程按同一路径解析水位文件
+  const slotPath = shownSlotFile(SID);
   const baseEnv = {
     ...process.env,
     ZCODE_USAGE_DB: dbPath,
@@ -748,26 +753,25 @@ async function loadWith(dbPath) {
     stdio: ["pipe", "pipe", "pipe"],
   });
 
-  // 默认关闭:无输出,不弹通知
+  // 默认关闭:无输出,不弹通知,不写任何水位文件
   let out = runStop(cfgOff);
   assert.equal(out, "", "turnEndLine 缺省时 Stop hook 必须放行且无输出");
-  assert.ok(!fs.existsSync(shownFile), "关闭时不得写水位文件");
+  assert.ok(!fs.existsSync(shownFile) && !fs.existsSync(slotPath), "关闭时不得写水位文件");
 
-  // 开启后首次:输出空(不驱动模型续跑),水位落盘(0.5.5 起为按会话多槽格式)
+  // 开启后首次:输出空(不驱动模型续跑),水位按会话独立文件落盘(0.5.5 R04)
   out = runStop(cfgOn);
   assert.equal(out, "", "notify 模式必须放行且无输出(不驱动模型续跑,不折叠回合)");
-  let shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-  let slot = shown.sessions[SID];
-  assert.ok(slot, "水位应按会话保存独立槽位");
+  let slot = JSON.parse(fs.readFileSync(slotPath, "utf8"));
+  assert.equal(slot.version, 3);
+  assert.equal(slot.sessionId, SID, "水位文件绑定该会话");
   assert.ok(Number.isFinite(slot.shownAt) && slot.shownAt > 0, "水位应为 coverage.lastCompletedAt");
-  assert.ok(typeof slot.fingerprint === "string" && slot.fingerprint.length > 0, "槽位应保存展示范围指纹(F06)");
-  assert.equal(shown.everNotified, true);
+  assert.ok(typeof slot.fingerprint === "string" && slot.fingerprint.length > 0, "水位应保存展示范围指纹(F06/R02)");
   assert.equal(slot.pending, undefined, "通知模式无 pending 机制(无循环风险)");
 
   // 水位未前进(指纹一致):不重复通知
   out = runStop(cfgOn);
   assert.equal(out, "", "数据无新增时不得重复通知");
-  assert.equal(JSON.parse(fs.readFileSync(shownFile, "utf8")).sessions[SID].ts, slot.ts,
+  assert.equal(JSON.parse(fs.readFileSync(slotPath, "utf8")).ts, slot.ts,
     "指纹一致时水位文件不得改写(ts 不变)");
 
   // 水位前进(新增完成请求):再次通知,水位前进
@@ -776,8 +780,7 @@ async function loadWith(dbPath) {
   db2.close();
   out = runStop(cfgOn);
   assert.equal(out, "", "有新数据时再次通知(抑制模式下输出为空)");
-  shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-  assert.ok(shown.sessions[SID].shownAt > 1_000_000, "水位应前进到最新完成请求");
+  assert.ok(JSON.parse(fs.readFileSync(slotPath, "utf8")).shownAt > 1_000_000, "水位应前进到最新完成请求");
 
   // 字符串形式与布尔等价
   const cfgStr = path.join(tmp, "stop-config-str.json");
@@ -785,20 +788,23 @@ async function loadWith(dbPath) {
   out = runStop(cfgStr);
   assert.equal(out, "", "notify 字符串与 true 等价(水位未前进时无输出)");
 
-  // 主开关优先:tokenRateLine=false 时通知也不生效
+  // 主开关优先:tokenRateLine=false 时通知也不生效(旧共享水位不动、不新建独立水位)
   const cfgMaster = path.join(tmp, "stop-config-master.json");
   fs.writeFileSync(cfgMaster, JSON.stringify({ tokenRateLine: false, turnEndLine: true }));
-  fs.writeFileSync(shownFile, JSON.stringify({ sessionId: SID, shownAt: 0, ts: 0 }));
+  const legacy = JSON.stringify({ sessionId: SID, shownAt: 0, ts: 0 });
+  fs.writeFileSync(shownFile, legacy);
+  const slotBefore = fs.readFileSync(slotPath, "utf8");
   out = runStop(cfgMaster);
   assert.equal(out, "", "tokenRateLine=false 时 Stop hook 必须停用");
-  assert.equal(JSON.parse(fs.readFileSync(shownFile, "utf8")).shownAt, 0, "停用时不得更新水位");
+  assert.equal(fs.readFileSync(shownFile, "utf8"), legacy, "停用时不得改写旧水位");
+  assert.equal(fs.readFileSync(slotPath, "utf8"), slotBefore, "停用时不得改写会话水位");
 
   // 损坏水位文件:按无水位处理,不应抛错
-  fs.writeFileSync(shownFile, "not-json{");
+  fs.writeFileSync(slotPath, "not-json{");
   out = runStop(cfgOn);
   assert.equal(out, "", "损坏水位按无水位降级,不抛错");
-  shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-  assert.ok(shown.sessions?.[SID], "损坏后重建为多槽格式并正常通知");
+  slot = JSON.parse(fs.readFileSync(slotPath, "utf8"));
+  assert.ok(slot.sessionId === SID && typeof slot.fingerprint === "string", "损坏后重建并正常通知");
 }
 
 // ---- 用例 29b:turnEndLine 两态解析 ----
