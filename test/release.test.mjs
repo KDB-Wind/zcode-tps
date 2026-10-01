@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 import { spawnSync, spawn } from "node:child_process";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
-import { querySettings, supportsNode, healthFile, startHealth, recordHealth } from "../plugins/zcode-tps/scripts/runtime.mjs";
+import { querySettings, supportsNode, healthFile, startHealth, recordHealth, HOOK_PROMPT, HOOK_STOP } from "../plugins/zcode-tps/scripts/runtime.mjs";
 
 const root = fileURLToPath(new URL("../", import.meta.url));
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-tps-release-"));
@@ -203,24 +203,26 @@ try {
     assert.equal(child.status, 0);
     assert.equal(child.json.hookSpecificOutput.hookEventName, "UserPromptSubmit");
     assert.match(child.json.hookSpecificOutput.additionalContext, /采样时间/);
-    let health = JSON.parse(fs.readFileSync(process.env.ZCODE_TPS_HEALTH));
+    let health = JSON.parse(fs.readFileSync(healthFile("s", HOOK_PROMPT)));
     assert.equal(health.status, "ok");
+    assert.equal(health.hook, "prompt", "prompt 链路健康记录须带 hook 类型(F02)");
     const successfulAt = health.lastSuccessAt;
     const { runDoctor } = await load("doctor");
     let report = await runDoctor();
     assert.equal(report.failed, 0);
     assert.equal(report.checks.find(c => c.name === "会话状态文件").ok, true);
-    assert.equal(report.checks.find(c => c.name === "最近采集").ok, true);
+    assert.equal(report.checks.find(c => c.name === "注入链路采集(UserPromptSubmit)").ok, true);
+    assert.equal(report.checks.find(c => c.name === "通知链路(Stop)").ok, true, "无 Stop 记录时为'未观察到',不判失败");
 
     fs.writeFileSync(process.env.ZCODE_TPS_CONFIG, '{"tokenRateLine":"false"}');
     assert.equal(hook().json.hookSpecificOutput.additionalContext, "");
     assert.equal(start().json.hookSpecificOutput.additionalContext, "");
-    assert.equal(JSON.parse(fs.readFileSync(process.env.ZCODE_TPS_HEALTH)).status, "disabled");
+    assert.equal(JSON.parse(fs.readFileSync(healthFile("s", HOOK_PROMPT))).status, "disabled");
 
     for (const config of ['{"tokenRateLine":', 'null', '[]']) {
       fs.writeFileSync(process.env.ZCODE_TPS_CONFIG, config);
       assert.equal(hook().json.hookSpecificOutput.additionalContext, "");
-      health = JSON.parse(fs.readFileSync(process.env.ZCODE_TPS_HEALTH));
+      health = JSON.parse(fs.readFileSync(healthFile("s", HOOK_PROMPT)));
       assert.equal(health.status, "error");
       assert.ok(health.error);
       assert.equal(health.lastSuccessAt, successfulAt);
@@ -258,7 +260,7 @@ try {
     const env = { ...process.env, ZCODE_SESSION_ID: "s" };
     const first = spawnSync(process.execPath, [hook], { env, encoding: "utf8", timeout: 10000 });
     assert.equal(first.status, 0);
-    const previous = JSON.parse(fs.readFileSync(healthFile("s")));
+    const previous = JSON.parse(fs.readFileSync(healthFile("s", HOOK_PROMPT)));
     db.exec("BEGIN EXCLUSIVE");
     const child = spawn(process.execPath, [hook], { env, stdio: "ignore" });
     const closed = once(child, "close");
@@ -267,7 +269,7 @@ try {
       const deadline = Date.now() + 5000;
       do {
         await delay(20);
-        running = JSON.parse(fs.readFileSync(healthFile("s")));
+        running = JSON.parse(fs.readFileSync(healthFile("s", HOOK_PROMPT)));
       } while (running.runId === previous.runId && Date.now() < deadline);
       assert.notEqual(running.runId, previous.runId, "hook must persist its start before querying a locked DB");
       assert.equal(running.status, "running");
@@ -278,39 +280,61 @@ try {
       db.exec("ROLLBACK");
     }
     const report = await (await load("doctor")).runDoctor();
-    const check = report.checks.find(c => c.name === "最近采集");
+    const check = report.checks.find(c => c.name === "注入链路采集(UserPromptSubmit)");
     assert.equal(check.ok, false);
     assert.equal(check.status, "running");
     assert.match(check.detail, /中断或超时/);
   });
   await fixture("session-health", async ({ load }) => {
     const { runDoctor } = await load("doctor");
-    const forSession = async sid => {
+    const forSession = async (sid, name = "注入链路采集(UserPromptSubmit)") => {
       const previous = process.env.ZCODE_SESSION_ID;
       process.env.ZCODE_SESSION_ID = sid;
-      try { return (await runDoctor()).checks.find(c => c.name === "最近采集"); }
+      try { return (await runDoctor()).checks.find(c => c.name === name); }
       finally {
         if (previous === undefined) delete process.env.ZCODE_SESSION_ID;
         else process.env.ZCODE_SESSION_ID = previous;
       }
     };
-    const a = startHealth("window-a");
+    const a = startHealth("window-a", HOOK_PROMPT);
     recordHealth({ ...a, status: "ok", lastSuccessAt: Date.now(), durationMs: 5, warnings: [] });
-    const b = startHealth("window-b");
+    const b = startHealth("window-b", HOOK_PROMPT);
     recordHealth({ ...b, status: "error", error: "test failure", durationMs: 10 });
     assert.equal((await forSession("window-a")).ok, true);
     assert.equal((await forSession("window-b")).ok, false);
     assert.equal((await forSession("window-never-run")).ok, false);
-    assert.equal(JSON.parse(fs.readFileSync(healthFile("window-b"))).lastSuccessAt, undefined);
+    assert.equal(JSON.parse(fs.readFileSync(healthFile("window-b", HOOK_PROMPT))).lastSuccessAt, undefined);
     assert.equal((await forSession("window-b")).sessionId, "window-b");
-    const oldRun = startHealth("window-a");
-    const newRun = startHealth("window-a");
+    const oldRun = startHealth("window-a", HOOK_PROMPT);
+    const newRun = startHealth("window-a", HOOK_PROMPT);
     recordHealth({ ...oldRun, status: "ok", durationMs: 999 });
-    assert.equal(JSON.parse(fs.readFileSync(healthFile("window-a"))).runId, newRun.runId);
+    assert.equal(JSON.parse(fs.readFileSync(healthFile("window-a", HOOK_PROMPT))).runId, newRun.runId);
     assert.equal((await forSession("window-a")).ok, false);
     assert.match((await forSession("window-a")).detail, /采集中/);
-    assert.notEqual(healthFile("../window-a"), healthFile("window-a"));
-    assert.equal(path.dirname(healthFile("../window-a")), tmp, "session IDs cannot escape the health directory");
+    assert.notEqual(healthFile("../window-a", HOOK_PROMPT), healthFile("window-a", HOOK_PROMPT));
+    assert.equal(path.dirname(healthFile("../window-a", HOOK_PROMPT)), tmp, "session IDs cannot escape the health directory");
+
+    // F02:同会话不同 hook 分文件隔离——disabled/error 的 Stop 不再覆盖 prompt 的诊断,反之亦然
+    const a2 = startHealth("window-a", HOOK_PROMPT);
+    recordHealth({ ...a2, status: "error", error: "prompt db failure", durationMs: 7 });
+    const s2 = startHealth("window-a", HOOK_STOP);
+    recordHealth({ ...s2, status: "disabled", durationMs: 2 });
+    const promptRead = JSON.parse(fs.readFileSync(healthFile("window-a", HOOK_PROMPT)));
+    assert.equal(promptRead.status, "error", "Stop 的 disabled 不得覆盖 prompt 的 error(F02)");
+    assert.equal(promptRead.error, "prompt db failure");
+    const promptCheck = await forSession("window-a");
+    assert.equal(promptCheck.ok, false);
+    assert.match(promptCheck.detail, /prompt db failure/);
+    const stopCheck = await forSession("window-a", "通知链路(Stop)");
+    assert.equal(stopCheck.ok, true, "disabled 属预期状态");
+    assert.match(stopCheck.detail, /通知关闭/);
+    // 交错运行:prompt 晚于 stop 完成,prompt 记录不受 stop 影响
+    const s3 = startHealth("window-b", HOOK_STOP);
+    const p3 = startHealth("window-b", HOOK_PROMPT);
+    recordHealth({ ...p3, status: "ok", durationMs: 3, warnings: [] });
+    recordHealth({ ...s3, status: "ok", durationMs: 4, lastSuccessAt: Date.now(), warnings: [] });
+    assert.equal(JSON.parse(fs.readFileSync(healthFile("window-b", HOOK_PROMPT))).status, "ok");
+    assert.equal(JSON.parse(fs.readFileSync(healthFile("window-b", HOOK_STOP))).status, "ok");
   });
   await fixture("timezone-display", async ({ insert, load }) => {
     insert({ time: 1000 });
@@ -492,7 +516,7 @@ try {
     JSON.parse(fs.readFileSync(path.join(root, "marketplace.json"))).plugins[0].version,
     JSON.parse(fs.readFileSync(path.join(root, "plugins/zcode-tps/.zcode-plugin/plugin.json"))).version,
   ];
-  assert.deepEqual(versions, ["0.5.4", "0.5.4", "0.5.4"]);
+  assert.deepEqual(versions, ["0.5.5", "0.5.5", "0.5.5"]);
   // 发布一致性:README 版本与示例、hook 注释与字段常量对应,防止再次漂移
   const pkgVersion = versions[0];
   const { DEFAULT_RATE_FIELDS } = await import(pathToFileURL(path.join(root, "plugins/zcode-tps/scripts/token-rate.mjs")).href + "?drift");

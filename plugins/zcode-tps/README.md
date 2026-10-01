@@ -1,4 +1,4 @@
-# zcode-tps 0.5.4
+# zcode-tps 0.5.5
 
 从 `~/.zcode/cli/db/db.sqlite` 的 `model_usage` 只读计算速率、用量和缓存命中率。无需额外模型调用；自动行由模型根据 hook 上下文引用展示。
 
@@ -52,7 +52,7 @@
 
 **已知限制**：注入行在发消息时采样，只能覆盖到上一轮——如果会话只有一轮对话（常见于新会话直接开启目标任务、执行很长才结束），第一轮回复末尾不会有任何统计，从第二轮对话起正常显示。`turnEndLine` 的系统通知是这一场景的补救选项，但弹窗有打扰感，默认不开启；Windows 下横幅顶部的来源名显示为 PowerShell 的应用标识（AUMID），无法自定义，通知内容本身不受影响。
 
-`turnEndLine`（默认 `false`）开启回合结束的系统通知（Stop hook）。开启后，回合结束时立即弹系统通知显示统计（Windows toast / macOS 通知中心 / Linux notify-send，零依赖），单轮会话即时可见；通知完全不动会话流，不产生任何额外模型调用，回答主体不受影响（不采用"驱动模型续跑补行"方案——ZCode 会把续跑回合折叠为摘要条，回答被藏起）。通知负责即时性，UserPromptSubmit 注入行照常工作、负责对话流内的历史记录，两渠道互补。Windows 下首条通知会自动写入注册表开启 PowerShell 通知的横幅权限（新机器默认可能为关，静默 toast 会被丢弃），之后尊重用户在系统设置里的开关。数据未前进时不重复通知；任何查询失败静默放行，绝不阻塞回合结束；`tokenRateLine: false` 时本选项一并停用。取值：`true`/`"notify"`/`"toast"` 开启，`false`/`"off"` 关闭。
+`turnEndLine`（默认 `false`）开启回合结束的系统通知（Stop hook）。开启后，回合结束时立即弹系统通知显示统计（Windows toast / macOS 通知中心 / Linux notify-send，零依赖），单轮会话即时可见；通知完全不动会话流，不产生任何额外模型调用，回答主体不受影响（不采用"驱动模型续跑补行"方案——ZCode 会把续跑回合折叠为摘要条，回答被藏起）。通知负责即时性，UserPromptSubmit 注入行照常工作、负责对话流内的历史记录，两渠道互补。Windows 下首条通知会自动写入注册表开启 PowerShell 通知的横幅权限（新机器默认可能为关，静默 toast 会被丢弃），之后尊重用户在系统设置里的开关。通知在 Stop 时对库内已落库的 completed 快照采样——通常恰为刚结束这轮，但不含 Stop 之后才提交的用量，不宣称"本轮最终完整用量"。去重按会话独立槽位 + 展示内容指纹：同一会话展示的统计无变化（含切走再切回）不重复通知，子代理迟到并入等内容变化会再次通知。通知先提交并确认拉起、成功才记水位：提交失败记 `notify-failed` 且不前进水位，下次回合结束自动重试；"已提交"只承诺命令已交给系统，横幅是否可见由通知权限与用户设置决定。任何查询失败静默放行，绝不阻塞回合结束；`tokenRateLine: false` 时本选项一并停用。取值：`true`/`"notify"`/`"toast"` 开启，`false`/`"off"` 关闭。
 
 `timezone` 控制所有时间显示（速率行 `time` 段、采样提示、`/tps` 报表、doctor），默认 `Asia/Shanghai`；可设 `"UTC"`、`"system"`（跟随系统时区）或任意 IANA 时区名（如 `America/New_York`）。无效值回退默认并在 `warnings` 提示。环境变量 `ZCODE_TPS_TIMEZONE` 优先于配置文件。数据库中的时间戳无时区语义，只是显示层的选择。
 
@@ -63,11 +63,13 @@
 ## 统计口径
 
 - `durMs = duration_ms ?? (completed_at - started_at)`，速率为 `output_tokens / (durMs / 1000)`。
-- 有效样本：请求 `status=completed`、输出大于 0、时长在 `[500ms, 1h)`。无 first-token 但时长有效的请求仍可统计速率，TTFT 可为空。
+- 数值有效性契约（0.5.5）：token 与时长字段须为非负有限数值（SQL 与 JS 同一规则）。文本、负数、NULL、非有限值的行不计速率样本；用量按 0 计并保留请求计数，同时在 `warnings` 暴露"N 条请求的 token 字段非合法数值"，不静默补零冒充准确账本。`cache_read_input_tokens > input_tokens` 的语义异常行同样告警。
+- 有效样本：请求 `status=completed`、输出为合法数值且大于 0、时长在 `[500ms, 1h)`。无 first-token 但时长有效的请求仍可统计速率，TTFT 可为空。完成时间超出 Date 可表示范围的行保留用量，时间显示为空并附告警。
 - 最近轮均、会话均为 `Σoutput / Σduration`。请求内等待计入；请求间工具执行和编排间隙不计入。并发子代理的请求时长相加，不代表整轮墙钟吞吐。
 - 总量始终为输入 + 输出；reasoning 是输出明细，不再相加。零输出或时长无效的 completed 请求仍计入用量和请求数。
 - 缓存命中率 = 缓存读 / 输入；输入已含缓存读，缓存创建不计命中。
-- Decode 速度 = `output / (durMs − TTFT)`，只计纯生成阶段，排队与预填充不计入分母，因此高于端到端速率。口径近似智谱官方"高峰期平均 Decode 速度"（同为纯生成思路），但计时边界、请求构成与平均方法不同，可用于同环境趋势观察，不保证与官方数字等价。TTFT 取 `time_to_first_token_ms`，缺失时回退 `first_token_at − started_at`；两者皆缺的请求不参与 Decode（仍计入端到端与用量）。解码窗口 ≥200ms 的要求对请求级、分布与会话级（含子代理）统一生效；会话 Decode 为同批有效样本的 `Σoutput / Σ(durMs − TTFT)` 加权值。
+- Decode 速度 = `output / (durMs − TTFT)`，只计纯生成阶段，排队与预填充不计入分母，因此高于端到端速率。口径近似智谱官方"高峰期平均 Decode 速度"（同为纯生成思路），但计时边界、请求构成与平均方法不同，可用于同环境趋势观察，不保证与官方数字等价。TTFT 取 `time_to_first_token_ms`，缺失时回退 `first_token_at − started_at`（两者皆为数值才有效）；TTFT 须满足 `0 ≤ TTFT ≤ durMs`，负数、文本或超过请求时长的值不参与 Decode（端到端样本不受影响，两者范围不同）。两者皆缺的请求不参与 Decode（仍计入端到端与用量）。解码窗口 ≥200ms 的要求对请求级、分布与会话级（含子代理）统一生效；会话 Decode 为同批有效样本的 `Σoutput / Σ(durMs − TTFT)` 加权值。
+- turn_id 为 NULL 或纯空白文本时一律判"轮次未知"（共用有效 ID 规则）；合法但带前后空格的 ID 按原值区分，不 trim 合并。
 - 不使用 `turn_usage` 计算指标。ZCode 清理旧 `model_usage` 行后累计可能下降，不能当全历史消耗或费用账本。
 
 ## JSON 与时间边界
@@ -109,18 +111,20 @@ NULL/空轮次 ID 不能证明轮次归属：最新请求缺 ID 时 `turn=null`�
 | `ZCODE_SESSION_ID` | 明确指定当前会话 |
 | `ZCODE_TPS_LAST_SESSION` | 覆盖会话状态文件；hook、CLI、doctor 共用 |
 | `ZCODE_TPS_CONFIG` | 覆盖配置文件路径 |
-| `ZCODE_TPS_HEALTH` | 覆盖健康记录基础路径；默认是状态文件路径加 `.health.json`，会话文件追加 `.SHA256(sessionId).json` |
+| `ZCODE_TPS_HEALTH` | 覆盖健康记录基础路径；默认是状态文件路径加 `.health.json`，实际文件按 会话+hook 追加 `.SHA256(sessionId).prompt.json` / `.stop.json` |
 | `TOKEN_RATE_HIST` | history 条数，1–1000 的整数，默认 60 |
 | `TOKEN_RATE_MIN_MS` | 有限正数，默认 500 |
 | `TOKEN_RATE_MAX_MS` | 有限正数，默认 3600000；必须大于 MIN |
+| `ZCODE_TPS_NOTIFY_SUPPRESS` | 置 `1` 跳过真实系统通知（测试/CI 用；健康记录如实标注 `suppressed`） |
+| `ZCODE_TPS_NOTIFY_BIN` | 覆盖通知命令（诊断/测试用，如指向缺失路径验证提交失败路径） |
 
 只读连接设置 2 秒 busy timeout，整个查询遇锁错误重试一次，取消轮次查询的嵌套重试。SQLite 锁等待与查询 CPU 时间不是同一个预算；hook 的 8 秒宿主超时仍是最终限制。
 
 doctor 与查询共享必需/可选列定义。缺 `trace_id` 时无法归因；缺 `turn_id` 时轮次未知；缺 `cache_creation_input_tokens` 时缓存写入为 null，其余累计仍可用。以上为 warn；核心列缺失为 error。`turn_usage` 缺失不影响指标。
 
-状态文件存在只说明曾写入，不能证明采集成功或当前 hook 已注册。hook 在加载配置和查询数据库前记录 `running`、`runId`、PID 和开始时间，完成后再更新为 `ok`、`disabled` 或 `error`。尚未完成的记录总是警告；进程已退出或运行超过 8 秒时提示疑似中断/超时，不沿用上一次成功状态。
+状态文件存在只说明曾写入，不能证明采集成功或当前 hook 已注册。hook 在查询数据库前记录 `running`、`runId`、PID、hook 类型和开始时间，完成后再更新为 `ok`、`disabled`、`notify-failed` 或 `error`；任何可捕获失败（缺库、持续锁、配置损坏、通知命令不可用）都有带原因的终态，只有宿主强制终止才会残留 `running`。尚未完成的记录总是警告；进程已退出或运行超过 8 秒时提示疑似中断/超时，不沿用上一次成功状态。
 
-健康记录按会话哈希文件名保存，并保留全局最近启动采集的摘要。doctor 优先选择显式会话 ID，其次新鲜状态文件中的会话；不使用其他会话的成功记录替代当前会话。没有会话线索时可展示全局记录，并明确标注会话。最近成功时间仅从同一会话继承。无显式 ID 的 hook 会记录到全局文件，并在成功查询后附 `resolvedSessionId`；在获得实际会话前不会猜测归属。
+健康记录按 会话哈希 + hook 类型 分文件保存（0.5.5）：Stop 通道的关闭态/失败不会覆盖 prompt 通道的诊断，反之亦然；同一会话两个 hook 交错完成互不合并。doctor 分"注入链路采集(UserPromptSubmit)"与"通知链路(Stop)"两项展示，通知链路区分采集成功（附提交结果 submitted/suppressed/unknown）、通知关闭、未观察到（可能回合未结束、插件刚更新未重开会话或宿主未触发 Stop——以记录为准，不预设）与提交失败四态。doctor 优先选择显式会话 ID，其次新鲜状态文件中的会话；不使用其他会话的成功记录替代当前会话。无显式 ID 的 hook 会记录到无会话文件，并在成功查询后附 `resolvedSessionId`；在获得实际会话前不会猜测归属。
 
 记录不包含对话正文。doctor 对缺失、过期、未完成和降级记录提示警告，error 才影响退出码。会话健康文件按每个会话一份保留；并行窗口隔离不等于同一会话并发执行的事务日志。
 
@@ -128,7 +132,7 @@ doctor 与查询共享必需/可选列定义。缺 `trace_id` 时无法归因；
 
 0.4.0 已把速率从 `(output+reasoning)/(completed-first_token)` 改为 `output/duration`。0.4.2 进一步修正累计总量中的 reasoning 重复计数；若思考量非零，总量会下降，这是纠错。`history.legacyTps` 仅用于显式请求的 0.3 对比，不作为默认性能指标。
 
-在仓库根目录运行 `npm test`，也可单独执行 `node test/degrade.test.mjs`、`node test/doctor.test.mjs`、`node test/release.test.mjs`、`node test/correctness.test.mjs`（含三类库 × 七异常的正确性矩阵与查询语句数门禁）。测试使用隔离配置和临时 SQLite，包含并发 WAL 写入时快照一致性、CLI 与 hook JSON 契约。
+在仓库根目录运行 `npm test`，也可单独执行 `node test/degrade.test.mjs`、`node test/doctor.test.mjs`、`node test/release.test.mjs`、`node test/correctness.test.mjs`、`node test/quality.test.mjs`（0.5.5 修复回归：索引选择、字段类型校验、Stop 终态与通知提交、多槽水位、stdin 限时限长）。测试使用隔离配置和临时 SQLite，包含并发 WAL 写入时快照一致性、CLI 与 hook JSON 契约。
 
 `npm run benchmark` 默认跑多场景矩阵:小/中/大库(5k/100k/1M 行,含真实分布的缓存命中与 token 长度)× 索引场景(无/旧实验索引/生产真实索引镜像)× 查询模式(典型/最大会话/auto 识别)× 冷/热,并记录内存与持续独占锁耗时;可传位置参数只跑一档,如 `npm run benchmark -- 1000000`。基准只创建临时数据库,不修改真实用量库或其索引。样本不含 Node 启动和 hook 文件 IO,不能代替宿主实测。
 

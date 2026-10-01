@@ -8,7 +8,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { inspectSchema, parseBool as parseBoolLoose, readConfig, querySettings, stateFile, healthFile, supportsNode, validId, parseJson, resolveTimezone, formatInZone } from "./runtime.mjs";
+import { inspectSchema, parseBool as parseBoolLoose, readConfig, querySettings, stateFile, healthFile, supportsNode, validId, parseJson, resolveTimezone, formatInZone, HOOK_PROMPT, HOOK_STOP } from "./runtime.mjs";
 
 // 显示时区:配置优先,配置不可读时回退默认;与速率行/报表共用一套配置
 function displayTimezone() {
@@ -169,7 +169,9 @@ function configCheck() {
   }
 }
 
-function healthCheck() {
+// ---- hook 链路诊断(0.5.5 起 prompt 与 stop 分文件、分链路展示) ----
+// 健康记录按 会话+hook 隔离(F02):Stop 的 disabled/error 不再掩盖 prompt 的采集错误。
+function resolveHealthSessionId() {
   let sessionId = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || null;
   if (sessionId == null) {
     try {
@@ -178,35 +180,77 @@ function healthCheck() {
       if (validId(st.sessionId) && age >= 0 && age < 2 * 3600 * 1000) sessionId = st.sessionId;
     } catch {}
   }
+  return sessionId;
+}
+
+function readHealthRecord(sessionId, hook) {
   try {
-    if (sessionId != null && !validId(sessionId)) throw new Error("invalid session");
-    let h;
-    try { h = parseJson(fs.readFileSync(healthFile(sessionId), "utf8")); }
-    catch {
-      h = parseJson(fs.readFileSync(healthFile(), "utf8"));
+    const h = parseJson(fs.readFileSync(healthFile(sessionId, hook), "utf8"));
+    if (!h || typeof h !== "object") return null;
+    if (sessionId != null && h.sessionId !== sessionId) return null; // 其他会话的记录不冒充本会话
+    return h;
+  } catch { return null; }
+}
+
+// 共享:running 状态的活性与超时解释 + 基础明细
+function describeRun(h, zone) {
+  let status = h.status ?? "未知";
+  if (status === "running") {
+    let alive = true;
+    if (Number.isInteger(h.pid) && h.pid > 0) {
+      try { process.kill(h.pid, 0); } catch (e) { if (e.code === "ESRCH") alive = false; }
     }
-    // Global/legacy records are a fallback only for the same explicitly selected session.
-    if (sessionId != null && h.sessionId !== sessionId) throw new Error("different session");
-    const age = Date.now() - h.ts;
-    const fresh = Number.isFinite(age) && age >= 0 && age < 2 * 3600 * 1000;
-    const ok = fresh && ["ok", "disabled"].includes(h.status) && !h.warnings?.length;
-    let status = h.status ?? "未知";
-    if (status === "running") {
-      let alive = true;
-      if (Number.isInteger(h.pid) && h.pid > 0) {
-        try { process.kill(h.pid, 0); } catch (e) { if (e.code === "ESRCH") alive = false; }
-      }
-      status = !alive || Date.now() - h.startedAt >= 8000 ? "采集中断或超时(未记录完成)" : "采集中(尚未完成)";
-    }
-    const zone = displayTimezone();
-    return { name: "最近采集", level: "warn", ok,
-      sessionId: h.sessionId ?? null, runId: h.runId ?? null, status: h.status,
-      detail: `会话 ${h.sessionId ?? "未知"};${status};耗时 ${h.durationMs ?? "未知"}ms;最后成功 ${h.lastSuccessAt ? `${formatInZone(h.lastSuccessAt, zone)} (${zone})` : "无记录"}${h.error ? ";" + h.error : ""}${h.warnings?.length ? ";" + h.warnings.join(";") : ""}`,
-      hint: fresh ? "这是最近一次 hook 的结果,并非当前会话注册状态的证明" : "记录过期或时间异常,发送新消息后重试" };
-  } catch {
-    return { name: "最近采集", level: "warn", ok: false, sessionId,
-      detail: `会话 ${sessionId ?? "未知"} 无有效采集记录`, hint: "发送一条消息后检查;其他会话的成功记录不会替代当前会话" };
+    status = !alive || Date.now() - h.startedAt >= 8000 ? "采集中断或超时(未记录完成)" : "采集中(尚未完成)";
   }
+  const last = h.lastSuccessAt ? `${formatInZone(h.lastSuccessAt, zone)} (${zone})` : "无记录";
+  const extra = `${h.error ? ";" + h.error : ""}${h.warnings?.length ? ";" + h.warnings.join(";") : ""}`;
+  return { status, detail: `${status};耗时 ${h.durationMs ?? "未知"}ms;最后成功 ${last}${extra}` };
+}
+
+function healthChecks() {
+  const sessionId = resolveHealthSessionId();
+  const zone = displayTimezone();
+  const fresh = (h) => {
+    const age = Date.now() - h.ts;
+    return Number.isFinite(age) && age >= 0 && age < 2 * 3600 * 1000;
+  };
+
+  // 注入链路(UserPromptSubmit):默认显示行的采集
+  const promptName = "注入链路采集(UserPromptSubmit)";
+  const hp = sessionId != null && !validId(sessionId) ? null : readHealthRecord(sessionId, HOOK_PROMPT);
+  const promptCheck = (() => {
+    if (!hp) return { name: promptName, level: "warn", ok: false, sessionId,
+      detail: `会话 ${sessionId ?? "未知"} 无有效采集记录`,
+      hint: "发送一条消息后重查;插件安装/更新后需重开会话(hooks 会话启动时加载)" };
+    const run = describeRun(hp, zone);
+    const ok = fresh(hp) && ["ok", "disabled"].includes(hp.status) && !hp.warnings?.length;
+    return { name: promptName, level: "warn", ok, sessionId: hp.sessionId ?? null, runId: hp.runId ?? null, status: hp.status,
+      detail: `会话 ${hp.sessionId ?? "未知"};${run.detail}`,
+      hint: fresh(hp) ? "这是最近一次 hook 的结果,并非当前会话注册状态的证明" : "记录过期或时间异常,发送新消息后重试" };
+  })();
+
+  // 通知链路(Stop):回合结束系统通知,四态区分——采集成功/通知关闭/未观察到/提交失败(F02/F05)
+  const stopName = "通知链路(Stop)";
+  const hs = sessionId != null && !validId(sessionId) ? null : readHealthRecord(sessionId, HOOK_STOP);
+  const stopCheck = (() => {
+    if (!hs) return { name: stopName, level: "warn", ok: true, sessionId,
+      detail: `会话 ${sessionId ?? "未知"} 未观察到 Stop hook 运行`,
+      hint: "回合结束过至少会留下记录(含关闭态);无记录可能为插件刚更新未重开会话,或宿主未触发 Stop——以记录为准,不预设" };
+    const run = describeRun(hs, zone);
+    if (hs.status === "disabled") return { name: stopName, level: "warn", ok: true, sessionId: hs.sessionId ?? null, status: hs.status,
+      detail: `会话 ${hs.sessionId ?? "未知"};通知关闭(turnEndLine 未开启,属预期);${run.detail}`,
+      hint: "需要回合结束通知时,配置 turnEndLine 为 true" };
+    if (hs.status === "notify-failed") return { name: stopName, level: "warn", ok: false, sessionId: hs.sessionId ?? null, status: hs.status,
+      detail: `会话 ${hs.sessionId ?? "未知"};${run.detail}`,
+      hint: "通知命令提交失败;检查平台通知命令可用性(powershell/osascript/notify-send),下次回合结束会自动重试" };
+    const ok = fresh(hs) && ["ok"].includes(hs.status);
+    const notify = hs.notified ? `通知已提交(${hs.notifyStatus ?? "未知确认"})` : "无新增数据,未通知";
+    return { name: stopName, level: "warn", ok, sessionId: hs.sessionId ?? null, status: hs.status,
+      detail: `会话 ${hs.sessionId ?? "未知"};采集成功;${notify};${run.detail}`,
+      hint: "提交通知只承诺命令已提交,横幅是否可见由系统通知权限与用户设置决定" };
+  })();
+
+  return [promptCheck, stopCheck];
 }
 
 export async function runDoctor() {
@@ -216,7 +260,7 @@ export async function runDoctor() {
   results.push(await turnTableCheck());
   results.push(stateFileCheck());
   results.push(configCheck());
-  results.push(healthCheck());
+  results.push(...healthChecks());
   const failed = results.filter((r) => !r.ok && r.level !== "warn").length;
   const warnings = results.filter((r) => !r.ok && r.level === "warn").length;
   return { checks: results, failed, warnings };

@@ -753,17 +753,22 @@ async function loadWith(dbPath) {
   assert.equal(out, "", "turnEndLine 缺省时 Stop hook 必须放行且无输出");
   assert.ok(!fs.existsSync(shownFile), "关闭时不得写水位文件");
 
-  // 开启后首次:输出空(不驱动模型续跑),水位落盘
+  // 开启后首次:输出空(不驱动模型续跑),水位落盘(0.5.5 起为按会话多槽格式)
   out = runStop(cfgOn);
   assert.equal(out, "", "notify 模式必须放行且无输出(不驱动模型续跑,不折叠回合)");
   let shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-  assert.equal(shown.sessionId, SID);
-  assert.ok(Number.isFinite(shown.shownAt) && shown.shownAt > 0, "水位应为 coverage.lastCompletedAt");
-  assert.equal(shown.pending, undefined, "通知模式无 pending 机制(无循环风险)");
+  let slot = shown.sessions[SID];
+  assert.ok(slot, "水位应按会话保存独立槽位");
+  assert.ok(Number.isFinite(slot.shownAt) && slot.shownAt > 0, "水位应为 coverage.lastCompletedAt");
+  assert.ok(typeof slot.fingerprint === "string" && slot.fingerprint.length > 0, "槽位应保存展示范围指纹(F06)");
+  assert.equal(shown.everNotified, true);
+  assert.equal(slot.pending, undefined, "通知模式无 pending 机制(无循环风险)");
 
-  // 水位未前进:不重复通知
+  // 水位未前进(指纹一致):不重复通知
   out = runStop(cfgOn);
   assert.equal(out, "", "数据无新增时不得重复通知");
+  assert.equal(JSON.parse(fs.readFileSync(shownFile, "utf8")).sessions[SID].ts, slot.ts,
+    "指纹一致时水位文件不得改写(ts 不变)");
 
   // 水位前进(新增完成请求):再次通知,水位前进
   const db2 = new DatabaseSync(dbPath);
@@ -772,7 +777,7 @@ async function loadWith(dbPath) {
   out = runStop(cfgOn);
   assert.equal(out, "", "有新数据时再次通知(抑制模式下输出为空)");
   shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
-  assert.ok(shown.shownAt > 1_000_000, "水位应前进到最新完成请求");
+  assert.ok(shown.sessions[SID].shownAt > 1_000_000, "水位应前进到最新完成请求");
 
   // 字符串形式与布尔等价
   const cfgStr = path.join(tmp, "stop-config-str.json");
@@ -792,6 +797,8 @@ async function loadWith(dbPath) {
   fs.writeFileSync(shownFile, "not-json{");
   out = runStop(cfgOn);
   assert.equal(out, "", "损坏水位按无水位降级,不抛错");
+  shown = JSON.parse(fs.readFileSync(shownFile, "utf8"));
+  assert.ok(shown.sessions?.[SID], "损坏后重建为多槽格式并正常通知");
 }
 
 // ---- 用例 29b:turnEndLine 两态解析 ----

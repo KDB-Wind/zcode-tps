@@ -88,3 +88,23 @@
 - 自寻轮次记录:第 1 轮发现 2 项(插件 README 测试清单漂移、真实库 INDEXED BY 冒烟缺失)→ 已修;第 2 轮候选(PROGRESS 终局、worktree/临时文件清理、本地提交)→ 已执行;第 3 轮:无新可落地项(P3 明确不修;auto 1M 1.1s 可接受且有排序主导波动说明;REVIEW.md 为本地不提交文件)。**梯队枯竭 + 连续 3 轮自寻收敛 + 门禁全绿 → 收尾。**
 - 红线遵守:真实库仅 PRAGMA/SELECT 只读探查与生产路径冒烟,零写入;合成库全部位于系统临时目录且运行后删除;未 push;未执行任何发布动作;未使用 pkill/taskkill。
 - 下一步(若还有 4 小时):① 真实宿主 hook 耗时采样(观察锁竞争频率,PERFORMANCE.md 遗留项);② auto 识别路径的排序优化(无 completed_at 索引时 1M 行约 1.1s,可用 MAX+回表两段查询替代排序,预计再省 ~40%);③ `(session_id)` 覆盖打分可纳入 index_xinfo 的排序列方向信息;④ CI 上跑一次 100k 矩阵防回归(当前矩阵仅本地手跑)。
+
+# v0.5.5 可信度补丁轮(2026-10-01)
+
+基于 `docs/GPT审核报告-20260930.md`(基线 434638f)修复 F01–F10,保持默认采样行为与默认四段行;上游 0.8.3 对照结论(第 10 节)不引入其核心。
+
+## 改动
+
+- **查询正确性(F01/F07/F08/F09/F10)**:强制索引只选普通非部分索引 + 一次性 no-query-solution 回退 + SQL 标识符引用;`validNumSql/validNum` 统一 SQL/JS 数值有效性(token/时长/TTFT 非负有限),TTFT 走 SQL 投影 `ttft_val`(显式列优先、数值化 first-started 回退)并要求 `0≤ttft≤dur`;坏 token 用量按 0 计 + `bad_tokens/cache_gt_input` 告警;`formatInZone` 守卫 ±8.64e15 日期范围;空白 turn_id 投影为 NULL 共用 `validIdSql`。
+- **Stop 通知与诊断(F02/F03/F04/F05/F06)**:健康记录按 会话+hook 分文件(`healthFile(sid,hook)`,去掉全局镜像);stop 的 startHealth 先于读配置,任何 catch 记 error 终态;macOS 通知改 `on run` argv 传参;`submitNotify` 等待 ≤250ms 拉起确认,成功才落水位,失败记 `notify-failed` 不前进水位(下回合重试);水位按会话多槽(≤32)+展示内容指纹,旧单槽文件迁移;stdin 1.5s/64KB 限时限长。
+- **doctor**:拆"注入链路采集(UserPromptSubmit)"与"通知链路(Stop)"两检查,通知四态(采集成功/通知关闭/未观察到/提交失败)。
+- **测试**:新增 `test/quality.test.mjs`(30+ 断言覆盖 F01–F10 与 stdin 预算);degrade 用例 29 随多槽水位更新;release 健康断言随分文件/检查名更新;版本断言 0.5.5。诊断/测试 seam:`ZCODE_TPS_NOTIFY_BIN` 覆盖通知命令(Windows 清空 PATH 不可靠,CreateProcess 仍搜系统目录,实测确认)。
+- **文档**:CHANGELOG 0.5.5 条目 + 清理重复 0.5.3 标题;两 README/tps-doctor 命令同口径(Stop 采样="已落库 completed 快照",不写"恰为完整数据")。
+
+## 门禁(2026-10-01 22:20,Node v24.14.0,win32)
+
+- npm test 5 文件全绿:degrade 30 用例 / doctor 8 / release 30 / correctness(矩阵 21 格)/ quality 0.5.5 回归。
+- benchmark 1M 档对照 0.5.3 基线:real_indexes 典型 117ms(基线 ~170ms)/最大 360ms(~330ms,噪声内)/auto 456ms(~800ms);持续独占锁 6.53s 持平;oracle 全过。
+- 真实库只读冒烟(token-rate + doctor)正常;数值守卫无可见性能代价。
+- 红线遵守:真实库仅只读;合成库在临时目录;未 push、未发布;未用 pkill。
+- 遗留:origin/marketplace 推送与 tag 留待用户明确授权(报告 §8.2);0.6.0(wrapUpSample 收尾采样/workflow 分账)未动。

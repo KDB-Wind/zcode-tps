@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 
 export const validId = value => typeof value === "string" && value.trim().length > 0;
@@ -54,9 +55,16 @@ export function resolveTurnEndMode(v) {
   return "off";
 }
 export const configFile = () => process.env.ZCODE_TPS_CONFIG || path.join(os.homedir(), ".zcode", "zcode-tps.config.json");
-export function healthFile(sessionId) {
+// 健康记录按 会话+hook 类型 分文件(F02):Stop 的 disabled/error 不再覆盖 prompt 的诊断,
+// 交错完成的两个 hook 互不合并。hook 为空时保留旧版"仅按会话"路径(迁移读,不再写入)。
+export const HOOK_PROMPT = "prompt";
+export const HOOK_STOP = "stop";
+export function healthFile(sessionId, hook) {
   const base = process.env.ZCODE_TPS_HEALTH || `${stateFile()}.health.json`;
-  return validId(sessionId) ? `${base}.${createHash("sha256").update(sessionId).digest("hex")}.json` : base;
+  let suffix = "";
+  if (validId(sessionId)) suffix += `.${createHash("sha256").update(sessionId).digest("hex")}`;
+  if (hook) suffix += `.${hook}`;
+  return suffix ? `${base}${suffix}.json` : base;
 }
 
 export function readConfig() {
@@ -121,9 +129,15 @@ function zoneFormatter(tz, withDate) {
   return f;
 }
 
-// 毫秒时间戳 → 配置时区的 "YYYY-MM-DD HH:mm:ss";withDate=false 仅 "HH:mm:ss"。非有限时间返回 null。
+// ECMAScript 可表示的最大日期毫秒(±8.64e15)。超出范围的有限数值 new Date() 得 Invalid Date,
+// Intl 格式化抛 RangeError "Invalid time value" —— 一条坏 completed_at 不能拖垮整份报表(F08)。
+export const MAX_DATE_MS = 8_640_000_000_000_000;
+export const validEpoch = ms => typeof ms === "number" && Number.isFinite(ms) && Math.abs(ms) <= MAX_DATE_MS;
+
+// 毫秒时间戳 → 配置时区的 "YYYY-MM-DD HH:mm:ss";withDate=false 仅 "HH:mm:ss"。
+// 非有限时间或超出 Date 可表示范围返回 null(不抛错,F08)。
 export function formatInZone(ms, tz, withDate = true) {
-  if (!Number.isFinite(ms)) return null;
+  if (!validEpoch(ms)) return null;
   const zone = resolveTimezone(tz);
   const parts = {};
   for (const p of zoneFormatter(zone, withDate).formatToParts(new Date(ms))) parts[p.type] = p.value;
@@ -154,26 +168,84 @@ export function writeState(file, value) {
 }
 
 export function recordHealth(update) {
-  const file = healthFile(update.sessionId);
+  // F02:文件按 会话+hook 隔离;update.hook 缺失时退回旧版会话文件(兼容读,不推荐新写入)
+  const file = healthFile(update.sessionId, update.hook);
   try {
     let previous = {};
     try { previous = parseJson(fs.readFileSync(file, "utf8")) || {}; } catch {}
-    if (previous.sessionId !== update.sessionId) previous = {};
-    // A late completion must not replace a newer run already observed for this session.
+    if (previous.sessionId !== update.sessionId || (update.hook && previous.hook !== update.hook)) previous = {};
+    // A late completion must not replace a newer run already observed for this session+hook.
     if (update.status !== "running" && previous.runId && previous.runId !== update.runId) return;
     const record = { ...previous, ...update, ts: Date.now() };
     writeState(file, record);
-    if (file !== healthFile()) {
-      let latest = {};
-      try { latest = parseJson(fs.readFileSync(healthFile(), "utf8")) || {}; } catch {}
-      if (!latest.startedAt || latest.startedAt <= record.startedAt) writeState(healthFile(), record);
-    }
   } catch {} // Diagnostics must not break the hook JSON contract.
 }
 
-export function startHealth(sessionId) {
-  const run = { sessionId: validId(sessionId) ? sessionId : null,
+export function startHealth(sessionId, hook = null) {
+  const run = { sessionId: validId(sessionId) ? sessionId : null, hook,
     runId: randomUUID(), pid: process.pid, startedAt: Date.now() };
   recordHealth({ ...run, status: "running", durationMs: null, sampledAt: null, error: null, warnings: [] });
   return run;
+}
+
+// ---- 系统通知(Stop hook 用;构造与提交分离,便于单测命令构造) ----
+// Windows:Windows.UI.Notifications 免依赖 toast,AppId 复用 PowerShell 已注册 AUMID;
+// 首条通知前写 HKCU 开启横幅权限(新机器默认可能为关,静默 toast 被丢弃;仅 ensurePermission=true 时写,之后尊重用户设置)。
+// macOS:AppleScript `on run` + argv 传参 —— 文本经参数传入,不做字符串转义(F04:JSON 转义会破坏 AppleScript 字符串边界)。
+// Linux:notify-send 参数即文本。
+export function buildNotifyCommand(line, { ensurePermission = false, platform = process.platform } = {}) {
+  // 诊断/测试用覆盖:指定通知可执行文件(如缺失的路径)可确定性验证提交失败路径;
+  // 覆盖时参数形如 notify-send(标题在前),不构造平台脚本。
+  const override = process.env.ZCODE_TPS_NOTIFY_BIN;
+  if (override) return { command: override, args: ["zcode-tps", line] };
+  if (platform === "win32") {
+    const aumid = "{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe";
+    const perm = ensurePermission
+      ? "$p='HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Notifications\\Settings\\" + aumid + "';" +
+        "if(-not(Test-Path $p)){New-Item $p -Force|Out-Null};" +
+        "Set-ItemProperty $p -Name Enabled -Value 1 -Type DWord;" +
+        "Set-ItemProperty $p -Name ShowBanner -Value 1 -Type DWord;" +
+        "Set-ItemProperty $p -Name ShowInActionCenter -Value 1 -Type DWord;"
+      : "";
+    const script =
+      perm +
+      "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]|Out-Null;" +
+      "$t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);" +
+      "$x=$t.GetElementsByTagName('text').Item(0);$x.AppendChild($t.CreateTextNode('zcode-tps'))|Out-Null;" +
+      "$x=$t.GetElementsByTagName('text').Item(1);$x.AppendChild($t.CreateTextNode(" + JSON.stringify(line) + "))|Out-Null;" +
+      "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('" + aumid + "').Show([Windows.UI.Notifications.ToastNotification]::new($t))";
+    return { command: "powershell", args: ["-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand",
+      Buffer.from(script, "utf16le").toString("base64")] };
+  }
+  if (platform === "darwin") {
+    return { command: "osascript", args: [
+      "-e", "on run {message, title}\n display notification message with title title\n end run",
+      line, "zcode-tps",
+    ] };
+  }
+  return { command: "notify-send", args: ["zcode-tps", line] };
+}
+
+// 提交通知并如实报告提交结果(F05):detached 子进程不阻塞回合,但等待有界的拉起确认——
+// spawn 成功/"error"(如命令缺失)。返回:
+//   "suppressed"(测试抑制)/ "submitted"(子进程已拉起)/ "unknown"(限时内未确认,按已提交处理但如实标注)/
+//   "failed:<原因>"(拉起失败;水位不前进,下次 Stop 自然重试)
+// 提交成功只承诺命令已提交,不保证用户看到横幅(通知权限由系统与用户设置决定)。
+export function submitNotify({ line, ensurePermission = false, confirmMs = 250 } = {}) {
+  if (process.env.ZCODE_TPS_NOTIFY_SUPPRESS === "1") return Promise.resolve("suppressed");
+  return new Promise((resolve) => {
+    let settled = false;
+    let timer = null;
+    const done = (status) => { if (!settled) { settled = true; if (timer) clearTimeout(timer); resolve(status); } };
+    try {
+      const { command, args } = buildNotifyCommand(line, { ensurePermission });
+      const child = spawn(command, args, { detached: true, stdio: "ignore", windowsHide: true });
+      timer = setTimeout(() => done("unknown"), confirmMs);
+      child.once("spawn", () => done("submitted"));
+      child.once("error", (e) => done(`failed:${e?.code ?? e?.message ?? "spawn error"}`));
+      child.unref();
+    } catch (e) {
+      done(`failed:${e?.message ?? e}`);
+    }
+  });
 }

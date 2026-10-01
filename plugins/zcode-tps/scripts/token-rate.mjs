@@ -17,7 +17,7 @@ catch (e) { sqliteError = e; }
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { inspectSchema, parseBool, querySettings, readConfig, validId, validIdSql, blankLabelSql, parseJson, resolveTimezone, formatInZone, zoneOffsetLabel } from "./runtime.mjs";
+import { inspectSchema, parseBool, querySettings, readConfig, validId, validIdSql, blankLabelSql, parseJson, resolveTimezone, formatInZone, validEpoch, zoneOffsetLabel } from "./runtime.mjs";
 
 // 跨平台默认路径(macOS/Linux: ~/.zcode/...;Windows: %USERPROFILE%\.zcode\...),可用 ZCODE_USAGE_DB 覆盖
 const DB_PATH =
@@ -27,11 +27,24 @@ const DB_PATH =
 const LEGACY_MIN_GEN_MS = 200;
 const LEGACY_MAX_GEN_MS = 3_600_000;
 const DURATION_SQL = "COALESCE(duration_ms, completed_at - started_at)";
-// Decode 窗口:请求总时长减去首 token 等待;TTFT 缺失时回退 first_token_at - started_at,两者皆缺则为 NULL(不参与统计)。
-// 近似智谱官方"高峰期平均 Decode 速度"的纯生成思路:只计纯生成阶段,排队/预填充不计入分母;计时边界与平均方法不同,不保证与官方数字等价。
-const DECODE_SQL = "COALESCE(time_to_first_token_ms, first_token_at - started_at)";
 // 请求级 Decode 有效性的解码窗口下限:总时长已过 MIN_DURATION_MS 门槛,但几乎全花在等待首字时解码窗口过短,速率失真。
+// 近似智谱官方"高峰期平均 Decode 速度"的纯生成思路:只计纯生成阶段,排队/预填充不计入分母;计时边界与平均方法不同,不保证与官方数字等价。
 const DECODE_MIN_MS = 200;
+
+// ---- 数值有效性契约(F07/F10):token/时长/TTFT 计数字段必须是"非负有限数值" ----
+// SQL 与 JS 使用同一规则,保证 history/turn/session/subagent/decodeStats 样本一致:
+// 文本、负数、NULL、±Infinity 一律无效——无效行不计速率;用量侧按 0 计并计入数据质量告警,不静默当真。
+// (9e999 为 SQL 字面量,即 REAL 无穷;`x < 9e999` 排除存储的 Inf。)
+const validNum = (v) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+const validNumSql = (expr) => `typeof(${expr}) IN ('integer','real') AND ${expr} >= 0 AND ${expr} < 9e999`;
+// 非严格数值(可为负,用于时间戳差):SQL 端 typeof 守卫,JS 端 Number.isFinite
+const finiteNumSql = (expr) => `typeof(${expr}) IN ('integer','real') AND ${expr} > -9e999 AND ${expr} < 9e999`;
+const finiteNum = (v) => typeof v === "number" && Number.isFinite(v);
+// 用量 SUM 守卫:非法值按 0 计(计数仍保留,异常经 badTokens 暴露)
+const sumOk = (col) => `SUM(CASE WHEN ${validNumSql(col)} THEN ${col} ELSE 0 END)`;
+
+// SQL 标识符引用(索引名等可能含特殊字符;JSON.stringify 不是标识符引用,F01)
+const quoteIdent = (name) => '"' + String(name).replace(/"/g, '""') + '"';
 
 function rateTps(tokens, durationMs) {
   return Math.round((tokens / durationMs) * 10000) / 10;
@@ -84,13 +97,16 @@ function openDb() {
 // 检测以 session_id 为首列的索引(只读 PRAGMA;真实库 3.11.2+ 自带 model_usage_session_turn_idx)。
 // 生产索引不含 status/query_source 统计列,SQLite 无 ANALYZE 统计时规划器常弃用之而全表扫描;
 // 命中时对带 session_id 等值的语句用 INDEXED BY 固定走该索引(大库下避免线性劣化,审计 T2)。
+// F01:只选普通(非部分)索引——部分索引带 WHERE 条件,无法保证覆盖辅助查询的排除条件,
+// INDEXED BY 是强制要求而非提示,命中不可用索引会令语句准备失败(no query solution)。
 function pickSessionIndex(db) {
   const score = (cols) =>
     1 + (cols.includes("status") ? 2 : 0) + (cols.includes("query_source") ? 2 : 0) + (cols.includes("completed_at") ? 2 : 0);
   try {
     let best = null, bestScore = 0;
     for (const idx of db.prepare("PRAGMA index_list(model_usage)").all()) {
-      const cols = db.prepare(`PRAGMA index_info(${JSON.stringify(idx.name)})`).all().map((c) => c.name);
+      if (idx.partial) continue;
+      const cols = db.prepare(`PRAGMA index_info(${quoteIdent(idx.name)})`).all().map((c) => c.name);
       if (cols[0] !== "session_id") continue;
       const s = score(cols);
       if (s > bestScore) { best = idx.name; bestScore = s; }
@@ -131,10 +147,19 @@ function query(sessionId, opts = {}) {
     opts.lastSessionFile ||
     process.env.ZCODE_TPS_LAST_SESSION ||
     path.join(os.homedir(), ".zcode", "zcode-tps.last-session.json");
-  return withBusyRetry(() => queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption));
+  // F01:强制索引与语句不兼容(如索引被改为部分索引/表达式索引)时最多回退一次常规路径并提示,
+  // 不让诊断统计整体失败。正常索引路径不受影响。
+  try {
+    return withBusyRetry(() => queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption, true));
+  } catch (e) {
+    if (!/no query solution/i.test(String(e?.message ?? ""))) throw e;
+    const r = withBusyRetry(() => queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption, false));
+    r.warnings.push(`会话索引强制不可用,已回退常规查询路径: ${e.message}`);
+    return r;
+  }
 }
 
-function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
+function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption, forceIndex = true) {
   const { history: HIST, min: MIN_DURATION_MS, max: MAX_DURATION_MS } = querySettings();
   const db = openDb();
   try {
@@ -164,13 +189,19 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
     const args = sid ? [sid] : [];
     const sessionFilter = sid ? " AND session_id = ?" : " AND 0";
     // 显式/已识别会话且存在 session_id 首列索引时,固定会话级语句的索道路径(见 pickSessionIndex)
-    const sessionIdx = sid ? pickSessionIndex(db) : null;
-    const muFrom = sessionIdx ? `model_usage INDEXED BY ${JSON.stringify(sessionIdx)}` : "model_usage";
+    const sessionIdx = forceIndex && sid ? pickSessionIndex(db) : null;
+    const muFrom = sessionIdx ? `model_usage INDEXED BY ${quoteIdent(sessionIdx)}` : "model_usage";
     if (!sid) warnings.push("无法识别有效会话,未汇总其他会话数据");
+    // F09:空白 turn_id(纯空白文本)与 NULL 同样判为"轮次未知"——共用 validIdSql 规则,
+    // 不把空白 ID 虚构成已知轮次;合法 ID(含前后空格)保留原值,不 trim 合并。
+    // TTFT 值表达式(F07):显式列优先;NULL 时回退 first_token_at-started_at(两者皆数值才有效,否则 NULL)。
+    const ttftValSql = "CASE WHEN time_to_first_token_ms IS NOT NULL THEN time_to_first_token_ms" +
+      ` WHEN ${finiteNumSql("first_token_at")} AND ${finiteNumSql("started_at")} THEN first_token_at - started_at` +
+      " ELSE NULL END";
     const base =
-      `SELECT ${schema.columns.has("turn_id") ? "NULLIF(turn_id, '')" : "NULL"} turn_id, model_id, output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens,` +
+      `SELECT ${schema.columns.has("turn_id") ? `CASE WHEN ${validIdSql("turn_id")} THEN turn_id ELSE NULL END` : "NULL"} turn_id, model_id, output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens,` +
       ` ${schema.columns.has("cache_creation_input_tokens") ? "cache_creation_input_tokens" : "NULL"} cache_creation_input_tokens, first_token_at, completed_at, time_to_first_token_ms, status,` +
-      ` ${DURATION_SQL} dur_ms, ${DURATION_SQL} - ${DECODE_SQL} dec_ms` +
+      ` ${DURATION_SQL} dur_ms, ${ttftValSql} ttft_val, ${DURATION_SQL} - (${ttftValSql}) dec_ms` +
       " FROM " + muFrom + " WHERE status = 'completed' AND query_source = 'main_turn'";
     // 主统计严格限定 main_turn:辅助来源(compact/标题/验证等)只进 auxiliary,绝不回流主统计。
     // 会话无主请求时主统计为空(usage/turn/latest 为 null,行输出"暂无已完成的模型请求"),
@@ -182,14 +213,18 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
       const tok = r.output_tokens ?? 0;
       const reasoning = r.reasoning_tokens ?? 0;
       // first-token 只用于 0.3 旧值与 TTFT;0.4 headline 可统计无流式 token 事件的完成请求。
-      const hasTime = Number.isFinite(r.first_token_at) && Number.isFinite(r.completed_at) && r.completed_at > r.first_token_at;
+      const hasTime = finiteNum(r.first_token_at) && finiteNum(r.completed_at) && r.completed_at > r.first_token_at;
       const genMs = hasTime ? r.completed_at - r.first_token_at : null; // 纯生成耗时(不含首 token 等待)
-      const durMs = Number.isFinite(r.dur_ms) ? r.dur_ms : null;
+      const durMs = validNum(r.dur_ms) ? r.dur_ms : null;
+      // TTFT 直接用 SQL 投影的 ttft_val(显式列优先,NULL 回退 first-started,与 D 谓词同一表达式,杜绝两端漂移)
+      const ttftVal = r.ttft_val ?? null;
+      const ttftValid = validNum(ttftVal) && durMs != null && ttftVal <= durMs;
+      const decMs = ttftValid ? durMs - ttftVal : null;
       // ZCode/Responses 的 reasoning_tokens 是 output_tokens breakdown,不能再相加。
-      const valid = durMs != null && durMs >= MIN_DURATION_MS && durMs < MAX_DURATION_MS && tok > 0;
+      // 有效性(F07/F10):时长与 token 均须为非负有限数值,与 SQL 的 V/D 谓词同一规则。
+      const valid = durMs != null && durMs >= MIN_DURATION_MS && durMs < MAX_DURATION_MS && validNum(r.output_tokens) && r.output_tokens > 0;
       const legacyTokens = tok + reasoning;
       const legacyValid = genMs != null && genMs >= LEGACY_MIN_GEN_MS && genMs < LEGACY_MAX_GEN_MS && legacyTokens > 0;
-      const decMs = Number.isFinite(r.dec_ms) ? r.dec_ms : null;
       return {
         turnId: r.turn_id,
         model: r.model_id,
@@ -197,7 +232,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
         reasoningTokens: reasoning,
         inputTokens: r.input_tokens ?? 0,
         cacheRead: r.cache_read_input_tokens ?? 0,
-        ttftMs: Number.isFinite(r.time_to_first_token_ms) ? r.time_to_first_token_ms : null,
+        ttftMs: ttftValid ? ttftVal : null,
         genMs,
         durMs,
         tokPerSec: valid ? rateTps(tok, durMs) : null,
@@ -209,11 +244,23 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
       };
     };
     const items = histRows.map(mapRequest);
-    // 预格式化时间字段(*Text):/tps 报表直接引用,避免模型自行把时间戳换算成 UTC
+    // 预格式化时间字段(*Text):/tps 报表直接引用,避免模型自行把时间戳换算成 UTC。
+    // F08:超出 Date 可表示范围的有限时间戳(或文本时间戳)格式化为 null,计入告警而不拖垮报表。
+    const badDateCount = items.filter((it) => it.completedAt != null && !validEpoch(it.completedAt)).length;
+    if (badDateCount) warnings.push(`${badDateCount} 条请求的完成时间非法(超出可表示范围或非数值),相关时间显示为空`);
     for (const it of items) it.completedAtText = inZone(it.completedAt);
-    // 有效性谓词(JS 端 mapRequest 使用同一半开区间;V 为端到端有效,D 为 Decode 有效)
-    const V = "dur_ms >= ? AND dur_ms < ? AND output_tokens > 0";
-    const D = V + " AND dec_ms >= " + DECODE_MIN_MS;
+    // 有效性谓词(JS 端 mapRequest 使用同一规则;V 为端到端有效,D 为 Decode 有效)。
+    // F07/F10:数值类型守卫进入谓词本体——dur/token/ttft 为文本、负数或非有限值时不算有效样本;
+    // D 额外要求 TTFT 物理合理(0 ≤ ttft ≤ dur,dec ≤ dur),负/文本 TTFT 不再虚构解码窗口。
+    const V = `${validNumSql("dur_ms")} AND dur_ms >= ? AND dur_ms < ? AND ${validNumSql("output_tokens")} AND output_tokens > 0`;
+    const D = `${V} AND ${validNumSql("ttft_val")} AND ttft_val <= dur_ms AND ${validNumSql("dec_ms")} AND dec_ms >= ${DECODE_MIN_MS}`;
+    // 数据质量计数(F10):token 字段非法(文本/负数/非有限)与 cache_read>input 的行数,暴露异常而非补零隐藏
+    const badTokensSql =
+      `SUM(CASE WHEN NOT (${validNumSql("output_tokens")} AND ${validNumSql("reasoning_tokens")} AND` +
+      ` ${validNumSql("input_tokens")} AND ${validNumSql("cache_read_input_tokens")}) THEN 1 ELSE 0 END)`;
+    const cacheGtInputSql =
+      `SUM(CASE WHEN ${validNumSql("input_tokens")} AND ${validNumSql("cache_read_input_tokens")}` +
+      ` AND cache_read_input_tokens > input_tokens THEN 1 ELSE 0 END)`;
     // 展示用 latest 优先取最近一条新口径有效记录:items 按完成时间倒序,首个有效项即原独立查询的结果。
     // 仅当最近 HIST 条全部无效(罕见,最新有效行被 ≥HIST 条无效行压住)才回退深查询(审计 P1-1:1 次扫描→0 次)。
     const latestTurnId = histRows[0]?.turn_id ?? null; // ?? null:空 history 时参数需可绑定(NULL 不匹配任何 turn_id)
@@ -229,22 +276,24 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
     // turn_id = NULL(绑定 NULL 参数)永不匹配,t_* 列为 NULL/0;此时 JS 端 turn=null 不读取这些列。
     const bigRow = db
       .prepare(
-        "SELECT COUNT(*) n, SUM(output_tokens) o, SUM(reasoning_tokens) r," +
-        " SUM(input_tokens) i, SUM(cache_read_input_tokens) c, SUM(cache_creation_input_tokens) cc," +
+        "SELECT COUNT(*) n," +
+        ` ${sumOk("output_tokens")} o, ${sumOk("reasoning_tokens")} r,` +
+        ` ${sumOk("input_tokens")} i, ${sumOk("cache_read_input_tokens")} c, ${sumOk("cache_creation_input_tokens")} cc,` +
         " COUNT(DISTINCT turn_id) turns, SUM(CASE WHEN turn_id IS NULL THEN 1 ELSE 0 END) unknown_turn_requests," +
         " MIN(completed_at) first_at, MAX(completed_at) last_at," +
+        ` ${badTokensSql} bad_tokens, ${cacheGtInputSql} cache_gt_input,` +
         ` SUM(CASE WHEN ${V} THEN 1 ELSE 0 END) vn,` +
         ` SUM(CASE WHEN ${V} THEN output_tokens ELSE 0 END) vtok,` +
         ` SUM(CASE WHEN ${V} THEN dur_ms ELSE 0 END) vdur,` +
         ` SUM(CASE WHEN ${D} THEN 1 ELSE 0 END) dcn,` +
         ` SUM(CASE WHEN ${D} THEN output_tokens ELSE 0 END) dctok,` +
         ` SUM(CASE WHEN ${D} THEN dec_ms ELSE 0 END) dcdec,` +
-        " SUM(CASE WHEN turn_id = ? THEN 1 ELSE 0 END) t_req," +
-        " SUM(CASE WHEN turn_id = ? THEN input_tokens ELSE 0 END) t_i," +
-        " SUM(CASE WHEN turn_id = ? THEN output_tokens ELSE 0 END) t_o," +
-        " SUM(CASE WHEN turn_id = ? THEN reasoning_tokens ELSE 0 END) t_r," +
-        " SUM(CASE WHEN turn_id = ? THEN cache_read_input_tokens ELSE 0 END) t_cr," +
-        " SUM(CASE WHEN turn_id = ? THEN cache_creation_input_tokens ELSE 0 END) t_cc," +
+        ` SUM(CASE WHEN turn_id = ? THEN 1 ELSE 0 END) t_req,` +
+        ` SUM(CASE WHEN turn_id = ? AND ${validNumSql("input_tokens")} THEN input_tokens ELSE 0 END) t_i,` +
+        ` SUM(CASE WHEN turn_id = ? AND ${validNumSql("output_tokens")} THEN output_tokens ELSE 0 END) t_o,` +
+        ` SUM(CASE WHEN turn_id = ? AND ${validNumSql("reasoning_tokens")} THEN reasoning_tokens ELSE 0 END) t_r,` +
+        ` SUM(CASE WHEN turn_id = ? AND ${validNumSql("cache_read_input_tokens")} THEN cache_read_input_tokens ELSE 0 END) t_cr,` +
+        ` SUM(CASE WHEN turn_id = ? AND ${validNumSql("cache_creation_input_tokens")} THEN cache_creation_input_tokens ELSE 0 END) t_cc,` +
         " MAX(CASE WHEN turn_id = ? THEN completed_at END) t_last," +
         ` SUM(CASE WHEN turn_id = ? AND ${V} THEN output_tokens ELSE 0 END) t_vtok,` +
         ` SUM(CASE WHEN turn_id = ? AND ${V} THEN dur_ms ELSE 0 END) t_vdur` +
@@ -290,7 +339,8 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
     if (sid) {
       const auxRows = db
         .prepare(
-          "SELECT " + blankLabelSql("query_source", "'(缺失)'") + " src, COUNT(*) n, SUM(input_tokens) i, SUM(output_tokens) o FROM " + muFrom +
+          "SELECT " + blankLabelSql("query_source", "'(缺失)'") + " src, COUNT(*) n," +
+          ` ${sumOk("input_tokens")} i, ${sumOk("output_tokens")} o FROM ` + muFrom +
           " WHERE status = 'completed' AND query_source IS NOT 'main_turn' AND query_source IS NOT 'subagent'" +
           sessionFilter +
           " GROUP BY src ORDER BY n DESC, src"
@@ -332,13 +382,15 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
           " AND session_id = ? AND " + validIdSql("trace_id");
         const subScopeSql =
           "SELECT output_tokens, reasoning_tokens, input_tokens, cache_read_input_tokens," +
-          ` ${DURATION_SQL} dur_ms, ${DURATION_SQL} - ${DECODE_SQL} dec_ms FROM model_usage` +
+          ` ${DURATION_SQL} dur_ms, ${ttftValSql} ttft_val, ${DURATION_SQL} - (${ttftValSql}) dec_ms FROM model_usage` +
           " WHERE status = 'completed' AND query_source = 'subagent' AND " + validIdSql("trace_id") +
           " AND trace_id IN (" + traceListSql + ")";
         const subRow = db
           .prepare(
-            "SELECT COUNT(*) n, SUM(output_tokens) o, SUM(reasoning_tokens) r," +
-            " SUM(input_tokens) i, SUM(cache_read_input_tokens) c," +
+            "SELECT COUNT(*) n," +
+            ` ${sumOk("output_tokens")} o, ${sumOk("reasoning_tokens")} r,` +
+            ` ${sumOk("input_tokens")} i, ${sumOk("cache_read_input_tokens")} c,` +
+            ` ${badTokensSql} bad_tokens,` +
             ` SUM(CASE WHEN ${V} THEN 1 ELSE 0 END) vn,` +
             ` SUM(CASE WHEN ${V} THEN output_tokens ELSE 0 END) vtok,` +
             ` SUM(CASE WHEN ${V} THEN dur_ms ELSE 0 END) vdur,` +
@@ -356,6 +408,7 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
         subSum = { n: subRow.n, o: subRow.o, r: subRow.r, i: subRow.i, c: subRow.c };
         subAggr = { n: subRow.vn, tok: subRow.vtok, dur: subRow.vdur };
         subDecodeRow = { n: subRow.dcn, tok: subRow.dctok, dec: subRow.dcdec };
+        if (subRow.bad_tokens) warnings.push(`${subRow.bad_tokens} 条子代理请求的 token 字段非合法数值(文本/负数/非有限),对应用量按 0 计`);
       } catch (e) {
         if (isBusyError(e)) throw e; // 忙时交由外层 withBusyRetry 重试,不在此静默吞掉
         subAggr = null;
@@ -445,6 +498,9 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption) {
       : null;
 
     if (sumRow.unknown_turn_requests) warnings.push(`${sumRow.unknown_turn_requests} 条请求缺少 turn_id,轮次数未知`);
+    // F10:异常数据可见,不以 0 冒充准确账本
+    if (bigRow.bad_tokens) warnings.push(`${bigRow.bad_tokens} 条主对话请求的 token 字段非合法数值(文本/负数/非有限),对应用量按 0 计`);
+    if (bigRow.cache_gt_input) warnings.push(`${bigRow.cache_gt_input} 条主对话请求 cache_read_input_tokens 大于 input_tokens(字段语义异常),缓存命中率可能失真`);
     session.scope = !sid ? "unknown" : useSub ? "main_turn+subagent" : "main_turn";
     session.total = session.totalInput + session.totalOutput;
     session.cacheHit = session.totalInput ? Math.round(session.totalCacheRead / session.totalInput * 1000) / 10 : null;
@@ -531,7 +587,8 @@ function formatLine(r, fields) {
         parts.push(`缓存 ${r.cacheHit}%${scopeSuffix}`);
       }
     } else if (id === "time") {
-      parts.push(`⏱ ${t}`);
+      // F08:完成时间非法(超出可表示范围)时跳过该段,不显示 "⏱ null"
+      if (t != null) parts.push(`⏱ ${t}`);
     }
   }
   // 所选字段无数据时回落默认名单,保证注入行恒有内容可引用
@@ -596,4 +653,4 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
   }
 }
 
-export { query, formatLine, openDb, withBusyRetry, parseBool, resolveRateFields, RATE_SEGMENTS, DEFAULT_RATE_FIELDS };
+export { query, formatLine, openDb, withBusyRetry, parseBool, resolveRateFields, RATE_SEGMENTS, DEFAULT_RATE_FIELDS, pickSessionIndex, quoteIdent };

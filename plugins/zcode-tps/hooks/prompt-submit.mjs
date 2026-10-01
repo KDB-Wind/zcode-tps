@@ -5,10 +5,11 @@
 // 可选配置 ~/.zcode/zcode-tps.config.json:{"tokenRateLine": false} 可关闭速率行注入。
 // turnEndLine 的回合结束通知(系统通知)与本注入行互补:通知管即时,注入行管对话流内的历史记录。
 
-import { readConfig, parseBool, stateFile, writeState, recordHealth, startHealth, validId } from "../scripts/runtime.mjs";
+import { readConfig, parseBool, stateFile, writeState, recordHealth, startHealth, validId, HOOK_PROMPT } from "../scripts/runtime.mjs";
 
 const sid = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || "";
-const run = startHealth(sid);
+// F02:健康记录显式带 hook 类型(prompt),与 Stop 通道分文件,互不覆盖
+const run = startHealth(sid, HOOK_PROMPT);
 const complete = update => recordHealth({ ...run, ...update, durationMs: Date.now() - run.startedAt });
 if (validId(sid)) {
   try {
