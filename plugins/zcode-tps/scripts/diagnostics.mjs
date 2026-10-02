@@ -110,11 +110,19 @@ function scopeFragments(tr, db, sid, caps) {
   const actorClaim = caps.workflowAssociation.status === "ok"
     ? frag(`session_id IN (SELECT session_id FROM dwf_actor WHERE run_id IN (SELECT id FROM dwf_run WHERE parent_session_id = ?))`, [sid])
     : frag("0"); // 无验证键时 actor 链为空集:workflow 行全部落入 unclassified/歧义,不补 0(A04)
+  // 其他 root 的 run 经同一 actor 链 claim 的会话:归属被证明属于别的 root(或双 claim → 歧义),
+  // 不得计入本 root 的任何桶(spec §4.2:跨 root 命中无法判明时不纳入任何 root 总量)
+  const otherRootClaim = caps.workflowAssociation.status === "ok"
+    ? frag(`session_id IN (SELECT session_id FROM dwf_actor WHERE run_id IN (SELECT id FROM dwf_run WHERE parent_session_id <> ?))`, [sid])
+    : frag("0");
   const auxList = Object.keys(AUX_CLASS).map((s) => `'${s.replace(/'/g, "''")}'`).join(", ");
   const nonBlankSrc = `query_source IS NOT NULL AND TRIM(query_source, ' ') != ''`;
 
   const main = frag(`session_id = ? AND query_source = 'main_turn'`, [sid]);
-  const workflow = frag(`query_source = 'workflow_child' AND (${actorClaim.sql})`, actorClaim.params);
+  const workflow = caps.workflowAssociation.status === "ok"
+    ? frag(`query_source = 'workflow_child' AND (${actorClaim.sql}) AND NOT (${otherRootClaim.sql})`,
+      [...actorClaim.params, ...otherRootClaim.params])
+    : frag("0");
   const subagent = frag(
     `query_source = 'subagent' AND (session_id = ? OR (${mainTraces.sql} AND NOT (${multiRoot.sql})))`,
     [sid, ...mainTraces.params, ...multiRoot.params]);
@@ -127,16 +135,22 @@ function scopeFragments(tr, db, sid, caps) {
             AND (query_source IS NULL OR query_source NOT IN (${auxList}))`, [sid]),
     // in-session workflow_child 但无 actor 链归属 → workflow 细分不可证(A04;actorClaim 为空桩时 NOT(0) 恒真)
     frag(`session_id = ? AND query_source = 'workflow_child' AND NOT (${actorClaim.sql})`, [sid, ...actorClaim.params]),
-    // 库外 trace 弱关联的未知来源 / 未验证 workflow_child
+    // 库外 trace 弱关联的未知来源 / 未验证 workflow_child(能被其他 root 的 actor 链证明归属的不算)
     frag(`session_id <> ? AND ${nonBlankSrc} AND query_source NOT IN ('main_turn', 'subagent', 'workflow_child', ${auxList})
             AND ${mainTraces.sql} AND NOT (${multiRoot.sql})`, [sid, ...mainTraces.params, ...multiRoot.params]),
-    frag(`session_id <> ? AND query_source = 'workflow_child' AND NOT (${actorClaim.sql}) AND ${mainTraces.sql} AND NOT (${multiRoot.sql})`,
-      [sid, ...actorClaim.params, ...mainTraces.params, ...multiRoot.params]),
+    frag(`session_id <> ? AND query_source = 'workflow_child' AND NOT (${actorClaim.sql}) AND ${mainTraces.sql} AND NOT (${multiRoot.sql})
+            AND NOT (${otherRootClaim.sql})`,
+      [sid, ...actorClaim.params, ...mainTraces.params, ...multiRoot.params, ...otherRootClaim.params]),
   ]);
-  const ambiguous = frag(
-    `session_id <> ? AND ${mainTraces.sql} AND (${multiRoot.sql}) AND NOT (query_source = 'workflow_child' AND (${actorClaim.sql}))`,
-    [sid, ...mainTraces.params, ...multiRoot.params, ...actorClaim.params]);
-  return { main, workflow, subagent, auxiliary, unclassified, ambiguous, mainTraces, multiRoot, actorClaim };
+  const ambiguous = orAll([
+    // trace 命中多 root:除被本 root actor 链(且仅本 root)claim 的行外,一律歧义
+    frag(`session_id <> ? AND ${mainTraces.sql} AND (${multiRoot.sql}) AND NOT (query_source = 'workflow_child' AND (${actorClaim.sql}))`,
+      [sid, ...mainTraces.params, ...multiRoot.params, ...actorClaim.params]),
+    // 双 root 同时 claim 的 actor 会话:归属不可判
+    frag(`session_id <> ? AND (${actorClaim.sql}) AND (${otherRootClaim.sql})`,
+      [sid, ...actorClaim.params, ...otherRootClaim.params]),
+  ]);
+  return { main, workflow, subagent, auxiliary, unclassified, ambiguous, mainTraces, multiRoot, actorClaim, otherRootClaim };
 }
 
 // ---- 桶聚合:单遍条件聚合,质量按字段给出 known/missing/invalid(spec §4.3) ----
@@ -267,8 +281,10 @@ function buildWorkflow(tr, db, sid, caps, frags) {
   const budgeted = runs.slice(0, MAX_RUNS);
   let workflowTotals = { requests: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheCreation: 0 };
   for (const r of budgeted) {
+    // 与 workflow 桶同一归属规则:被其他 root 同时 claim 的 actor 会话不计入本 run(守恒前提)
     const agg = bucketAggregate(tr, db, frag(
-      `query_source = 'workflow_child' AND session_id IN (SELECT session_id FROM dwf_actor WHERE run_id = ?)`, [r.rid]));
+      `query_source = 'workflow_child' AND session_id IN (SELECT session_id FROM dwf_actor WHERE run_id = ?)
+         AND NOT (${frags.otherRootClaim.sql})`, [r.rid, ...frags.otherRootClaim.params]));
     addAggregates(workflowTotals, agg);
     runRows.push({
       runId: runDisplayId(r.rid),
@@ -487,7 +503,7 @@ function buildTiming(tr, db, sid, caps, { min, max }) {
   );
   const ttftGroups = tStats.n ? groupQuery("ttft_val", "ttft_val IS NOT NULL").all(sid) : [];
   const D = `${validNumSql("dur_ms")} AND dur_ms >= ? AND dur_ms < ? AND ${validNumSql("output_tokens")} AND output_tokens > 0 AND ${validNumSql("ttft_val")} AND ttft_val <= dur_ms AND dur_ms - ttft_val >= ${DECODE_MIN_MS}`;
-  const decodeGroups = row.d_samples ? db.prepare(
+  const decodeRaw = row.d_samples ? db.prepare(
     `${baseCte}, g AS (SELECT COALESCE(NULLIF(TRIM(provider_id), ''), '(unknown)') provider,
         COALESCE(NULLIF(TRIM(model_id), ''), '(unknown)') model, output_tokens * 1000.0 / (dur_ms - ttft_val) v FROM s WHERE ${D}),
        gw AS (SELECT provider, model, v, ROW_NUMBER() OVER (PARTITION BY provider, model ORDER BY v) rn,
@@ -496,16 +512,22 @@ function buildTiming(tr, db, sid, caps, { min, max }) {
        MAX(CASE WHEN rn = CAST(CEIL(0.5 * cnt) AS INTEGER) THEN v END) median,
        MAX(CASE WHEN rn = CAST(CEIL(0.9 * cnt) AS INTEGER) THEN v END) p90
      FROM gw GROUP BY provider, model ORDER BY n DESC, model LIMIT ${MAX_GROUPS + 1}`
-  ).all(sid, min, max).map((r) => ({ provider: r.provider, model: r.model, samples: r.n,
-    mean: r.mean != null ? Math.round(r.mean * 10) / 10 : null,
-    median: r.median != null ? Math.round(r.median * 10) / 10 : null,
-    p90: r.p90 != null ? Math.round(r.p90 * 10) / 10 : null })) : [];
-  const splitGroups = (groups) => ({
-    groups: groups.slice(0, MAX_GROUPS).map((g) => ({ ...g,
+  ).all(sid, min, max) : [];
+  // other 计数不受 LIMIT 截断:单独数总组数
+  const countGroups = (validWhere, extraParams = []) => db.prepare(
+    `${baseCte} SELECT COUNT(*) c FROM (
+       SELECT COALESCE(NULLIF(TRIM(provider_id), ''), '(unknown)') provider, COALESCE(NULLIF(TRIM(model_id), ''), '(unknown)') model
+       FROM s WHERE ${validWhere} GROUP BY provider, model)`
+  ).get(sid, ...extraParams).c;
+  const ttftTotal = tStats.n ? countGroups("ttft_val IS NOT NULL") : 0;
+  const decodeTotal = row.d_samples ? countGroups(D, [min, max]) : 0;
+  const splitGroups = (groups, total) => ({
+    groups: groups.slice(0, MAX_GROUPS).map((g) => ({
+      provider: g.provider, model: g.model, samples: g.n,
       mean: g.mean != null ? Math.round(g.mean * 10) / 10 : null,
       median: g.median != null ? Math.round(g.median * 10) / 10 : null,
       p90: g.p90 != null ? Math.round(g.p90 * 10) / 10 : null })),
-    other: groups.length > MAX_GROUPS ? { note: `超过 ${MAX_GROUPS} 组的部分合并为 other(合并规则:按样本数取前 ${MAX_GROUPS} 组,其余不再细分)`, groups: groups.length - MAX_GROUPS } : null,
+    other: total > MAX_GROUPS ? { note: `超过 ${MAX_GROUPS} 组的部分合并为 other(合并规则:按样本数取前 ${MAX_GROUPS} 组,其余不再细分)`, groups: total - MAX_GROUPS } : null,
   });
   out.status = "ok";
   out.data = {
@@ -524,7 +546,7 @@ function buildTiming(tr, db, sid, caps, { min, max }) {
       numeratorOutputTokens: row.d_num ?? 0, denominatorDecodeMs: row.d_den ?? 0,
       note: "有效集与 §4.4 相同(解码窗口 ≥200ms);分子分母为原始值",
     },
-    byModel: { ttft: splitGroups(ttftGroups), decode: decodeGroups.length ? splitGroups(decodeGroups) : { groups: [], other: null },
+    byModel: { ttft: splitGroups(ttftGroups, ttftTotal), decode: splitGroups(decodeRaw, decodeTotal),
       note: "provider_id+model_id 分组;同名 model 不跨 provider 合并;缺 provider 归入 (unknown);零样本组不出现(仅有样本的组)" },
   };
   if (out.status === "ok") delete out.reasonCode;
@@ -579,7 +601,7 @@ function buildReconciliation(tr, db, sid, caps, base) {
   const comparedFields = [];
   let anyInvalid = false, anyDifferent = false;
   for (const [tuField, muField, tuVal, muVal] of compareDefs) {
-    if (tuVal === undefined) continue; // turn_usage 缺该列 → 跳过,不算 invalid
+    if (tuVal === undefined || tuVal === null) continue; // turn_usage 缺列或该字段为 NULL → 不比较,如实说明
     const tuInt = typeof tuVal === "number" && Number.isInteger(tuVal);
     const muInt = typeof muVal === "number" && Number.isInteger(muVal);
     const invalid = !tuInt || !muInt;
@@ -759,6 +781,18 @@ export function runDetailsWorker() {
   // 避免 process.exit 截断最后一条 IPC 消息。
 }
 
+// Windows 实测:子进程 disconnect 后 IPC 句柄仍可能不释放(最小复现,Node 24.14)。
+// 因此最后一条消息带 flush 回调,确认已刷出后显式退出;回调失联时兜底强制退出。
+const flushExit = (msg, code) => {
+  const force = setTimeout(() => process.exit(code), 3000);
+  try {
+    if (typeof force.unref === "function") force.unref();
+    process.send(msg, () => process.exit(code));
+  } catch {
+    process.exit(code);
+  }
+};
+
 async function handleWorkerRun(m) {
   const budget = Number(process.env.ZCODE_TPS_DETAILS_BUDGET_MS) || 5000;
   const deadline = Date.now() + Math.max(200, budget - 200); // worker 内软预算略先于父进程硬预算
@@ -768,10 +802,9 @@ async function handleWorkerRun(m) {
       dbPath: m.dbPath, deadline,
       notify: (evt) => sendSafe({ tps: evt.type, ...evt }),
     });
-    sendSafe({ tps: "done" });
+    flushExit({ tps: "done" }, 0);
   } catch (e) {
-    sendSafe({ tps: "fatal", error: e?.message ?? String(e) });
-    process.exitCode = 1;
+    flushExit({ tps: "fatal", error: e?.message ?? String(e) }, 1);
   }
 }
 
