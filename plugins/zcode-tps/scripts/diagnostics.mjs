@@ -426,6 +426,8 @@ function buildTiming(tr, db, sid, caps, { min, max }) {
   const baseCte = `WITH s AS MATERIALIZED (SELECT ${durExpr} dur_ms, ${ttftUse} ttft_val, ${explicit} ttft_raw,
       first_token_at, started_at, output_tokens, provider_id, model_id
     FROM model_usage WHERE session_id = ? AND status = 'completed' AND +query_source = 'main_turn')`;
+  // nearest-rank 用纯整数算术:ceil(cnt/2)=(cnt+1)/2、ceil(9cnt/10)=(9cnt+9)/10。
+  // 不能用 CEIL()——Node 22.13 的 SQLite 3.47.2 未启用数学函数,Node 24 的 3.51.2 才有。
   const derivedCond = `ttft_raw IS NULL AND ${finiteNumSql("first_token_at")} AND ${finiteNumSql("started_at")}`;
   const row = db.prepare(
     `${baseCte} SELECT COUNT(*) candidates,
@@ -443,8 +445,8 @@ function buildTiming(tr, db, sid, caps, { min, max }) {
     `${baseCte}, t AS (SELECT ttft_val v FROM s WHERE ttft_val IS NOT NULL),
        tw AS (SELECT v, ROW_NUMBER() OVER (ORDER BY v) rn, COUNT(*) OVER () cnt, AVG(v) OVER () mean FROM t)
      SELECT (SELECT COUNT(*) FROM t) n, (SELECT AVG(v) FROM t) mean,
-       (SELECT v FROM tw WHERE rn = CAST(CEIL(0.5 * cnt) AS INTEGER)) median,
-       (SELECT v FROM tw WHERE rn = CAST(CEIL(0.9 * cnt) AS INTEGER)) p90`
+       (SELECT v FROM tw WHERE rn = (cnt + 1) / 2) median,
+       (SELECT v FROM tw WHERE rn = (9 * cnt + 9) / 10) p90`
   ).get(sid);
   const groupQuery = (valueExpr, extraWhere) => db.prepare(
     `${baseCte}, g AS (SELECT COALESCE(NULLIF(TRIM(provider_id), ''), '(unknown)') provider,
@@ -452,8 +454,8 @@ function buildTiming(tr, db, sid, caps, { min, max }) {
        gw AS (SELECT provider, model, v, ROW_NUMBER() OVER (PARTITION BY provider, model ORDER BY v) rn,
         COUNT(*) OVER (PARTITION BY provider, model) cnt, AVG(v) OVER (PARTITION BY provider, model) gmean FROM g)
      SELECT provider, model, MAX(cnt) n, MAX(gmean) mean,
-       MAX(CASE WHEN rn = CAST(CEIL(0.5 * cnt) AS INTEGER) THEN v END) median,
-       MAX(CASE WHEN rn = CAST(CEIL(0.9 * cnt) AS INTEGER) THEN v END) p90
+       MAX(CASE WHEN rn = (cnt + 1) / 2 THEN v END) median,
+       MAX(CASE WHEN rn = (9 * cnt + 9) / 10 THEN v END) p90
      FROM gw GROUP BY provider, model ORDER BY n DESC, model LIMIT ${MAX_GROUPS + 1}`
   );
   const ttftGroups = tStats.n ? groupQuery("ttft_val", "ttft_val IS NOT NULL").all(sid) : [];
@@ -464,8 +466,8 @@ function buildTiming(tr, db, sid, caps, { min, max }) {
        gw AS (SELECT provider, model, v, ROW_NUMBER() OVER (PARTITION BY provider, model ORDER BY v) rn,
         COUNT(*) OVER (PARTITION BY provider, model) cnt, AVG(v) OVER (PARTITION BY provider, model) gmean FROM g)
      SELECT provider, model, MAX(cnt) n, MAX(gmean) mean,
-       MAX(CASE WHEN rn = CAST(CEIL(0.5 * cnt) AS INTEGER) THEN v END) median,
-       MAX(CASE WHEN rn = CAST(CEIL(0.9 * cnt) AS INTEGER) THEN v END) p90
+       MAX(CASE WHEN rn = (cnt + 1) / 2 THEN v END) median,
+       MAX(CASE WHEN rn = (9 * cnt + 9) / 10 THEN v END) p90
      FROM gw GROUP BY provider, model ORDER BY n DESC, model LIMIT ${MAX_GROUPS + 1}`
   ).all(sid, min, max) : [];
   // other 计数不受 LIMIT 截断:单独数总组数
