@@ -10,9 +10,13 @@
 
 // Runtime warnings remain on stderr; importing this module must not alter other warning listeners.
 
+// node:sqlite 同步加载(不用顶层 await):0.6.0 起 diagnostics.mjs 静态导入本模块,
+// 顶层 await 会与"动态 import diagnostics → 静态 import token-rate"形成循环评估死锁。
+// createRequire 同样给旧运行时留下可解释的 sqliteError,而不是解析期崩溃。
+import { createRequire } from "node:module";
 let DatabaseSync;
 let sqliteError;
-try { ({ DatabaseSync } = await import("node:sqlite")); }
+try { ({ DatabaseSync } = createRequire(import.meta.url)("node:sqlite")); }
 catch (e) { sqliteError = e; }
 import fs from "node:fs";
 import os from "node:os";
@@ -83,9 +87,9 @@ function resolveAutoSid(db, lastSessionFile) {
 const BUSY_TIMEOUT_MS = 2000;
 const BUSY_RETRY_WAIT_MS = 150;
 
-function openDb() {
+function openDb(dbPath = DB_PATH) {
   if (sqliteError) throw new Error(`node:sqlite 不可用,请使用 Node 22.13+ 或 24+: ${sqliteError.message}`);
-  const db = new DatabaseSync(DB_PATH, { readOnly: true });
+  const db = new DatabaseSync(dbPath, { readOnly: true });
   try {
     db.exec(`PRAGMA busy_timeout = ${BUSY_TIMEOUT_MS}`);
   } catch {}
@@ -149,22 +153,43 @@ function query(sessionId, opts = {}) {
     path.join(os.homedir(), ".zcode", "zcode-tps.last-session.json");
   // F01:强制索引与语句不兼容(如索引被改为部分索引/表达式索引)时最多回退一次常规路径并提示,
   // 不让诊断统计整体失败。正常索引路径不受影响。
+  const run = (forceIndex) => withBusyRetry(() => {
+    const db = openDb(opts.dbPath);
+    try {
+      db.exec("BEGIN");
+      try {
+        const r = queryOnceInTxn(db, sessionId, includeSub, lastSessionFile, timezoneOption, forceIndex);
+        db.exec("COMMIT");
+        return r;
+      } catch (e) {
+        try { db.exec("ROLLBACK"); } catch {}
+        throw e;
+      }
+    } finally {
+      db.close();
+    }
+  });
   try {
-    return withBusyRetry(() => queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption, true));
+    return run(true);
   } catch (e) {
     if (!/no query solution/i.test(String(e?.message ?? ""))) throw e;
-    const r = withBusyRetry(() => queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption, false));
+    const r = run(false);
     r.warnings.push(`会话索引强制不可用,已回退常规查询路径: ${e.message}`);
     return r;
   }
 }
 
-function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption, forceIndex = true) {
+// 辅助/内部请求来源分类(0.5.5 aux 与 0.6.0 诊断账本共用,spec §9.2 归一规则共用一份实现)
+const AUX_CLASS = {
+  session_title: "title", goal_summary_title: "title",
+  compact: "system", target_completion_verification: "system",
+};
+
+// 单事务内的基础查询:连接与 BEGIN/COMMIT 由调用方管理(0.5.5 行为不变),
+// 详情诊断(diagnostics.mjs)在同一事务内继续读取,保证基础与模块同一快照(spec 0.6.0 §11.1)。
+function queryOnceInTxn(db, sessionId, includeSub, lastSessionFile, timezoneOption, forceIndex = true) {
   const { history: HIST, min: MIN_DURATION_MS, max: MAX_DURATION_MS } = querySettings();
-  const db = openDb();
-  try {
-    db.exec("BEGIN");
-    const schema = inspectSchema(db);
+  const schema = inspectSchema(db);
     // 列集为空 = 表不存在(空库文件/非用量库,如 tasks-index.sqlite),与"缺列"必须区分(审计 P2-2)
     if (!schema.columns.size) throw new Error("model_usage 表不存在(ZCode 尚未产生用量数据,或该库不是 ZCode 用量库)");
     if (schema.missing.length) throw new Error(`model_usage 缺少列: ${schema.missing.join(", ")}`);
@@ -331,10 +356,6 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption, force
     // 辅助/内部请求(ZCode 3.11.2+ 的标题生成、压缩、目标完成验证等):completed 但非 main_turn/subagent。
     // 不进入主统计与速率;按来源分组暴露。NULL/空白来源归一为"(缺失)"组并专用告警:
     // ZCode 升级若把某来源写成 NULL/空白,不再从所有统计静默消失(审计 P1-3)。
-    const AUX_CLASS = {
-      session_title: "title", goal_summary_title: "title",
-      compact: "system", target_completion_verification: "system",
-    };
     let auxiliary = null;
     if (sid) {
       const auxRows = db
@@ -513,13 +534,9 @@ function queryOnce(sessionId, includeSub, lastSessionFile, timezoneOption, force
     const coverage = { retainedOnly: true, status: "completed", scope: usage?.scope ?? session.scope,
       firstCompletedAt: sumRow.first_at ?? null, lastCompletedAt: sumRow.last_at ?? null,
       firstCompletedAtText: inZone(sumRow.first_at), lastCompletedAtText: inZone(sumRow.last_at) };
-    db.exec("COMMIT");
     return { sessionId: sid, scoped, sampledAt, sampledAtText: inZone(sampledAt),
       timezone, utcOffset, coverage, warnings, latest, session, turn, usage, cacheHit, decodeStats, auxiliary, history: items };
-  } finally {
-    db.close();
   }
-}
 
 function fmtK(n) {
   if (n == null) return "-";
@@ -605,27 +622,82 @@ function formatLine(r, fields) {
 // --- CLI ---
 if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
   const json = process.argv.includes("--json");
-  const sid = process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || null;
-  let cfg;
-  const r = (() => {
-    try {
-      cfg = readConfig();
-      return { ok: true, value: query(sid, { includeSubagents: parseBool(cfg.includeSubagents, true), timezone: cfg.timezone }) };
-    } catch (e) {
-      return { ok: false, error: e?.message ?? String(e) };
-    }
-  })();
-  if (!r.ok) {
-    // S3:优雅错误——/tps agent 只消费 stdout,--json 仍给机器可解析的错误对象而非堆栈
-    if (json) {
-      console.log(JSON.stringify({ error: r.error, db: DB_PATH }, null, 2));
-    } else {
-      console.error(`token-rate 查询失败:${r.error}`);
-      console.error(`数据库:${DB_PATH}(可用 ZCODE_USAGE_DB 指定,自检见 /tps-doctor)`);
-    }
-    process.exitCode = 1;
+  const workerMode = process.argv.includes("--details-worker");
+
+  // --details worker 子进程:仅经 IPC 接收任务,stdout 保持干净(最终 JSON 只由父进程输出,spec §11.2)。
+  if (workerMode) {
+    const { runDetailsWorker } = await import("./diagnostics.mjs");
+    runDetailsWorker(); // 注册 IPC 监听后顶层代码结束,事件循环由 message 事件维持
   } else {
-    const q = r.value;
+    const detailArgIdx = process.argv.indexOf("--details");
+    const sessionFlagIdx = process.argv.indexOf("--session");
+    const paramError = (message, extra = {}) => {
+      console.log(JSON.stringify({ error: message, db: DB_PATH, parameterError: extra }, null, 2));
+      process.exitCode = 1;
+    };
+    let explicitSid = null;
+    if (sessionFlagIdx >= 0) {
+      const v = process.argv[sessionFlagIdx + 1];
+      if (v == null || !validId(v) || String(v).startsWith("--")) {
+        paramError("--session 需要非空会话 ID 参数", { parameter: "--session", value: v ?? null });
+        process.exit(process.exitCode || 1);
+      }
+      explicitSid = v;
+    }
+    let details = null; // null=未请求;数组=请求的模块名单
+    if (detailArgIdx >= 0) {
+      if (!json) {
+        paramError("--details 需要 --json 输出", { parameter: "--details" });
+        process.exit(process.exitCode || 1);
+      }
+      const raw = process.argv[detailArgIdx + 1];
+      const { DETAIL_MODULES, parseDetailModules } = await import("./diagnostics.mjs");
+      if (raw == null || String(raw).startsWith("--")) {
+        details = [...DETAIL_MODULES]; // --details 无值 = 全部四项
+      } else if (raw.includes("=") && detailArgIdx !== process.argv.indexOf(raw)) {
+        details = null; // 不可达,防御
+      } else {
+        const parsed = parseDetailModules(raw);
+        if (!parsed.ok) {
+          paramError(parsed.message, { parameter: "--details", value: raw, unknown: parsed.unknown ?? null });
+          process.exit(process.exitCode || 1);
+        }
+        details = parsed.modules;
+      }
+    }
+    const sid = explicitSid || process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || null;
+    let cfg;
+    const r = (() => {
+      try {
+        cfg = readConfig();
+        if (details) return { ok: true, details: true };
+        return { ok: true, value: query(sid, { includeSubagents: parseBool(cfg.includeSubagents, true), timezone: cfg.timezone }) };
+      } catch (e) {
+        return { ok: false, error: e?.message ?? String(e) };
+      }
+    })();
+    if (!r.ok) {
+      // S3:优雅错误——/tps agent 只消费 stdout,--json 仍给机器可解析的错误对象而非堆栈
+      if (json) {
+        console.log(JSON.stringify({ error: r.error, db: DB_PATH }, null, 2));
+      } else {
+        console.error(`token-rate 查询失败:${r.error}`);
+        console.error(`数据库:${DB_PATH}(可用 ZCODE_USAGE_DB 指定,自检见 /tps-doctor)`);
+      }
+      process.exitCode = 1;
+    } else if (r.details) {
+      // 详情路径:有界子进程内执行(入口预算 5s,清理预留 ≤500ms;超时保留已交付的基础与完整模块,spec §11.2)
+      const { runDetailsParent } = await import("./diagnostics.mjs");
+      const exit = await runDetailsParent({
+        sessionId: sid,
+        modules: details,
+        timezone: cfg.timezone,
+        includeSubagents: parseBool(cfg.includeSubagents, true),
+        dbPath: DB_PATH,
+      });
+      process.exitCode = exit;
+    } else {
+      const q = r.value;
     if (json) {
       console.log(JSON.stringify(q, null, 2));
     } else {
@@ -657,6 +729,8 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
       for (const warning of q.warnings) console.log(`⚠️ ${warning}`);
     }
   }
+  }
 }
 
-export { query, formatLine, openDb, withBusyRetry, parseBool, resolveRateFields, RATE_SEGMENTS, DEFAULT_RATE_FIELDS, pickSessionIndex, quoteIdent };
+export { query, formatLine, openDb, withBusyRetry, parseBool, resolveRateFields, RATE_SEGMENTS, DEFAULT_RATE_FIELDS, pickSessionIndex, quoteIdent,
+  queryOnceInTxn, validId, validIdSql, validNum, finiteNum, validNumSql, finiteNumSql, sumOk, DURATION_SQL, DECODE_MIN_MS, isBusyError, AUX_CLASS, DB_PATH };
