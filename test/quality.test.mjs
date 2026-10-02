@@ -523,6 +523,138 @@ async function loadWith(dbPath) {
       await runC();
       assert.equal(calls(), failedCalls + 1, "锁释放后重试通知成功(失败尝试本身也算一次命令调用)");
     }
+
+    // §13 E01:pause the old-claim reader at the exact recovery boundary. The second
+    // process must fail to acquire the SAME guard, not replace the claim under that reader.
+    {
+      fs.rmSync(slotC, { force: true }); fs.rmSync(claimC, { force: true }); fs.rmSync(countFile, { force: true });
+      const dead = execFileSync(process.execPath, ["-e", "console.log(process.pid)"], { encoding: "utf8" }).trim();
+      fs.writeFileSync(claimC, JSON.stringify({ runId: "dead", pid: Number(dead), ts: Date.now() }));
+      const marker = path.join(tmp, "recovery-read");
+      const resume = path.join(tmp, "recovery-resume");
+      const preload = path.join(tmp, "recovery-pause.mjs");
+      fs.writeFileSync(preload, `import fs from "node:fs";
+        const read = fs.readFileSync;
+        fs.readFileSync = function(file, ...args) {
+          const raw = read.call(fs, file, ...args);
+          if (String(file) === process.env.CLAIM_TEST_FILE && JSON.parse(String(raw)).runId === "dead") {
+            fs.writeFileSync(process.env.CLAIM_TEST_MARK, "ready");
+            const deadline = Date.now() + 4000;
+            while (!fs.existsSync(process.env.CLAIM_TEST_RESUME)) {
+              if (Date.now() > deadline) throw new Error("recovery pause timeout");
+              Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+            }
+          }
+          return raw;
+        };`);
+      const paused = spawnC({ NODE_OPTIONS: `--import=${pathToFileURL(preload).href}`,
+        CLAIM_TEST_FILE: claimC, CLAIM_TEST_MARK: marker, CLAIM_TEST_RESUME: resume, QSLEEP: "800" });
+      try {
+        const deadline = Date.now() + 3000;
+        while (!fs.existsSync(marker) && Date.now() < deadline) await delay(10);
+        assert.ok(fs.existsSync(marker), "first recovery contender reached the controlled boundary");
+        await spawnC();
+        assert.equal(readHealth("sconc", HOOK_STOP).skipReason, "locked");
+        assert.equal(JSON.parse(fs.readFileSync(claimC, "utf8")).runId, "dead", "contender did not replace the observed claim");
+        assert.equal(calls(), 0, "contender did not start a notification");
+      } finally {
+        fs.writeFileSync(resume, "go");
+        await paused;
+      }
+      assert.equal(calls(), 1, "exactly one notification after concurrent recovery");
+      assert.ok(!fs.existsSync(claimC), "effective owner released its own metadata");
+    }
+
+    // §13 E02:young incomplete legacy records are protected; aged records can recover.
+    for (const raw of ["", '{"runId":', "[]"]) {
+      fs.rmSync(slotC, { force: true });
+      fs.writeFileSync(claimC, raw);
+      const before = calls();
+      runC();
+      assert.equal(calls(), before, "do not steal an incomplete legacy writer during its grace period");
+      assert.equal(readHealth("sconc", HOOK_STOP).skipReason, "locked");
+      const old = new Date(Date.now() - 60000);
+      fs.utimesSync(claimC, old, old);
+      runC();
+      assert.equal(calls(), before + 1, "aged empty/truncated/unrecognized metadata does not block forever");
+      assert.ok(!fs.existsSync(claimC));
+    }
+
+    // OS lock recovery:kill an actual holder BEFORE atomic metadata publication.
+    // No shared JSON is created in that window, and closing the killed connection releases the guard.
+    {
+      const worker = path.join(tmp, "claim-crash-worker.mjs");
+      const crashClaim = path.join(tmp, "crash.claim");
+      const claimant = pathToFileURL(path.join(root, "plugins/zcode-tps/scripts/claim.mjs")).href;
+      fs.writeFileSync(worker, `import fs from "node:fs";
+        const { acquireClaim } = await import(${JSON.stringify(claimant)});
+        const rename = fs.renameSync;
+        fs.renameSync = function(from, to) {
+          if (to === process.env.CLAIM_TEST_FILE) {
+            process.send("publishing");
+            Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);
+          }
+          return rename.call(fs, from, to);
+        };
+        await acquireClaim(process.env.CLAIM_TEST_FILE, "crash-owner");`);
+      const child = spawn(process.execPath, [worker], {
+        env: { ...process.env, CLAIM_TEST_FILE: crashClaim }, stdio: ["ignore", "ignore", "pipe", "ipc"],
+      });
+      const closed = once(child, "close");
+      let timeout;
+      try {
+        const ready = await Promise.race([once(child, "message"), new Promise((_, reject) => {
+          timeout = setTimeout(() => reject(new Error("claim worker did not reach publication")), 3000);
+        })]);
+        assert.equal(ready[0], "publishing");
+        const { acquireClaim, releaseClaim } = await import(claimant);
+        assert.equal(await acquireClaim(crashClaim, "contender"), null, "live OS mutex cannot be stolen");
+        child.kill(); await closed;
+        const recovered = await acquireClaim(crashClaim, "after-crash");
+        assert.ok(recovered, "killed writer releases its OS lock without waiting for a JSON timeout");
+        releaseClaim(recovered);
+        const replacement = await acquireClaim(crashClaim, "replacement");
+        releaseClaim(recovered); // An obsolete release must not unlink the replacement's record.
+        assert.equal(JSON.parse(fs.readFileSync(crashClaim, "utf8")).runId, "replacement");
+        releaseClaim(replacement);
+        const changed = await acquireClaim(crashClaim, "changed-owner");
+        const foreign = JSON.stringify({ guard: "sqlite-v1", runId: "foreign", pid: process.pid, ts: Date.now() });
+        fs.writeFileSync(crashClaim, foreign); // Fault injection: ownership metadata replaced outside the protocol.
+        assert.throws(() => releaseClaim(changed), /owner 已变化/);
+        assert.equal(fs.readFileSync(crashClaim, "utf8"), foreign, "release never deletes another owner's record");
+        const afterFault = await acquireClaim(crashClaim, "after-fault");
+        assert.ok(afterFault, "failed owner validation still closes the old connection");
+        releaseClaim(afterFault);
+      } finally {
+        clearTimeout(timeout);
+        if (child.exitCode === null && child.signalCode === null) child.kill();
+        await closed;
+      }
+    }
+
+    // §13 E03:initialize new state directories and report non-contention I/O errors.
+    {
+      const freshBase = path.join(tmp, "new-state-directory", "shown.json");
+      const freshSlot = freshBase + slotFile("sqa").slice(shownFile.length);
+      runStop({ cfg: cfgOn, realNotify: true,
+        extraEnv: { ZCODE_TPS_LAST_SHOWN: freshBase, ...cEnv() } });
+      assert.equal(readHealth("sqa", HOOK_STOP).notifyStatus, "ok");
+      assert.ok(fs.existsSync(freshSlot), "first use creates parent directory and writes watermark");
+      const obstruction = path.join(tmp, "parent-is-file");
+      fs.writeFileSync(obstruction, "not a directory");
+      runStop({ cfg: cfgOn, extraEnv: { ZCODE_TPS_LAST_SHOWN: path.join(obstruction, "shown.json") } });
+      const failed = readHealth("sqa", HOOK_STOP);
+      assert.equal(failed.status, "error", "filesystem failure must not masquerade as a competing owner");
+      assert.equal(failed.skipReason, null);
+      assert.match(failed.error, /占用锁失败.*(EEXIST|ENOTDIR)/);
+      const corruptBase = path.join(tmp, "corrupt-state", "shown.json");
+      const corruptSlot = corruptBase + slotFile("sqa").slice(shownFile.length);
+      fs.mkdirSync(path.dirname(corruptSlot), { recursive: true });
+      fs.writeFileSync(`${corruptSlot}.claim.sqlite`, "not a SQLite database");
+      runStop({ cfg: cfgOn, extraEnv: { ZCODE_TPS_LAST_SHOWN: corruptBase } });
+      assert.equal(readHealth("sqa", HOOK_STOP).status, "error", "a damaged guard is not mutex contention");
+      assert.match(readHealth("sqa", HOOK_STOP).error, /not a database/);
+    }
   }
 
   // F06(迁移):旧共享多槽文件 → 迁移读为独立文件,共享文件本身不再写入

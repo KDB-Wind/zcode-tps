@@ -17,12 +17,13 @@
 // - 通知等待退出码:非零退出/信号 = 提交失败,不落水位,下次 Stop 重试(R01);
 // - 去重水位按会话哈希独立文件,并发 Stop 互不覆盖(R04);旧共享多槽文件只作迁移读;
 // - 同会话"比较→发送→写水位"以原子 claim 串行化:相同内容不重复发送,旧采样晚完成
-//   不倒写新水位;占用后重验,拿不到锁即让位(不等待、不耗预算),残留锁由 pid/过期回收;
+//   不倒写新水位;事务锁保护占用/回收/释放,拿不到锁即让位,进程退出自动释放互斥;
 // - 指纹覆盖实际展示所需的原始聚合(速率分母/缓存分子/最新请求/字段选择),不只哈希四舍五入后的行文本(R02)。
 // 任何失败静默放行(exit 0),绝不阻塞回合结束。
 import fs from "node:fs";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import { acquireClaim, assertClaimOwner, releaseClaim } from "../scripts/claim.mjs";
 import {
   readConfig, parseBool, parseJson, resolveTurnEndMode, lastShownFile, shownSlotFile, notifiedOnceFile,
   writeState, recordHealth, startHealth, submitNotify, validId, HOOK_STOP,
@@ -124,55 +125,11 @@ function writeShownSlot(sessionId, fingerprint, shownAt) {
   writeState(file, { version: 3, sessionId, shownAt, fingerprint, ts: Date.now(), source: "stop" });
 }
 
-// ---- 同会话原子占用(审核 §12.3):claim 文件 + 占用后重验 + 防倒写 ----
-// "比较水位→发送通知→写水位"对同会话并不原子:并发 Stop 会重复发送相同内容,
-// 旧采样晚完成的运行还会倒写新水位。修复:发送前以 O_EXCL 原子创建 claim(带 pid/runId/ts),
-// 只有占用者发送与写水位;占用后重读水位,发现内容已被并发通知(指纹一致)、已有更新的
-// 完成水位、或水位写入时刻晚于本次采样开始(即占用前已有基于更新采样的提交)时让位。
-// 拿不到锁不等待(等待会消耗预算),直接让位;持有者被强杀由 pid 活性 + 过期时限回收兜底;
-// 通知失败/异常路径释放锁,下次 Stop 可重试。跨会话本就互不影响(独立水位文件)。
-const CLAIM_STALE_MS = 15000;
-
+// claim.mjs 使用独立状态库的事务锁保护整个生命周期,JSON 只作诊断/迁移。
 const claimPath = (sessionId) => {
   const f = shownSlotFile(sessionId);
   return f ? `${f}.claim` : null;
 };
-
-function pidAlive(pid) {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === "EPERM"; }
-}
-
-function acquireClaim(file, runId) {
-  if (!file) return true; // 无法定位会话文件时不设锁(水位写入本身仍是原子的单文件替换)
-  const create = () => {
-    const fd = fs.openSync(file, "wx");
-    try { fs.writeFileSync(fd, JSON.stringify({ runId, pid: process.pid, ts: Date.now() })); }
-    finally { fs.closeSync(fd); }
-  };
-  try {
-    create();
-    return true;
-  } catch (e) {
-    if (e.code !== "EEXIST") return false;
-  }
-  try {
-    // 已存在:持有者进程仍在且未过期 → 让位;否则回收(残留锁)后重试一次
-    const c = parseJson(fs.readFileSync(file, "utf8"));
-    const live = c && pidAlive(c.pid) && Date.now() - (Number(c.ts) || 0) <= CLAIM_STALE_MS;
-    if (live) return false;
-    try { fs.unlinkSync(file); } catch {}
-    create();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function releaseClaim(file) {
-  if (!file) return;
-  try { fs.unlinkSync(file); } catch {}
-}
 
 // "曾成功通知过"标记:决定是否在首次通知前补写 Windows 注册表横幅权限(幂等,仅一次)
 function everNotified() {
@@ -308,13 +265,14 @@ try {
   // §12.3:同会话原子占用——比较→发送→写水位只允许一个持有者;占用后重验,
   // 拿到锁的旧采样不再覆盖新结果(倒写),相同内容不被并发重复发送。
   const claim = claimPath(result.sessionId);
-  if (!acquireClaim(claim, run.runId)) {
+  const acquired = await acquireClaim(claim, run.runId);
+  if (!acquired) {
     complete({ status: "ok", resolvedSessionId: result.sessionId ?? null, lastSuccessAt: Date.now(),
       sampledAt: result.sampledAt, notified: false, skipReason: "locked",
       error: null, warnings: result.warnings });
     process.exit(0);
   }
-  heldClaim = claim;
+  heldClaim = acquired;
   // 占用后重验:并发者可能恰在本 run 查询期间完成了通知与写入
   const reread = readShownSlot(result.sessionId);
   let skipReason = null;
@@ -330,6 +288,7 @@ try {
     process.exit(0);
   }
   const confirmMs = Math.max(200, Math.min(NOTIFY_CONFIRM_MS, remainMs() - WRITE_RESERVE_MS));
+  assertClaimOwner(heldClaim);
   const notifyStatus = await submitNotify({ line, ensurePermission: !everNotified(), confirmMs });
   if (typeof notifyStatus === "string" && notifyStatus.startsWith("failed")) {
     releaseClaim(heldClaim);
@@ -338,6 +297,7 @@ try {
       sampledAt: result.sampledAt, warnings: result.warnings });
     process.exit(0);
   }
+  assertClaimOwner(heldClaim);
   writeShownSlot(result.sessionId, fingerprint, lastCompletedAt);
   markNotifiedOnce();
   releaseClaim(heldClaim);
@@ -346,8 +306,10 @@ try {
     sampledAt: result.sampledAt, notified: true, notifyStatus, error: null, warnings: result.warnings });
 } catch (e) {
   // F03:可捕获的失败必须记录终态与原因;宿主强制终止(SIGKILL)才会残留 running
-  // (同会话占用锁随之残留,由 pid 活性/过期回收兜底,不影响下次重试)
-  if (heldClaim) releaseClaim(heldClaim);
-  complete({ status: "error", error: e?.message ?? String(e), warnings: [] });
+  // 进程强杀时 SQLite 的 OS 锁会释放;JSON 残留由下一占用者在事务内恢复。
+  let error = e?.message ?? String(e);
+  try { if (heldClaim) releaseClaim(heldClaim); }
+  catch (cleanup) { error += `;占用锁清理失败: ${cleanup.message}`; }
+  complete({ status: "error", error, warnings: [] });
   process.exit(0);
 }
