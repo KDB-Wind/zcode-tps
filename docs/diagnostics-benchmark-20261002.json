@@ -1,0 +1,694 @@
+{
+  "100k": {
+    "node": "v24.14.0",
+    "rows": 100000,
+    "targetTypicalRows": 1000,
+    "targetLargeRows": 10000,
+    "budgetMs": 5000,
+    "fastBaselineMs": 15.2,
+    "fastCurrentMs": 15.5,
+    "fastMatrix": [
+      {
+        "indexes": "real",
+        "mode": "typical",
+        "baselineMs": 34,
+        "currentMs": 34.2,
+        "deltaMs": 0.2,
+        "investigationThresholdMs": 30
+      },
+      {
+        "indexes": "real",
+        "mode": "largest",
+        "baselineMs": 161.9,
+        "currentMs": 173.4,
+        "deltaMs": 11.5,
+        "investigationThresholdMs": 32.4
+      },
+      {
+        "indexes": "real",
+        "mode": "auto",
+        "baselineMs": 120.3,
+        "currentMs": 110.7,
+        "deltaMs": -9.6,
+        "investigationThresholdMs": 30
+      },
+      {
+        "indexes": "no-index",
+        "mode": "typical",
+        "baselineMs": 96.3,
+        "currentMs": 98.5,
+        "deltaMs": 2.2,
+        "investigationThresholdMs": 30
+      },
+      {
+        "indexes": "no-index",
+        "mode": "largest",
+        "baselineMs": 94.5,
+        "currentMs": 100.8,
+        "deltaMs": 6.3,
+        "investigationThresholdMs": 30
+      },
+      {
+        "indexes": "no-index",
+        "mode": "auto",
+        "baselineMs": 165.7,
+        "currentMs": 171.2,
+        "deltaMs": 5.5,
+        "investigationThresholdMs": 33.1
+      }
+    ],
+    "actualCli": {
+      "elapsedMs": 267,
+      "status": "ok"
+    },
+    "cases": [
+      {
+        "name": "typical-1000",
+        "samples": [
+          {
+            "elapsedMs": 217,
+            "stages": {
+              "ready": 64,
+              "base": 95,
+              "meta": 96,
+              "accounting": 146,
+              "workflow": 165,
+              "reliability": 197,
+              "timing": 208,
+              "reconciliation": 208,
+              "done": 209
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 203,
+            "stages": {
+              "ready": 58,
+              "base": 87,
+              "meta": 88,
+              "accounting": 134,
+              "workflow": 152,
+              "reliability": 185,
+              "timing": 194,
+              "reconciliation": 194,
+              "done": 195
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 199,
+            "stages": {
+              "ready": 52,
+              "base": 83,
+              "meta": 84,
+              "accounting": 128,
+              "workflow": 149,
+              "reliability": 181,
+              "timing": 191,
+              "reconciliation": 191,
+              "done": 192
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          }
+        ]
+      },
+      {
+        "name": "large-10000",
+        "samples": [
+          {
+            "elapsedMs": 1056,
+            "stages": {
+              "ready": 52,
+              "base": 139,
+              "meta": 140,
+              "accounting": 520,
+              "workflow": 675,
+              "reliability": 960,
+              "timing": 1046,
+              "reconciliation": 1046,
+              "done": 1048
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 1120,
+            "stages": {
+              "ready": 55,
+              "base": 144,
+              "meta": 144,
+              "accounting": 546,
+              "workflow": 712,
+              "reliability": 1008,
+              "timing": 1109,
+              "reconciliation": 1110,
+              "done": 1111
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 1070,
+            "stages": {
+              "ready": 58,
+              "base": 147,
+              "meta": 148,
+              "accounting": 525,
+              "workflow": 691,
+              "reliability": 974,
+              "timing": 1061,
+              "reconciliation": 1061,
+              "done": 1063
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          }
+        ]
+      },
+      {
+        "name": "workflow-retry-10000",
+        "samples": [
+          {
+            "elapsedMs": 1183,
+            "stages": {
+              "ready": 53,
+              "base": 139,
+              "meta": 140,
+              "accounting": 536,
+              "workflow": 760,
+              "reliability": 1061,
+              "timing": 1153,
+              "reconciliation": 1154,
+              "done": 1156
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 1194,
+            "stages": {
+              "ready": 86,
+              "base": 173,
+              "meta": 173,
+              "accounting": 574,
+              "workflow": 797,
+              "reliability": 1099,
+              "timing": 1184,
+              "reconciliation": 1184,
+              "done": 1186
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 1125,
+            "stages": {
+              "ready": 55,
+              "base": 135,
+              "meta": 136,
+              "accounting": 526,
+              "workflow": 742,
+              "reliability": 1034,
+              "timing": 1115,
+              "reconciliation": 1116,
+              "done": 1117
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          }
+        ]
+      },
+      {
+        "name": "no-secondary-index-1000",
+        "samples": [
+          {
+            "elapsedMs": 731,
+            "stages": {
+              "ready": 54,
+              "base": 116,
+              "meta": 116,
+              "accounting": 364,
+              "workflow": 515,
+              "reliability": 695,
+              "timing": 721,
+              "reconciliation": 721,
+              "done": 723
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 737,
+            "stages": {
+              "ready": 54,
+              "base": 113,
+              "meta": 114,
+              "accounting": 386,
+              "workflow": 527,
+              "reliability": 699,
+              "timing": 723,
+              "reconciliation": 723,
+              "done": 726
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 725,
+            "stages": {
+              "ready": 62,
+              "base": 120,
+              "meta": 121,
+              "accounting": 378,
+              "workflow": 517,
+              "reliability": 691,
+              "timing": 715,
+              "reconciliation": 715,
+              "done": 718
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "1m": {
+    "node": "v24.14.0",
+    "rows": 1000000,
+    "targetTypicalRows": 1000,
+    "targetLargeRows": 10000,
+    "budgetMs": 5000,
+    "fastBaselineMs": 15,
+    "fastCurrentMs": 15.9,
+    "fastMatrix": [
+      {
+        "indexes": "real",
+        "mode": "typical",
+        "baselineMs": 15.5,
+        "currentMs": 31.3,
+        "deltaMs": 15.8,
+        "investigationThresholdMs": 30
+      },
+      {
+        "indexes": "real",
+        "mode": "largest",
+        "baselineMs": 176.2,
+        "currentMs": 169,
+        "deltaMs": -7.2,
+        "investigationThresholdMs": 35.2
+      },
+      {
+        "indexes": "real",
+        "mode": "auto",
+        "baselineMs": 943.4,
+        "currentMs": 954.1,
+        "deltaMs": 10.7,
+        "investigationThresholdMs": 188.7
+      },
+      {
+        "indexes": "no-index",
+        "mode": "typical",
+        "baselineMs": 739.9,
+        "currentMs": 732.7,
+        "deltaMs": -7.2,
+        "investigationThresholdMs": 148
+      },
+      {
+        "indexes": "no-index",
+        "mode": "largest",
+        "baselineMs": 716.2,
+        "currentMs": 717.2,
+        "deltaMs": 1,
+        "investigationThresholdMs": 143.2
+      },
+      {
+        "indexes": "no-index",
+        "mode": "auto",
+        "baselineMs": 1473.1,
+        "currentMs": 1582.5,
+        "deltaMs": 109.4,
+        "investigationThresholdMs": 294.6
+      }
+    ],
+    "actualCli": {
+      "elapsedMs": 263,
+      "status": "ok"
+    },
+    "cases": [
+      {
+        "name": "typical-1000",
+        "samples": [
+          {
+            "elapsedMs": 210,
+            "stages": {
+              "ready": 58,
+              "base": 87,
+              "meta": 88,
+              "accounting": 137,
+              "workflow": 156,
+              "reliability": 191,
+              "timing": 200,
+              "reconciliation": 201,
+              "done": 203
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 214,
+            "stages": {
+              "ready": 58,
+              "base": 87,
+              "meta": 88,
+              "accounting": 137,
+              "workflow": 157,
+              "reliability": 192,
+              "timing": 203,
+              "reconciliation": 203,
+              "done": 206
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 247,
+            "stages": {
+              "ready": 64,
+              "base": 100,
+              "meta": 100,
+              "accounting": 162,
+              "workflow": 186,
+              "reliability": 225,
+              "timing": 235,
+              "reconciliation": 236,
+              "done": 238
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          }
+        ]
+      },
+      {
+        "name": "large-10000",
+        "samples": [
+          {
+            "elapsedMs": 1148,
+            "stages": {
+              "ready": 59,
+              "base": 147,
+              "meta": 147,
+              "accounting": 572,
+              "workflow": 744,
+              "reliability": 1049,
+              "timing": 1137,
+              "reconciliation": 1137,
+              "done": 1141
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 1110,
+            "stages": {
+              "ready": 50,
+              "base": 135,
+              "meta": 136,
+              "accounting": 544,
+              "workflow": 714,
+              "reliability": 1012,
+              "timing": 1099,
+              "reconciliation": 1099,
+              "done": 1103
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 1123,
+            "stages": {
+              "ready": 52,
+              "base": 135,
+              "meta": 136,
+              "accounting": 552,
+              "workflow": 725,
+              "reliability": 1026,
+              "timing": 1111,
+              "reconciliation": 1111,
+              "done": 1115
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          }
+        ]
+      },
+      {
+        "name": "workflow-retry-10000",
+        "samples": [
+          {
+            "elapsedMs": 1218,
+            "stages": {
+              "ready": 50,
+              "base": 135,
+              "meta": 136,
+              "accounting": 580,
+              "workflow": 814,
+              "reliability": 1124,
+              "timing": 1206,
+              "reconciliation": 1207,
+              "done": 1211
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 1203,
+            "stages": {
+              "ready": 57,
+              "base": 142,
+              "meta": 142,
+              "accounting": 575,
+              "workflow": 805,
+              "reliability": 1111,
+              "timing": 1191,
+              "reconciliation": 1191,
+              "done": 1195
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          },
+          {
+            "elapsedMs": 1314,
+            "stages": {
+              "ready": 57,
+              "base": 140,
+              "meta": 140,
+              "accounting": 582,
+              "workflow": 864,
+              "reliability": 1218,
+              "timing": 1302,
+              "reconciliation": 1302,
+              "done": 1307
+            },
+            "timedOut": false,
+            "error": null,
+            "status": "ok",
+            "modules": {
+              "workflow": "ok",
+              "reliability": "ok",
+              "timing": "ok",
+              "reconciliation": "ok"
+            }
+          }
+        ]
+      },
+      {
+        "name": "no-secondary-index-1000",
+        "samples": [
+          {
+            "elapsedMs": 5051,
+            "stages": {
+              "ready": 63,
+              "base": 404,
+              "meta": 405,
+              "accounting": 2763
+            },
+            "timedOut": true,
+            "error": null,
+            "status": "partial",
+            "modules": null
+          },
+          {
+            "elapsedMs": 5056,
+            "stages": {
+              "ready": 61,
+              "base": 405,
+              "meta": 406,
+              "accounting": 2743
+            },
+            "timedOut": true,
+            "error": null,
+            "status": "partial",
+            "modules": null
+          },
+          {
+            "elapsedMs": 5055,
+            "stages": {
+              "ready": 56,
+              "base": 397,
+              "meta": 398,
+              "accounting": 2750
+            },
+            "timedOut": true,
+            "error": null,
+            "status": "partial",
+            "modules": null
+          }
+        ]
+      }
+    ]
+  }
+}

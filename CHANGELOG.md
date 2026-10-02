@@ -4,6 +4,16 @@
 
 按需求 spec 0.6.0（`docs/SPEC-0.6.0.md`）交付的**按需完整诊断报表**：默认注入行、`/tps` 基础统计与全部 0.5.5 行为保持不变，新能力全部经显式请求触发。数据契约先行验证（`docs/DATA-CONTRACT-0.6.0.md`，采样工具 `tools/data-contract-sample.mjs`），证据不足的能力诚实延后，不以猜测填满字段。
 
+### 发布前审核修复(D01–D09,版本保持 0.6.0)
+
+- 账本先按行 ID 取候选并集,先判歧义/foreign 再互斥分类;NULL 来源完整覆盖,独立集合守恒校验。
+- 运行时探测实际唯一键与列依赖;可选列缺失诚实降级。模块异常独立返回真实原因,IPC 最终封包保留 no-session/软预算终态。
+- 对账检查源行缺失/非法/安全整数质量;空集合或比较证据不足不 matched。跨 session/provider 重试组不产生准确指标;宿主 reported 独立提供。
+- 同 root 多 run claim 用量进 unallocated,root 只计一次;run 展示截断不截断总量。未验证的嵌套与重试因果不再宣称已验证。
+- 拒绝未开放 current/prompt-key、未知参数与非法模块值;wrapUpSample 即使配置 true 仍 unsupported。
+- M0 工具补全所有关联 ID 的全局别名,同值跨表同别名。新增原始反例测试与自动清理。
+- 只读诊断改为按 session/trace 索引取候选;避免低选择性 source 索引全表扫描。百万行典型会话完整报表约 0.2–0.3s;具体矩阵、基线对照与边界见 docs/FIX-VALIDATION-0.6.0-20261002.md。
+
 ### 新增：`--details` 完整诊断报表
 
 ```text
@@ -16,8 +26,8 @@ node token-rate.mjs --json --session <sessionId> --details workflow,reliability,
 - **互斥分账（accounting）**：`observedUsage`（"相关请求已记录用量"，不是 session.total、不是费用账单）= main + workflow + subagent + auxiliary + unclassified 五桶之和；先按 usage 行 id（model_usage 主键）求并集去重再分类；多 root trace 命中与双 run claim 的行进 `ambiguousCandidates`，不纳入任何 root 总量；每桶附状态计数与逐字段 knownRows/missingRows/invalidRows 质量说明。诊断范围含非 completed 状态，与兼容范围（0.5.5 默认行）分别注明。
 - **workflow 归属**：只用已验证的权威链 `dwf_run.parent_session_id → dwf_actor.session_id → model_usage.session_id(query_source=workflow_child)`；trace 仅作交叉验证与歧义检测；run 级聚合与 workflow 桶守恒；被其他 root 的 run 同时 claim 的会话判歧义。`dwf_run.spent_tokens` 仅作宿主上报摘要，不与 usage 相加；节点细分不可用（dwf_node/dwf_event 无指向 usage 行的链接列）。
 - **error/retry 可靠性（reliability）**：状态计数（未映射 raw status 单列）、失败已记录用量（计入一次，不从成功请求推算）、可重叠特征（cancelled_by_user/retryable/context_exceeded）单列、error_type/code 脱敏统计（不输出 error_message）。retry 分两层：`reported`（宿主上报 retry_count 摘要，不与观察尝试数相加、不推测丢失尝试）与 `attempts`（逻辑请求/尝试的库内观察值；重复/缺失/非法 attempt_index 的组被标记且不产出准确重试指标，其 token 行照常计入）。
-- **等待分布（timing）**：TTFT 显式列优先、非法显式值不偷偷回退；direct/derived/invalid/missing 计数、mean/median/p90（请求算术均值 + nearest-rank）；Decode 有效集与 0.5.5 相同并给出原始分子/分母；provider_id+model_id 分组（同名模型不跨 provider 合并、缺 provider 入 unknown 桶，最多 50 组其余合并为 other）。TTFT 是"首 token 等待"，不是 HTTP TTFB。
-- **turn_usage 对账（reconciliation）**：对最近已观察主轮、在同一快照内读取；整数 token 精确比较，`delta = model_usage − turn_usage`；不同只说明"当前快照不一致，可能尚未回填"，不定性数据损坏；缺表为 unavailable，不影响基础查询与 doctor 健康。对账语义以 DATA-CONTRACT §7 为界（workflow actor 轮的 turn_usage 含未留存尝试的用量，差额如实报告）。
+- **等待分布（timing）**：TTFT 显式列优先、非法显式值不偷偷回退；direct/derived/invalid/missing 计数、mean/median/p90（请求算术均值 + nearest-rank）；Decode 有效集与 0.5.5 相同并给出原始分子/分母；provider_id+model_id 分组（同名模型不跨 provider 合并、缺 provider 入 unknown 桶，最多 50 组其余仅报告省略组数(other),不宣称合并指标）。TTFT 是"首 token 等待"，不是 HTTP TTFB。
+- **turn_usage 对账（reconciliation）**：对最近已观察主轮、在同一快照内读取；整数 token 精确比较，`delta = model_usage − turn_usage`；不同只说明"当前快照不一致，可能尚未回填"，不定性数据损坏；缺表为 unavailable，不影响基础查询与 doctor 健康。对账语义以 DATA-CONTRACT §7 为界（workflow actor 轮有已观察差额，成因未验证，差额如实报告）。
 
 ### 新增：doctor --details 与 /tps 完整报表
 

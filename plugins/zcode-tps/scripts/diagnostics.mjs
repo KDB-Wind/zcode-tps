@@ -6,6 +6,7 @@
 //     未完成模块记 timeout,不输出半个累加桶(§11.2)。stdout 只有一个最终 JSON 对象。
 // 证据边界以 docs/DATA-CONTRACT-0.6.0.md 为准:语义未验证的能力必须 unavailable/partial,
 // 不以猜测填满字段;无证据不等于 0(contract-unverified 不可伪装 no-data,§9.2)。
+import { hasUniqueKey, normalizeDiagnosticsDb, buildDiagnosticScope } from "./diagnostic-scope.mjs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
@@ -49,10 +50,6 @@ const tableColumns = (db, table) => {
 };
 // 分片参数拼接:组合 WHERE 时参数必须按 SQL 文本出现顺序展开
 const frag = (sql, params = []) => ({ sql, params });
-const orAll = (frags) => ({
-  sql: frags.map((f) => `(${f.sql})`).join(" OR "),
-  params: frags.flatMap((f) => f.params),
-});
 const moduleStatus = (status, data = null, extra = {}) => ({ status, data, warnings: [], ...extra });
 
 export function parseDetailModules(raw) {
@@ -71,89 +68,36 @@ export function probeCapabilities(db) {
   const dwfActor = tableColumns(db, "dwf_actor");
   const tu = tableColumns(db, "turn_usage");
   const workflowOk = dwfRun.has("id") && dwfRun.has("parent_session_id")
-    && dwfActor.has("run_id") && dwfActor.has("session_id");
+    && hasUniqueKey(db, "dwf_run", ["id"]) && dwfActor.has("run_id") && dwfActor.has("session_id");
   const tuRequired = ["session_id", "turn_id", "input_tokens", "output_tokens", "model_request_count"];
   const tuOk = tuRequired.every((c) => tu.has(c));
   return {
     contract: CONTRACT_ID,
-    rowIdentity: { status: "ok", method: "model_usage.id 主键(DATA-CONTRACT §1)" },
+    rowIdentity: mu.has("id") && hasUniqueKey(db, "model_usage", ["id"])
+      ? { status: "ok", method: "实际 model_usage.id 单列主键/唯一约束;相关 NULL ID 另做守卫" }
+      : { status: "unavailable", reasonCode: "schema-missing", note: "缺少稳定唯一的 model_usage.id" },
     traceAssociation: mu.has("trace_id")
       ? { status: "ok", method: "trace_id 与 root main_turn 共享(DATA-CONTRACT §4.1)" }
       : { status: "unavailable", reasonCode: "schema-missing", note: "model_usage 缺少 trace_id" },
     workflowAssociation: workflowOk
       ? { status: "ok", method: "dwf_run.parent_session_id → dwf_actor.session_id → model_usage.session_id(DATA-CONTRACT §4.2)" }
       : { status: "unavailable", reasonCode: "schema-missing", note: "dwf_run/dwf_actor 缺少归属键列" },
-    turnUsageReconciliation: tuOk
-      ? { status: "ok", method: "(session_id, turn_id) 复合主键,同快照精确比较整数 token(DATA-CONTRACT §7)" }
+    turnUsageReconciliation: tuOk && hasUniqueKey(db, "turn_usage", ["session_id", "turn_id"])
+      ? { status: "ok", method: "实际 (session_id, turn_id) 唯一键,同快照比较全部状态行的已知合法整数" }
       : { status: "unavailable", reasonCode: "schema-missing", note: "turn_usage 缺少比较所需列" },
-    retryAttempts: mu.has("logical_request_id")
-      ? { status: "ok", method: "logical_request_id 分组 + attempt_index 有效性(DATA-CONTRACT §5)", retention: "观测:每个逻辑请求仅留存最终行,attempt_index 恒 0;失败尝试不留行" }
-      : { status: "unavailable", reasonCode: "schema-missing", note: "model_usage 缺少 logical_request_id" },
+    retryAttempts: ["logical_request_id", "attempt_index", "provider_id"].every((c) => mu.has(c))
+      ? { status: "ok", method: "logical_request_id 分组;跨 session/provider 或域未知的组不产出准确指标", retention: "当前样本 logical ID 唯一、attempt_index 恒 0;未留存尝试的原因未经验证" }
+      : { status: "unavailable", reasonCode: "schema-missing", note: "尝试分组缺少 logical_request_id/attempt_index/provider_id" },
+    reportedRetries: mu.has("retry_count")
+      ? { status: "ok", method: "宿主 retry_count 上报值,独立于尝试分组" }
+      : { status: "unavailable", reasonCode: "schema-missing", note: "缺少 retry_count" },
     // 本问快照(wrapUpSample):默认关闭且未经真实宿主验收,任何版本不得宣称有效(§10.3)
     currentPrompt: { status: "unavailable", reasonCode: "contract-unverified",
-      note: "wrapUpSample 默认关闭;hook stdin 的 turnId 运行时传递未验证,0.6.0 不返回本问数据" },
+      note: "wrapUpSample 即使配置 true 也不启用;hook turnId 运行时传递未验证,0.6.0 不返回本问数据" },
   };
 }
 
 // ---- SQL 分片(基于 DATA-CONTRACT 已验证的归属路径;trace 弱关联必须做歧义检测) ----
-function scopeFragments(tr, db, sid, caps) {
-  const { validIdSql, AUX_CLASS } = tr;
-  const mu = "model_usage";
-  const mainTraces = frag(
-    `trace_id IN (SELECT DISTINCT trace_id FROM ${mu} WHERE session_id = ? AND query_source = 'main_turn' AND ${validIdSql("trace_id")})`,
-    [sid]);
-  // 多 root trace:同一 trace 的 main_turn 落在 ≥2 个会话 → 该 trace 的库外行不可归属(spec §4.2/A03)
-  const multiRoot = frag(
-    `trace_id IN (SELECT trace_id FROM ${mu} WHERE query_source = 'main_turn' AND ${validIdSql("trace_id")}
-       AND trace_id IN (SELECT DISTINCT trace_id FROM ${mu} WHERE session_id = ? AND query_source = 'main_turn' AND ${validIdSql("trace_id")})
-       GROUP BY trace_id HAVING COUNT(DISTINCT session_id) > 1)`,
-    [sid]);
-  const actorClaim = caps.workflowAssociation.status === "ok"
-    ? frag(`session_id IN (SELECT session_id FROM dwf_actor WHERE run_id IN (SELECT id FROM dwf_run WHERE parent_session_id = ?))`, [sid])
-    : frag("0"); // 无验证键时 actor 链为空集:workflow 行全部落入 unclassified/歧义,不补 0(A04)
-  // 其他 root 的 run 经同一 actor 链 claim 的会话:归属被证明属于别的 root(或双 claim → 歧义),
-  // 不得计入本 root 的任何桶(spec §4.2:跨 root 命中无法判明时不纳入任何 root 总量)
-  const otherRootClaim = caps.workflowAssociation.status === "ok"
-    ? frag(`session_id IN (SELECT session_id FROM dwf_actor WHERE run_id IN (SELECT id FROM dwf_run WHERE parent_session_id <> ?))`, [sid])
-    : frag("0");
-  const auxList = Object.keys(AUX_CLASS).map((s) => `'${s.replace(/'/g, "''")}'`).join(", ");
-  const nonBlankSrc = `query_source IS NOT NULL AND TRIM(query_source, ' ') != ''`;
-
-  const main = frag(`session_id = ? AND query_source = 'main_turn'`, [sid]);
-  const workflow = caps.workflowAssociation.status === "ok"
-    ? frag(`query_source = 'workflow_child' AND (${actorClaim.sql}) AND NOT (${otherRootClaim.sql})`,
-      [...actorClaim.params, ...otherRootClaim.params])
-    : frag("0");
-  const subagent = frag(
-    `query_source = 'subagent' AND (session_id = ? OR (${mainTraces.sql} AND NOT (${multiRoot.sql})))`,
-    [sid, ...mainTraces.params, ...multiRoot.params]);
-  const auxiliary = frag(
-    `query_source IN (${auxList}) AND (session_id = ? OR (${mainTraces.sql} AND NOT (${multiRoot.sql})))`,
-    [sid, ...mainTraces.params, ...multiRoot.params]);
-  const unclassified = orAll([
-    // in-session 未知来源(含 NULL/空白;已知内部来源归 auxiliary,spec §4.2)
-    frag(`session_id = ? AND query_source != 'main_turn' AND query_source != 'subagent' AND query_source != 'workflow_child'
-            AND (query_source IS NULL OR query_source NOT IN (${auxList}))`, [sid]),
-    // in-session workflow_child 但无 actor 链归属 → workflow 细分不可证(A04;actorClaim 为空桩时 NOT(0) 恒真)
-    frag(`session_id = ? AND query_source = 'workflow_child' AND NOT (${actorClaim.sql})`, [sid, ...actorClaim.params]),
-    // 库外 trace 弱关联的未知来源 / 未验证 workflow_child(能被其他 root 的 actor 链证明归属的不算)
-    frag(`session_id <> ? AND ${nonBlankSrc} AND query_source NOT IN ('main_turn', 'subagent', 'workflow_child', ${auxList})
-            AND ${mainTraces.sql} AND NOT (${multiRoot.sql})`, [sid, ...mainTraces.params, ...multiRoot.params]),
-    frag(`session_id <> ? AND query_source = 'workflow_child' AND NOT (${actorClaim.sql}) AND ${mainTraces.sql} AND NOT (${multiRoot.sql})
-            AND NOT (${otherRootClaim.sql})`,
-      [sid, ...actorClaim.params, ...mainTraces.params, ...multiRoot.params, ...otherRootClaim.params]),
-  ]);
-  const ambiguous = orAll([
-    // trace 命中多 root:除被本 root actor 链(且仅本 root)claim 的行外,一律歧义
-    frag(`session_id <> ? AND ${mainTraces.sql} AND (${multiRoot.sql}) AND NOT (query_source = 'workflow_child' AND (${actorClaim.sql}))`,
-      [sid, ...mainTraces.params, ...multiRoot.params, ...actorClaim.params]),
-    // 双 root 同时 claim 的 actor 会话:归属不可判
-    frag(`session_id <> ? AND (${actorClaim.sql}) AND (${otherRootClaim.sql})`,
-      [sid, ...actorClaim.params, ...otherRootClaim.params]),
-  ]);
-  return { main, workflow, subagent, auxiliary, unclassified, ambiguous, mainTraces, multiRoot, actorClaim, otherRootClaim };
-}
-
 // ---- 桶聚合:单遍条件聚合,质量按字段给出 known/missing/invalid(spec §4.3) ----
 const TOKEN_FIELDS = [
   ["input", "input_tokens"], ["output", "output_tokens"], ["reasoning", "reasoning_tokens"],
@@ -209,7 +153,7 @@ function buildAccounting(tr, db, sid, caps, frags) {
   const basis = {
     main: "session_id = root 且 query_source=main_turn",
     workflow: "dwf_run.parent_session_id → dwf_actor.session_id(权威链;trace 仅交叉验证)",
-    subagent: "query_source=subagent 且 session=root 或与 root main_turn 共享 trace(多 root trace 已剔除)",
+    subagent: "query_source=subagent 且与 root 有直接会话/唯一 actor 链/唯一 root trace 关联;歧义与 foreign 先剔除",
     auxiliary: "已知内部来源(session_title/goal_summary_title/compact/target_completion_verification)",
     unclassified: "与 root 相关但来源类别未知或 workflow 归属不可证",
   };
@@ -230,22 +174,34 @@ function buildAccounting(tr, db, sid, caps, frags) {
         note: "这些行与多个 root 的 main_turn 共享 trace(或归属冲突),不纳入任何 root 总量;数量与已知用量仅作提示" }
     : { requests: 0, note: "明确范围内确认无歧义候选行" };
 
+  const independent = bucketAggregate(tr, db, frags.observed);
+  const candidateCount = db.prepare("SELECT COUNT(*) n FROM model_usage").get().n;
+  const foreignCount = db.prepare("SELECT COUNT(*) n FROM model_usage WHERE bucket = 'foreign'").get().n;
+  const conserved = ["requests", "input", "output", "reasoning", "cacheRead", "cacheCreation"].every((k) => independent[k] === observed[k]);
+  if (!conserved || independent.requests + ambAgg.requests + foreignCount !== candidateCount)
+    throw Object.assign(new Error("账本覆盖/守恒检查失败"), { reasonCode: "invalid-data" });
   return {
     scope: {
       rootSessionId: sid,
+      associationCoverage: {
+        status: caps.traceAssociation.status === "ok" && caps.workflowAssociation.status === "ok" ? "ok" : "partial",
+        missingPaths: ["traceAssociation", "workflowAssociation"].filter((k) => caps[k].status !== "ok"),
+        note: "候选集合守恒只证明已知关联范围内完整,缺关联能力不能推断全历史完整或没有子代理/workflow",
+      },
       sources: ["main_turn", "subagent", "workflow_child", "auxiliary(已知内部来源)", "unclassified(未知来源)"],
       statusRange: "库内留存的全部状态(completed/error/cancelled 及未映射状态,未映射单列)",
       retention: "仅库内留存行;已清理/未落库历史不可见;失败已记录用量不解释为额外收费",
       subagents: "诊断范围始终包含可归属的子代理与 workflow 行(与 includeSubagents 配置无关;兼容范围另见 session.scope)",
       note: "observedUsage 是『相关请求已记录用量』,不是 session.total 也不是全部历史真实消耗;缺少关联证据不等于已证明无 workflow",
     },
-    observedUsage: { ...observed, quality: observedQuality(buckets), tokensComplete,
+    coverage: { candidateRows: candidateCount, observedRows: independent.requests, ambiguousRows: ambAgg.requests, foreignRows: foreignCount, complete: true },
+    observedUsage: { ...independent, quality: observedQuality(buckets), tokensComplete,
       text: "相关请求已记录用量(互斥分类守恒:五桶之和 = observedUsage)" },
     buckets,
     ambiguousCandidates,
     classification: { order: ["main", "workflow", "subagent", "auxiliary", "unclassified"],
-      conflicts: [], // 结构上按 source 互斥;未来出现跨类冲突时在此记录并保留 main(spec §4.2)
-      note: "分类顺序固定;逻辑请求 ID 不用于去重(一次逻辑请求可多次尝试,DATA-CONTRACT §5)" },
+      conflicts: [], // 归属歧义已提前单列,CASE 每个候选只返回一个分类。
+      note: "先剔除跨 root 歧义与 foreign;分类 CASE 唯一;逻辑请求 ID 不用于去重(一次逻辑请求可多次尝试,DATA-CONTRACT §5)" },
   };
 }
 
@@ -265,69 +221,56 @@ function observedQuality(buckets) {
 
 // ---- workflow 模块(§5):run 列表 + 归属质量;无验证键时 unavailable ----
 function buildWorkflow(tr, db, sid, caps, frags) {
-  const { validIdSql } = tr;
-  const out = moduleStatus("unavailable", null, { reasonCode: "contract-unverified" });
-  if (caps.workflowAssociation.status !== "ok") {
-    out.status = "unavailable";
-    out.reasonCode = "schema-missing";
-    out.warnings.push("dwf_run/dwf_actor 缺少已验证的归属键列;workflow 分账不可用,相关行保留在 unclassified,不补 0");
-    return out;
-  }
-  const runs = db.prepare(
-    `SELECT id rid, status, spent_tokens, time_created, time_updated,
-       (SELECT COUNT(*) FROM dwf_actor a WHERE a.run_id = r.id) actors
-     FROM dwf_run r WHERE parent_session_id = ? ORDER BY time_created DESC`
-  ).all(sid);
-  const runRows = [];
-  const budgeted = runs.slice(0, MAX_RUNS);
-  let workflowTotals = { requests: 0, input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheCreation: 0 };
-  for (const r of budgeted) {
-    // 与 workflow 桶同一归属规则:被其他 root 同时 claim 的 actor 会话不计入本 run(守恒前提)
-    const agg = bucketAggregate(tr, db, frag(
-      `query_source = 'workflow_child' AND session_id IN (SELECT session_id FROM dwf_actor WHERE run_id = ?)
-         AND NOT (${frags.otherRootClaim.sql})`, [r.rid, ...frags.otherRootClaim.params]));
-    addAggregates(workflowTotals, agg);
-    runRows.push({
-      runId: runDisplayId(r.rid),
-      status: r.status ?? null,
-      actors: r.actors ?? 0,
-      associationQuality: (r.actors ?? 0) > 0 ? "actor-chain(已验证)" : "no-actor(无 actor 映射,行数为 0;spent_tokens 为宿主上报摘要,不与 usage 相加)",
-      requests: agg.requests, input: agg.input, output: agg.output, reasoning: agg.reasoning,
-      cacheRead: agg.cacheRead, cacheCreation: agg.cacheCreation, total: agg.total,
-      quality: agg.quality,
-      reportedSpentTokens: typeof r.spent_tokens === "number" && Number.isFinite(r.spent_tokens) && r.spent_tokens >= 0 ? r.spent_tokens : null,
-    });
-  }
-  // 守恒检查:run 之和必须等于 workflow 桶(同一行集合;§4.3)
-  const bucketAgg = bucketAggregate(tr, db, frags.workflow);
-  const conservationOk = runRows.reduce((s, r) => s + r.requests, 0) === bucketAgg.requests;
-  const unattributed = db.prepare(
-    `SELECT COUNT(*) n FROM model_usage WHERE query_source = 'workflow_child' AND session_id <> ? AND
-       trace_id IN (SELECT DISTINCT trace_id FROM model_usage WHERE session_id = ? AND query_source = 'main_turn' AND ${validIdSql("trace_id")})
-       AND NOT (${frags.actorClaim.sql})`
-  ).all(sid, sid, ...frags.actorClaim.params)[0]?.n ?? 0;
-  out.status = conservationOk ? "ok" : "partial";
-  if (conservationOk) delete out.reasonCode; else out.reasonCode = "invalid-data";
-  out.data = {
+  if (caps.workflowAssociation.status !== "ok") return moduleStatus("unavailable", null,
+    { reasonCode: "schema-missing", warnings: [caps.workflowAssociation.note] });
+  const cols = tableColumns(db, "dwf_run");
+  const optional = ["status", "spent_tokens", "time_created", "time_updated"].map((c) => cols.has(c) ? c : "NULL AS " + c);
+  const runs = db.prepare("SELECT id rid, " + optional.join(",") +
+    ", (SELECT COUNT(*) FROM dwf_actor a WHERE a.run_id = r.id) actors FROM dwf_run r WHERE parent_session_id = ? ORDER BY time_created DESC LIMIT " + MAX_RUNS).all(sid);
+  const runCount = db.prepare("SELECT COUNT(*) n FROM dwf_run WHERE parent_session_id = ?").get(sid).n;
+  const ownership = "(SELECT COUNT(DISTINCT a.run_id) FROM dwf_actor a JOIN dwf_run r ON a.run_id = r.id WHERE a.session_id = model_usage.session_id AND r.parent_session_id = ?)";
+  // 别名用于相关子查询,防止误解析到 actor 的 session_id。
+  const aggFor = (condition, params) => bucketAggregate(tr, db, frag("bucket = 'workflow' AND " + condition, params));
+  const conflict = aggFor(ownership.replaceAll("model_usage.session_id", "diagnostic_scope.session_id") + " > 1", [sid]);
+  const budgeted = runs;
+  const rows = budgeted.map((r) => {
+    const agg = aggFor("session_id IN (SELECT session_id FROM dwf_actor WHERE run_id = ?) AND " +
+      ownership.replaceAll("model_usage.session_id", "diagnostic_scope.session_id") + " = 1", [r.rid, sid]);
+    return { runId: runDisplayId(r.rid), status: r.status, actors: r.actors, associationQuality: r.actors ? "actor-chain(已验证)" : "no-actor",
+      ...agg, reportedSpentTokens: r.spent_tokens, startedAt: r.time_created, updatedAt: r.time_updated,
+      spentTokensNote: "宿主摘要,不与 usage 用量相加" };
+  });
+  // root 总量直接来自唯一行桶,不依赖展示的 run 个数。多 run claim 行留在 unallocated。
+  const total = bucketAggregate(tr, db, frags.workflow);
+  const uniqueRuns = aggFor(ownership.replaceAll("model_usage.session_id", "diagnostic_scope.session_id") + " = 1", [sid]);
+  const conserved = ["requests", "input", "output", "reasoning", "cacheRead", "cacheCreation"].every((k) => uniqueRuns[k] + conflict[k] === total[k]);
+  const omitted = { requests: uniqueRuns.requests, input: uniqueRuns.input, output: uniqueRuns.output,
+    reasoning: uniqueRuns.reasoning, cacheRead: uniqueRuns.cacheRead, cacheCreation: uniqueRuns.cacheCreation };
+  for (const row of rows) for (const k of Object.keys(omitted)) omitted[k] -= row[k];
+  omitted.total = omitted.input + omitted.output;
+  const ambiguous = conflict.requests > 0;
+  const out = moduleStatus(ambiguous || !conserved ? "partial" : "ok", {
     associationPaths: ["dwf_run.parent_session_id → dwf_actor.session_id → model_usage.session_id(query_source=workflow_child)"],
-    rootSessionId: sid,
-    runs: runRows,
-    runCountTotal: runs.length,
-    truncatedRuns: Math.max(0, runs.length - budgeted.length),
-    totals: { ...workflowTotals, total: workflowTotals.input + workflowTotals.output, conservation: conservationOk ? "run 之和 = workflow 桶" : "run 之和与 workflow 桶不一致,见 warnings" },
-    unattributedTraceLinkedRows: unattributed,
-    unattributedNote: "仅与当前 root 有 trace 弱关联、无 actor 链归属的 workflow_child 行数(已计入 unclassified,不冒充 workflow)",
-    nodeLevelBreakdown: { status: "unavailable", reasonCode: "contract-unverified",
-      note: "dwf_node/dwf_event 无指向 usage 行的链接列(DATA-CONTRACT §4.2),节点细分不提供" },
-  };
-  if (!conservationOk) out.warnings.push("run 级聚合与 workflow 桶守恒失败:存在跨 run 行归属异常,明细被标记 partial");
-  if (runs.length > MAX_RUNS) out.warnings.push(`run 数超过 ${MAX_RUNS},仅展示最近 ${MAX_RUNS} 个,其余计入 runCountTotal`);
+    rootSessionId: sid, runs: rows, runCountTotal: runCount, truncatedRuns: Math.max(0, runCount - MAX_RUNS),
+    totals: { ...total, conservation: conserved && !ambiguous && !omitted.requests ? "run 之和 = workflow 桶" : "唯一 run + 未展示 run + unallocated = workflow 桶",
+      conservationOk: conserved },
+    unallocated: { ...conflict, reasonCode: "association-ambiguous", note: "同 root 多 run claim;root 只计一次,不分配到任何具体 run" },
+    omittedRunsUsage: omitted,
+    unattributedTraceLinkedRows: db.prepare("SELECT COUNT(*) n FROM model_usage WHERE bucket = 'unclassified' AND query_source = 'workflow_child' AND session_id <> ?").get(sid).n,
+    unattributedNote: "无 actor 归属而仅 trace 关联的 workflow_child,已入 unclassified",
+    nodeLevelBreakdown: { status: "unavailable", reasonCode: "contract-unverified", note: "节点/嵌套传播未验证;不推测归属" },
+  });
+  if (ambiguous) { out.reasonCode = "association-ambiguous"; out.warnings.push("同 root 的多个 run claim 同一 actor;用量归 unallocated,总量只计一次"); }
+  if (!conserved) { out.reasonCode = "invalid-data"; out.warnings.push("run 守恒检查失败"); }
+  if (runCount > MAX_RUNS) out.warnings.push("run 展示截断;省略用量独立列示,totals 不截断");
+  if (optional.some((c) => c.startsWith("NULL"))) { out.status = "partial"; out.warnings.push("缺少可选 run 摘要列,仅显示已知字段"); }
   return out;
 }
 
 // ---- reliability 模块(§6):状态/失败已记录用量/重叠特征/脱敏错误统计/retry 摘要 ----
 function buildReliability(tr, db, caps, unionWhereRaw) {
   const { validNumSql, sumOk } = tr;
+  const columns = tableColumns(db, "model_usage");
   const out = moduleStatus("unavailable", null, { reasonCode: "contract-unverified" });
   // 追加 AND 条件需要整体括号:避免 OR 优先级把条件只挂在最后一个分片上
   const scope = { sql: `(${unionWhereRaw.sql})`, params: unionWhereRaw.params };
@@ -352,11 +295,11 @@ function buildReliability(tr, db, caps, unionWhereRaw) {
       total: (r.input ?? 0) + (r.output ?? 0), quality: { fields,
         tokensComplete: Object.values(fields).every((f) => f.missingRows + f.invalidRows === 0) } };
   });
-  const failed = statusCounts.filter((s) => s.status !== "completed");
+  const failed = statusCounts.filter((s) => s.status === "error" || s.status === "cancelled");
   const failedUsage = failed.reduce((a, s) => ({ requests: a.requests + s.requests, input: a.input + s.input,
     output: a.output + s.output }), { requests: 0, input: 0, output: 0 });
   failedUsage.total = failedUsage.input + failedUsage.output;
-  const flagCount = (col) => db.prepare(
+  const flagCount = (col) => !columns.has(col) ? null : db.prepare(
     `SELECT COUNT(*) n FROM model_usage WHERE ${scope.sql} AND ${col} = 1`
   ).all(...scope.params)[0]?.n ?? 0;
   const sanitizedTop = (col) => {
@@ -377,29 +320,32 @@ function buildReliability(tr, db, caps, unionWhereRaw) {
       ? "存在未映射的 raw status(已单列,未假设其语义);不能仅凭 completed_at 非空归为 completed" : null,
     failedRecordedUsage: { ...failedUsage,
       note: "失败行有已记录 input/output 即计入一次;无 token 则报缺失,不从成功请求推算;不是额外收费" },
+    nonFinalOrUnmappedUsage: statusCounts.filter((s) => !knownStatuses.has(s.status)),
     unterminatedRows: { requests: unterminated, note: unterminated ? "未终止行的 token 可能回填,不当最终消耗" : "明确范围内无未终止行" },
     overlappingFlags: {
+      unavailableFields: ["cancelled_by_user", "retryable", "context_exceeded"].filter((c) => !columns.has(c)),
       note: "cancelled_by_user / retryable / context_exceeded 是可重叠特征,不是可加的状态桶",
       cancelledByUser: flagCount("cancelled_by_user"),
       retryable: flagCount("retryable"),
       contextExceeded: flagCount("context_exceeded"),
     },
-    errorTypes: { values: sanitizedTop("error_type"),
+    errorTypes: { status: columns.has("error_type") ? "ok" : "unavailable", values: sanitizedTop("error_type"),
       note: "error_type 在成功行上也非空(逻辑请求的历史错误记录在最终行,DATA-CONTRACT §3);类别脱敏统计,error_message 不输出" },
-    errorCodes: { values: sanitizedTop("error_code"), note: "error_code 当前宿主全 NULL(观测)" },
+    errorCodes: { status: columns.has("error_code") ? "ok" : "unavailable", values: sanitizedTop("error_code"), note: "error_code 当前宿主全 NULL(观测)" },
     retry: buildRetrySummary(tr, db, caps, scope),
   };
+  if (["retryable", "cancelled_by_user", "context_exceeded", "error_type", "error_code"].some((c) => !columns.has(c))) {
+    out.status = "partial";
+    out.reasonCode = "schema-missing";
+    out.warnings.push("缺失的可选特征列以 unavailable/null 标注,不冒充 0");
+  }
   if (out.status === "ok") delete out.reasonCode;
   return out;
 }
 
-// retry 子能力(§6.2):reported 摘要始终提供;尝试分组指标仅在 lrid 契约验证后开放
+// retry 子能力(§6.2):reported 摘要独立提供;尝试分组指标仅在 lrid 契约验证后开放
 function buildRetrySummary(tr, db, caps, scope) {
   const { validNumSql, validIdSql } = tr;
-  if (!caps.retryAttempts || caps.retryAttempts.status !== "ok") {
-    return { status: "unavailable", reasonCode: "schema-missing",
-      note: "model_usage 缺少 logical_request_id,尝试分组指标不可用" };
-  }
   const scopeSql = `FROM model_usage WHERE ${scope.sql}`;
   const reported = db.prepare(
     `SELECT SUM(CASE WHEN ${validNumSql("retry_count")} AND retry_count > 0 THEN 1 ELSE 0 END) rows_with_retry,
@@ -407,6 +353,18 @@ function buildRetrySummary(tr, db, caps, scope) {
        SUM(CASE WHEN retry_count IS NOT NULL AND NOT (${validNumSql("retry_count")}) THEN 1 ELSE 0 END) invalid_values
      ${scopeSql}`
   ).all(...scope.params)[0] ?? {};
+  const reportedData = {
+    status: caps.reportedRetries.status,
+    rowsWithRetryCount: caps.reportedRetries.status === "ok" ? reported.rows_with_retry ?? 0 : null,
+    maxRetryCountObserved: reported.max_reported ?? null,
+    invalidValues: caps.reportedRetries.status === "ok" ? reported.invalid_values ?? 0 : null,
+    note: "宿主上报值,与观察尝试数分开;未留存尝试的原因未经验证",
+    ...(caps.reportedRetries.status !== "ok" ? { reasonCode: "schema-missing" } : {}),
+  };
+  if (caps.retryAttempts.status !== "ok") return {
+    status: "partial", reasonCode: "schema-missing", reported: reportedData,
+    attempts: { status: "unavailable", reasonCode: "schema-missing", note: caps.retryAttempts.note },
+  };
   // 分组:仅 validId(lrid) 的行进入组;重复/缺失/非法 attempt_index 的组被标记,不产出准确重试指标(R03)
   const g = db.prepare(
     `WITH scope AS MATERIALIZED (SELECT logical_request_id lrid, attempt_index ai, session_id, provider_id ${scopeSql}),
@@ -414,12 +372,13 @@ function buildRetrySummary(tr, db, caps, scope) {
          COUNT(DISTINCT CASE WHEN typeof(ai) = 'integer' AND ai >= 0 THEN ai END) valid_attempts,
          SUM(CASE WHEN ai IS NULL THEN 1 ELSE 0 END) missing_ai,
          SUM(CASE WHEN ai IS NOT NULL AND NOT (typeof(ai) = 'integer' AND ai >= 0) THEN 1 ELSE 0 END) invalid_ai,
-         COUNT(DISTINCT session_id) sessions, COUNT(DISTINCT provider_id) providers
+         COUNT(DISTINCT session_id) sessions, COUNT(DISTINCT provider_id) providers,
+         SUM(CASE WHEN NOT (${validIdSql("session_id")}) OR NOT (${validIdSql("provider_id")}) OR session_id IS NULL OR provider_id IS NULL THEN 1 ELSE 0 END) unknown_domain
        FROM scope WHERE ${validIdSql("lrid")} GROUP BY lrid)
      SELECT COUNT(*) groups_total, COALESCE(SUM(rows_n), 0) grouped_rows,
-       COALESCE(SUM(CASE WHEN missing_ai = 0 AND invalid_ai = 0 AND rows_n = valid_attempts AND valid_attempts > 1 THEN 1 ELSE 0 END), 0) retried_clean,
-       COALESCE(SUM(CASE WHEN missing_ai = 0 AND invalid_ai = 0 AND rows_n = valid_attempts AND valid_attempts > 1 THEN valid_attempts - 1 ELSE 0 END), 0) additional_clean,
-       COALESCE(SUM(CASE WHEN missing_ai > 0 OR invalid_ai > 0 OR rows_n > valid_attempts THEN 1 ELSE 0 END), 0) flagged_groups,
+       COALESCE(SUM(CASE WHEN missing_ai = 0 AND invalid_ai = 0 AND rows_n = valid_attempts AND valid_attempts > 1 AND sessions = 1 AND providers = 1 AND unknown_domain = 0 THEN 1 ELSE 0 END), 0) retried_clean,
+       COALESCE(SUM(CASE WHEN missing_ai = 0 AND invalid_ai = 0 AND rows_n = valid_attempts AND valid_attempts > 1 AND sessions = 1 AND providers = 1 AND unknown_domain = 0 THEN valid_attempts - 1 ELSE 0 END), 0) additional_clean,
+       COALESCE(SUM(CASE WHEN missing_ai > 0 OR invalid_ai > 0 OR rows_n > valid_attempts OR sessions <> 1 OR providers <> 1 OR unknown_domain > 0 THEN 1 ELSE 0 END), 0) flagged_groups,
        COALESCE(SUM(CASE WHEN sessions > 1 THEN 1 ELSE 0 END), 0) multi_session_groups,
        COALESCE(SUM(CASE WHEN providers > 1 THEN 1 ELSE 0 END), 0) multi_provider_groups
      FROM grp`
@@ -439,18 +398,13 @@ function buildRetrySummary(tr, db, caps, scope) {
       flaggedGroups: g.flagged_groups ?? 0,
       multiSessionGroups: g.multi_session_groups ?? 0,
       multiProviderGroups: g.multi_provider_groups ?? 0,
-      note: "重复/缺失/非法 attempt_index 的组不产出准确重试指标;其 token 行仍按原样计入账本,不删除行『修正』数据(R03)",
+      note: "跨 session/provider、域未知或重复/缺失/非法 attempt_index 的组不产出准确重试指标;其 token 行仍按原样计入账本,不删除行『修正』数据(R03)",
     },
-    retentionNote: "attemptRows 是库内留存行数:当前宿主每逻辑请求仅留存 1 行(DATA-CONTRACT §5),观察到的额外尝试为 0 不代表未发生重试",
+    retentionNote: "attemptRows 是库内留存行数:当前样本每 logical ID 仅观测到 1 行(DATA-CONTRACT §5),观察到的额外尝试为 0 不代表未发生重试",
   };
   return {
-    status: "ok",
-    reported: {
-      rowsWithRetryCount: reported.rows_with_retry ?? 0,
-      maxRetryCountObserved: reported.max_reported ?? null,
-      invalidValues: reported.invalid_values ?? 0,
-      note: "宿主上报值:最终行记录该逻辑请求的重试历史;失败尝试不留行(DATA-CONTRACT §5),不与观察尝试数相加,不推测丢失尝试",
-    },
+    status: caps.reportedRetries.status !== "ok" || g.multi_session_groups > 0 || g.multi_provider_groups > 0 ? "partial" : "ok",
+    reported: reportedData,
     attempts,
   };
 }
@@ -471,7 +425,7 @@ function buildTiming(tr, db, sid, caps, { min, max }) {
     ELSE NULL END`;
   const baseCte = `WITH s AS MATERIALIZED (SELECT ${durExpr} dur_ms, ${ttftUse} ttft_val, ${explicit} ttft_raw,
       first_token_at, started_at, output_tokens, provider_id, model_id
-    FROM model_usage WHERE session_id = ? AND status = 'completed' AND query_source = 'main_turn')`;
+    FROM model_usage WHERE session_id = ? AND status = 'completed' AND +query_source = 'main_turn')`;
   const derivedCond = `ttft_raw IS NULL AND ${finiteNumSql("first_token_at")} AND ${finiteNumSql("started_at")}`;
   const row = db.prepare(
     `${baseCte} SELECT COUNT(*) candidates,
@@ -528,7 +482,7 @@ function buildTiming(tr, db, sid, caps, { min, max }) {
       mean: g.mean != null ? Math.round(g.mean * 10) / 10 : null,
       median: g.median != null ? Math.round(g.median * 10) / 10 : null,
       p90: g.p90 != null ? Math.round(g.p90 * 10) / 10 : null })),
-    other: total > MAX_GROUPS ? { note: `超过 ${MAX_GROUPS} 组的部分合并为 other(合并规则:按样本数取前 ${MAX_GROUPS} 组,其余不再细分)`, groups: total - MAX_GROUPS } : null,
+    other: total > MAX_GROUPS ? { note: `超过 ${MAX_GROUPS} 组的部分合并为 other(合并规则:按样本数取前 ${MAX_GROUPS} 组,其余仅报告省略的组数,未计算合并指标)`, groups: total - MAX_GROUPS } : null,
   });
   out.status = "ok";
   out.data = {
@@ -550,83 +504,66 @@ function buildTiming(tr, db, sid, caps, { min, max }) {
     byModel: { ttft: splitGroups(ttftGroups, ttftTotal), decode: splitGroups(decodeRaw, decodeTotal),
       note: "provider_id+model_id 分组;同名 model 不跨 provider 合并;缺 provider 归入 (unknown);零样本组不出现(仅有样本的组)" },
   };
+  if (!tableColumns(db, "model_usage").has("provider_id")) {
+    out.status = "partial"; out.reasonCode = "schema-missing";
+    out.warnings.push("缺少 provider_id;分组统一标为 (unknown),不推测 provider");
+  }
   if (out.status === "ok") delete out.reasonCode;
   return out;
 }
 
 // ---- reconciliation 模块(§8):最近已观察主轮;同快照;整数精确比较 ----
 function buildReconciliation(tr, db, sid, caps, base) {
-  const { sumOk } = tr;
-  const out = moduleStatus("unavailable", null, { reasonCode: "contract-unverified" });
-  if (!caps.turnUsageReconciliation || caps.turnUsageReconciliation.status !== "ok") {
-    out.status = "unavailable";
-    out.reasonCode = "schema-missing";
-    out.warnings.push("turn_usage 缺少比较所需列/表;对账不可用,不影响基础查询与健康检查");
-    return out;
-  }
-  const turnId = base.turn?.turnId ?? null;
-  if (turnId == null) {
-    out.status = "unavailable";
-    out.reasonCode = "no-data";
-    out.data = { note: "明确范围内无最近已观察且 ID 有效的主轮,不对账" };
-    return out;
-  }
+  if (caps.turnUsageReconciliation.status !== "ok") return moduleStatus("unavailable", null,
+    { reasonCode: "schema-missing", warnings: [caps.turnUsageReconciliation.note ?? "turn_usage 缺少比较列/唯一键"] });
+  const turnId = base.turn?.turnId;
+  if (turnId == null) return moduleStatus("unavailable", { note: "无最近已观察主轮" }, { reasonCode: "no-data" });
   const tuCols = tableColumns(db, "turn_usage");
-  const tuRow = db.prepare(`SELECT * FROM turn_usage WHERE session_id = ? AND turn_id = ?`).get(sid, turnId);
-  if (!tuRow) {
-    out.status = "ok";
-    delete out.reasonCode;
-    out.data = {
-      turnId, result: "missing-aggregate",
-      note: "该轮在 turn_usage 无聚合行(可能尚未聚合/回填;单次快照不同不定性数据损坏,回填后重查可变 matched)",
-    };
-    return out;
+  const defs = [["model_request_count", "requests"], ["input_tokens", "input"], ["output_tokens", "output"],
+    ["reasoning_tokens", "reasoning"], ["cache_read_input_tokens", "cacheRead"], ["cache_creation_input_tokens", "cacheCreation"]];
+  const selected = ["status", ...defs.map(([c]) => c)].filter((c) => tuCols.has(c));
+  const tu = db.prepare("SELECT " + selected.join(",") + " FROM turn_usage WHERE session_id = ? AND turn_id = ?").get(sid, turnId);
+  if (!tu) return moduleStatus("ok", { turnId, result: "missing-aggregate",
+    note: "该轮尚无 turn_usage 聚合行,可能尚未聚合/回填;回填后重查可变 matched" });
+  const safeInt = (c) => "(typeof(" + c + ") IN ('integer','real') AND " + c + " >= 0 AND " + c +
+    " <= 9007199254740991 AND " + c + " = CAST(" + c + " AS INTEGER))";
+  const tokenSql = defs.slice(1).map(([c, n]) => [
+    "SUM(CASE WHEN " + safeInt(c) + " THEN " + c + " ELSE 0 END) " + n,
+    "SUM(CASE WHEN " + c + " IS NULL THEN 1 ELSE 0 END) " + n + "_missing",
+    "SUM(CASE WHEN " + c + " IS NOT NULL AND NOT " + safeInt(c) + " THEN 1 ELSE 0 END) " + n + "_invalid"
+  ].join(",")).join(",");
+  const mu = db.prepare("SELECT COUNT(*) requests, SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) completed_requests, " +
+    tokenSql + " FROM model_usage WHERE session_id = ? AND turn_id = ?").get(sid, turnId);
+  const comparedFields = [], skippedFields = [], sourceQuality = {};
+  let invalid = false, different = false;
+  const validInteger = (v) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0;
+  for (const [c, n] of defs) {
+    const missing = mu[n + "_missing"] ?? 0, bad = mu[n + "_invalid"] ?? 0;
+    sourceQuality[c] = { knownRows: mu.requests - missing - bad, missingRows: missing, invalidRows: bad };
+    const tuPresent = tuCols.has(c), tuMissing = tu[c] == null;
+    const badValue = bad > 0 || (!tuMissing && !validInteger(tu[c])) || !validInteger(mu[n]);
+    const unknown = missing > 0 || !tuPresent || tuMissing;
+    if (badValue) invalid = true;
+    if (unknown) skippedFields.push({ field: c, reasonCode: "missing-data", modelUsageMissingRows: missing,
+      turnUsageMissing: !tuPresent || tuMissing });
+    if (unknown && !badValue) continue;
+    const usable = !badValue && !unknown;
+    const delta = usable ? mu[n] - tu[c] : null;
+    if (usable && delta !== 0) different = true;
+    comparedFields.push({ field: c, modelUsage: mu[n], turnUsage: tu[c] ?? null, delta,
+      note: badValue ? "源行存在非法/非整数/非安全整数值,字段不参与精确比较" :
+        unknown ? "缺失值,不参与精确比较" : delta ? "delta = model_usage − turn_usage;当前快照不一致,可能尚未回填" : null });
   }
-  const mu = db.prepare(
-    `SELECT COUNT(*) requests,
-       SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) completed_requests,
-       ${sumOk("input_tokens")} input, ${sumOk("output_tokens")} output, ${sumOk("reasoning_tokens")} reasoning,
-       ${sumOk("cache_read_input_tokens")} cacheRead, ${sumOk("cache_creation_input_tokens")} cacheCreation
-     FROM model_usage WHERE session_id = ? AND turn_id = ?`
-  ).get(sid, turnId);
-  // 比较面:token 总和取 completed 行(证据:turn_usage 与 completed 行聚合精确相等,DATA-CONTRACT §7);
-  // 行数与 model_request_count 按全部状态行比较。
-  const compareDefs = [
-    ["model_request_count", "requests", tuRow.model_request_count, mu.requests],
-    ["input_tokens", "input", tuRow.input_tokens, mu.input],
-    ["output_tokens", "output", tuRow.output_tokens, mu.output],
-    ["reasoning_tokens", "reasoning", tuCols.has("reasoning_tokens") ? tuRow.reasoning_tokens : undefined, mu.reasoning],
-    ["cache_read_input_tokens", "cacheRead", tuCols.has("cache_read_input_tokens") ? tuRow.cache_read_input_tokens : undefined, mu.cacheRead],
-    ["cache_creation_input_tokens", "cacheCreation", tuCols.has("cache_creation_input_tokens") ? tuRow.cache_creation_input_tokens : undefined, mu.cacheCreation],
-  ];
-  const comparedFields = [];
-  let anyInvalid = false, anyDifferent = false;
-  for (const [tuField, muField, tuVal, muVal] of compareDefs) {
-    if (tuVal === undefined || tuVal === null) continue; // turn_usage 缺列或该字段为 NULL → 不比较,如实说明
-    const tuInt = typeof tuVal === "number" && Number.isInteger(tuVal);
-    const muInt = typeof muVal === "number" && Number.isInteger(muVal);
-    const invalid = !tuInt || !muInt;
-    const different = tuInt && muInt && muVal !== tuVal;
-    if (invalid) anyInvalid = true;
-    if (different) anyDifferent = true;
-    comparedFields.push({ field: tuField, modelUsage: muVal, turnUsage: tuVal,
-      delta: tuInt && muInt ? muVal - tuVal : null,
-      note: invalid ? "存在非整数值,字段不参与精确比较" : different ? `delta = model_usage − turn_usage = ${muVal - tuVal};当前快照不一致,可能尚未回填,不定性损坏` : null });
-  }
-  out.status = "ok";
-  out.data = {
-    turnId,
-    result: anyInvalid ? "invalid" : anyDifferent ? "different" : "matched",
-    comparedFields,
-    modelUsage: { requests: mu.requests ?? 0, completedRequests: mu.completed_requests ?? 0,
-      scopeNote: "同 (session,turn) 键下全部 usage 行;token 求和限 completed 行(非 completed 行已记录量不计入比较面,失败用量见 reliability)" },
-    turnUsage: { status: tuRow.status ?? null, modelRequestCount: tuRow.model_request_count ?? null,
-      note: "turn_usage 行级 status 是轮级状态,与请求状态不同" },
-    scopeNote: "仅比较同键主轮聚合;不与含 workflow/子代理的会话总数比较;两表不可相加,turn_usage 不成为主数据源",
-    snapshotNote: "同一只读事务快照内读取;排除两次独立读取的采样差,但不排除宿主异步聚合滞后",
-  };
-  if (out.status === "ok") delete out.reasonCode;
-  return out;
+  const required = defs.slice(0, 3).every(([c]) => comparedFields.some((f) => f.field === c && f.delta !== null));
+  const result = invalid ? "invalid" : !required || skippedFields.length ? "incomplete" : different ? "different" : "matched";
+  return moduleStatus(result === "invalid" || result === "incomplete" ? "partial" : "ok", {
+    turnId, result, comparedFields, skippedFields, sourceQuality,
+    modelUsage: { requests: mu.requests, completedRequests: mu.completed_requests ?? 0,
+      scopeNote: "同 (session,turn) 键下全部状态 usage 行;仅已知合法整数可求和比较" },
+    turnUsage: { status: tu.status ?? null, modelRequestCount: tu.model_request_count ?? null },
+    scopeNote: "同键主轮聚合比较,不是含 workflow/子代理的会话总量;两表不可相加",
+    snapshotNote: "同一只读事务快照;仍可能有宿主异步聚合滞后",
+  }, result === "invalid" ? { reasonCode: "invalid-data" } : result === "incomplete" ? { reasonCode: "no-data" } : {});
 }
 
 // ---- 状态聚合(§9.2):全部 ok=ok;全部 unavailable=unavailable;全部 error=error;其余 partial ----
@@ -641,94 +578,57 @@ export function aggregateStatus(statuses) {
 // ---- 组装诊断封包 ----
 async function buildDiagnostics(tr, db, base, options) {
   const { modules, notify, deadline, moduleGate, min, max } = options;
-  const sid = base.sessionId;
-  const caps = probeCapabilities(db);
-  const requested = modules && modules.length ? modules : [...DETAIL_MODULES];
+  const sid = base.sessionId, caps = probeCapabilities(db);
+  const requested = modules?.length ? modules : [...DETAIL_MODULES];
   const remaining = () => deadline == null || Date.now() < deadline;
-  const timeoutModule = (name) => moduleStatus("error", null, { reasonCode: "timeout",
-    warnings: [`预算内未完成 ${name} 模块;已终止,不输出半个累加桶`] });
-
+  const errorResult = (e) => moduleStatus("error", null, { reasonCode: e.reasonCode ?? "query-error",
+    warnings: [e?.message ?? String(e)] });
+  const timeout = () => moduleStatus("error", null, { reasonCode: "timeout", warnings: ["预算耗尽,模块未执行"] });
   const envelope = {
-    version: DIAGNOSTICS_VERSION,
-    snapshotId: randomUUID(),
-    sampledAt: base.sampledAt,
-    sampledAtText: base.sampledAtText,
-    rootSessionId: sid,
-    scope: null,
-    status: "ok",
-    capabilities: caps,
-    accounting: null,
-    workflow: { status: "not-requested", data: null, warnings: [] },
-    reliability: { status: "not-requested", data: null, warnings: [] },
-    timing: { status: "not-requested", data: null, warnings: [] },
-    reconciliation: { status: "not-requested", data: null, warnings: [] },
-    warnings: [],
+    version: DIAGNOSTICS_VERSION, snapshotId: randomUUID(), sampledAt: base.sampledAt,
+    sampledAtText: base.sampledAtText, rootSessionId: sid, scope: { rootSessionId: sid,
+      statusRange: "库内留存的全部状态", retention: "仅库内留存行",
+      note: "诊断范围与兼容范围(0.5.5 默认行)分别注明;includeSubagents 只影响兼容范围" },
+    status: "ok", capabilities: caps, accounting: null, warnings: [],
+    ...Object.fromEntries(DETAIL_MODULES.map((n) => [n, moduleStatus("not-requested")])),
   };
+  notify?.({ type: "meta", payload: { ...envelope, requestedModules: requested } });
   if (!sid) {
-    envelope.scope = { rootSessionId: null, note: "未解析到有效会话;诊断不可用,不自动汇总全库" };
-    for (const name of requested) envelope[name] = moduleStatus("unavailable", null, { reasonCode: "no-session",
-      warnings: ["诊断必须解析到有效 session;缺省保持原识别链,失败即 unavailable(§9.1)"] });
-    envelope.status = aggregateStatus(requested.map((n) => envelope[n].status));
-    return envelope;
-  }
-  envelope.scope = {
-    rootSessionId: sid,
-    statusRange: "库内留存的全部状态",
-    retention: "仅库内留存行",
-    note: "诊断范围与兼容范围(0.5.5 默认行)分别注明;includeSubagents 只影响兼容范围",
-  };
-  notify?.({ type: "meta", payload: { version: envelope.version, snapshotId: envelope.snapshotId,
-    sampledAt: envelope.sampledAt, sampledAtText: envelope.sampledAtText, rootSessionId: envelope.rootSessionId,
-    scope: envelope.scope, capabilities: caps, requestedModules: requested } });
-
-  const needsAccounting = requested.includes("workflow") || requested.includes("reliability");
-  let frags = null;
-  if (needsAccounting) {
-    if (!remaining()) { markTimeoutAll(envelope, requested, ["workflow", "reliability"]); }
-    else {
-      frags = scopeFragments(tr, db, sid, caps);
-      envelope.accounting = buildAccounting(tr, db, sid, caps, frags);
-      notify?.({ type: "accounting", payload: envelope.accounting });
-      if (requested.includes("workflow")) {
-        if (moduleGate) await moduleGate("workflow");
-        if (!remaining()) envelope.workflow = timeoutModule("workflow");
-        else { envelope.workflow = buildWorkflow(tr, db, sid, caps, frags); notify?.({ type: "module", name: "workflow", payload: envelope.workflow }); }
-      }
-      if (requested.includes("reliability")) {
-        if (moduleGate) await moduleGate("reliability");
-        if (!remaining()) envelope.reliability = timeoutModule("reliability");
-        else {
-          envelope.reliability = buildReliability(tr, db, caps, orAll([
-            frags.main, frags.workflow, frags.subagent, frags.auxiliary, frags.unclassified,
-          ]));
-          notify?.({ type: "module", name: "reliability", payload: envelope.reliability });
-        }
-      }
+    for (const n of requested) envelope[n] = moduleStatus("unavailable", null, { reasonCode: "no-session",
+      warnings: ["未解析到有效会话;不自动汇总全库"] });
+  } else {
+    const normalized = normalizeDiagnosticsDb(db);
+    let scope = null, accountingFailure = null;
+    const needsAccounting = requested.some((n) => n === "workflow" || n === "reliability");
+    if (needsAccounting) {
+      if (!remaining()) accountingFailure = timeout();
+      else if (caps.rowIdentity.status !== "ok") accountingFailure = moduleStatus("unavailable", null,
+        { reasonCode: "schema-missing", warnings: [caps.rowIdentity.note] });
+      else try {
+        scope = buildDiagnosticScope(tr, db, sid, caps, normalized);
+        envelope.accounting = buildAccounting(tr, scope.db, sid, caps, scope);
+        notify?.({ type: "accounting", payload: envelope.accounting });
+      } catch (e) { accountingFailure = errorResult(e); }
+      if (accountingFailure) envelope.accountingError = accountingFailure;
     }
-  }
-  if (requested.includes("timing")) {
-    if (moduleGate) await moduleGate("timing");
-    if (!remaining()) envelope.timing = timeoutModule("timing");
-    else { envelope.timing = buildTiming(tr, db, sid, caps, { min, max }); notify?.({ type: "module", name: "timing", payload: envelope.timing }); }
-  }
-  if (requested.includes("reconciliation")) {
-    if (moduleGate) await moduleGate("reconciliation");
-    if (!remaining()) envelope.reconciliation = timeoutModule("reconciliation");
-    else { envelope.reconciliation = buildReconciliation(tr, db, sid, caps, base); notify?.({ type: "module", name: "reconciliation", payload: envelope.reconciliation }); }
-  }
-  if (sid && !envelope.accounting) {
-    envelope.accountingNote = needsAccounting
-      ? "预算内未完成账本计算(已终止,不输出半个累加桶)"
-      : "workflow/reliability 未请求;互斥分账未计算(请求其一即返回 accounting)";
+    for (const n of requested) {
+      try {
+        if (moduleGate) await moduleGate(n);
+        if (!remaining()) envelope[n] = timeout();
+        else if ((n === "workflow" || n === "reliability") && accountingFailure) envelope[n] = accountingFailure;
+        else if (n === "workflow") envelope[n] = buildWorkflow(tr, scope.db, sid, caps, scope);
+        else if (n === "reliability") envelope[n] = buildReliability(tr, scope.db, caps, scope.observed);
+        else if (n === "timing") envelope[n] = buildTiming(tr, normalized.db, sid, caps, { min, max });
+        else if (n === "reconciliation") envelope[n] = buildReconciliation(tr, normalized.db, sid, caps, base);
+      } catch (e) { envelope[n] = errorResult(e); }
+      notify?.({ type: "module", name: n, payload: envelope[n] });
+    }
+    if (!envelope.accounting) envelope.accountingNote = needsAccounting
+      ? "账本不可用,原因见 accountingError;未输出半个桶" : "workflow/reliability 未请求,未计算账本";
   }
   envelope.status = aggregateStatus(requested.map((n) => envelope[n].status));
+  if (envelope.status === "ok" && envelope.accounting?.scope.associationCoverage.status === "partial") envelope.status = "partial";
   return envelope;
-}
-
-function markTimeoutAll(envelope, requested, names) {
-  for (const name of requested.filter((n) => names.includes(n))) {
-    envelope[name] = moduleStatus("error", null, { reasonCode: "timeout", warnings: ["预算耗尽,模块未执行"] });
-  }
 }
 
 // ---- 公共异步入口(§9.1):进程内执行,基础与模块同一只读事务 ----
@@ -736,7 +636,7 @@ export async function queryDetailed(sessionId, options = {}) {
   if (sessionId != null && !validId(sessionId)) throw new Error("显式会话 sessionId 必须为非空字符串");
   const tr = await loadTokenRate();
   const { openDb, queryOnceInTxn } = tr;
-  const { history, min, max } = querySettings(); // 门禁一致性:min/max 与快速路径同源
+  const { min, max } = querySettings(); // 门禁一致性:min/max 与快速路径同源
   const db = openDb(options.dbPath);
   try {
     db.exec("BEGIN");
@@ -798,12 +698,12 @@ async function handleWorkerRun(m) {
   const budget = Number(process.env.ZCODE_TPS_DETAILS_BUDGET_MS) || 5000;
   const deadline = Date.now() + Math.max(200, budget - 200); // worker 内软预算略先于父进程硬预算
   try {
-    await queryDetailed(m.sessionId, {
+    const result = await queryDetailed(m.sessionId, {
       modules: m.modules, timezone: m.timezone, includeSubagents: m.includeSubagents,
       dbPath: m.dbPath, deadline,
       notify: (evt) => sendSafe({ tps: evt.type, ...evt }),
     });
-    flushExit({ tps: "done" }, 0);
+    flushExit({ tps: "done", diagnostics: result.diagnostics }, 0);
   } catch (e) {
     flushExit({ tps: "fatal", error: e?.message ?? String(e) }, 1);
   }
@@ -822,7 +722,7 @@ export async function runDetailsParent({ sessionId, modules, timezone, includeSu
     console.log(JSON.stringify({ error: `详情子进程无法启动: ${e?.message ?? e}`, db: dbPath }, null, 2));
     return 1;
   }
-  const state = { base: null, meta: null, accounting: null, modules: new Map(), fatal: null, done: false, closed: false };
+  const state = { base: null, meta: null, accounting: null, modules: new Map(), fatal: null, done: false, final: null, closed: false };
   child.on("message", (m) => {
     if (!m || !m.tps) return;
     if (m.tps === "base") state.base = m.payload;
@@ -830,7 +730,7 @@ export async function runDetailsParent({ sessionId, modules, timezone, includeSu
     else if (m.tps === "accounting") state.accounting = m.payload;
     else if (m.tps === "module") state.modules.set(m.name, m.payload);
     else if (m.tps === "fatal") state.fatal = m.error;
-    else if (m.tps === "done") state.done = true;
+    else if (m.tps === "done") { state.done = true; state.final = m.diagnostics; }
   });
   child.on("error", (e) => { state.fatal = state.fatal ?? `详情子进程错误: ${e?.message ?? e}`; });
   // 任务派发:worker 顶层代码先就绪,再接收 run 消息(§11.2 同事务交付顺序由 worker 内保证)
@@ -854,12 +754,17 @@ export async function runDetailsParent({ sessionId, modules, timezone, includeSu
   }
   const elapsed = Date.now() - startedAt;
   if (!state.base) {
-    const error = state.fatal ?? `详情查询超时(${elapsed}ms 内基础查询未完成,已终止详情子进程;用量库可能被持续锁定或数据过大)`;
+    const error = state.fatal ?? (timedOut ? `详情查询超时(${elapsed}ms 内基础查询未完成,已终止详情子进程;用量库可能被持续锁定或数据过大)` : "详情子进程异常退出,基础查询未交付");
     console.log(JSON.stringify({ error, db: dbPath }, null, 2));
     return 1;
   }
+  if (state.final) {
+    state.base.diagnostics = state.final;
+    console.log(JSON.stringify(state.base, null, 2));
+    return 0;
+  }
   const diagnostics = {
-    ...(state.meta ?? { version: DIAGNOSTICS_VERSION, capabilities: probeCapabilitiesUnavailable(), requestedModules: modules }),
+    ...(state.meta ?? { version: DIAGNOSTICS_VERSION, capabilities: { contract: CONTRACT_ID, note: state.fatal ?? (timedOut ? "预算耗尽,能力元信息未送达" : "子进程异常退出,能力元信息未送达") }, requestedModules: modules }),
     accounting: state.accounting ?? null,
     workflow: { status: "not-requested", data: null, warnings: [] },
     reliability: { status: "not-requested", data: null, warnings: [] },
@@ -868,15 +773,11 @@ export async function runDetailsParent({ sessionId, modules, timezone, includeSu
   };
   const requested = state.meta?.requestedModules ?? modules;
   for (const name of requested) {
-    diagnostics[name] = state.modules.get(name) ?? moduleStatus("error", null, { reasonCode: "timeout",
-      warnings: [`预算内未完成 ${name} 模块;已终止,不输出半个累加桶(实际用时 ${elapsed}ms)`] });
+    diagnostics[name] = state.modules.get(name) ?? moduleStatus("error", null, { reasonCode: timedOut ? "timeout" : "query-error",
+      warnings: [state.fatal ?? (timedOut ? "预算耗尽,模块未完成" : "子进程异常退出,模块未交付")] });
   }
   diagnostics.status = aggregateStatus(requested.map((n) => diagnostics[n].status));
   state.base.diagnostics = diagnostics;
   console.log(JSON.stringify(state.base, null, 2));
   return 0;
-}
-
-function probeCapabilitiesUnavailable() {
-  return { contract: CONTRACT_ID, note: "meta 消息未及送达(超时),能力列表不可用" };
 }

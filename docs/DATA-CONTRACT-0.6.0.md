@@ -3,7 +3,7 @@
 日期:2026-10-02。状态:M0 证据基线,0.6.0 诊断能力开发的 schema/关联/语义依据。
 宿主:ZCode 桌面端 3.14.4.7912(Windows),CLI 内核 `D:\software\ZCode\resources\glm\zcode.cjs`。
 数据库:`~/.zcode/cli/db/db.sqlite`(SQLite 3.51.2,WAL,约 508 MB;采样期间宿主持续写入,行数为采样时点值)。
-采样方式:`node tools/data-contract-sample.mjs`(只读连接 + 单只读事务;PRAGMA/SELECT;样本 ≤3 行、窗口 ≤20000 行;内容类列不取值;所有 ID 经确定性 sha256 短别名脱敏,同值同别名)。原始证据 JSON 不入库。
+采样方式:`node tools/data-contract-sample.mjs`(只读连接 + 单只读事务;PRAGMA/SELECT;样本 ≤3 行、窗口 ≤20000 行;内容类列不取值;修复后的工具将所有关联 ID 经确定性 sha256 全局短别名脱敏,同值同别名;原版存在遗漏,见审核报告 D08,原始证据不应外发)。原始证据 JSON 不入库。
 
 验证以"实际开发当日"数据为准;本文不把 2026-09-30 的无漂移结论当作未来保证。**列存在 ≠ 语义已验证**,每节末尾给出"已验证/未验证"边界。
 
@@ -101,23 +101,23 @@ error_type, error_code, error_message*, raw_usage_json*, provider_metadata_json*
 
 ### 4.3 workflow 分账分类规则(0.6.0 实现)
 
-对 root session S:
-1. `main` = S 的 main_turn 行;
-2. `workflow` = actor 链归属到「parent_session_id = S」的 run 的 workflow_child 行(run 集合来自 dwf_run.parent_session_id = S,行集合来自 dwf_actor.session_id);
-3. `subagent` = trace ∈ S 的 main_turn trace 集合且 query_source='subagent'(0.5.5 同口径);
-4. `auxiliary` = S 的其他来源(不变);
-5. trace 双命中(workflow 与 subagent 路径)不增加总量:先按行 id 求并集再分类。workflow_child 与 subagent 由 query_source 区分,观测无同 ID 跨类冲突。
-6. `unclassified`/`ambiguousCandidates`:trace 命中 ≥2 个 root 的 main_turn、或 actor 链缺失时 trace 弱命中的行——计数并列冲突原因,不计入总量。
-7. **跨 root 的 actor claim(实现细化)**:某会话若同时出现在「parent = 当前 root」与「parent ≠ 当前 root」的 run 的 actor 列表中(双 claim),归属不可判 → 该会话全部行进 `ambiguousCandidates`,两个 root 均不计入;某 workflow_child 行的会话**仅**被其他 root 的 run claim 时,归属被证明属于其他 root,当前 root 的任何桶(含 unclassified)都不纳入。
+对 root session S(修复后):
+1. 先按唯一 usage ID 取直接 session、root main trace、权威 actor 会话的候选并集;缺稳定行 ID 时禁用分账。
+2. S 的 main_turn 保留 main;跨 root 双 actor claim 先列 ambiguous,所有非主来源均不得回流到五桶。
+3. 仅被 S claim 的 workflow_child 归 workflow;权威链证明只属于其他 root 的行列 foreign,不入本 root 总量。
+4. 多 root trace 的库外弱关联行列 ambiguous;其他可归属行按 subagent、已知 auxiliary、unclassified 分类(NULL/空白/未知来源仍覆盖)。
+5. 五桶 + ambiguous + foreign 覆盖独立候选行集合;observedUsage 只含五桶,逐字段检查守恒。
+6. 同 root 多 run claim 的行仍可归属 root,在 workflow 总量只计一次,run 明细不重复分配,单列 unallocated;50 个 run 展示限制不截断总量。
+7. 这里只验证直接 parent→actor 链。resumed_from 语义和嵌套层级传播未验证,夹具的同父 run 不能证明真实嵌套适配。
 
-## 5. retry / logical_request_id(已验证:尝试不留行)
+## 5. retry / logical_request_id(已验证留存形态,未验证全局作用域和遗漏原因)
 
 - `logical_request_id`:全表 22,650 行 **22,650 个不同值**(0 NULL)。同 lrid 多行:0 组。跨 session/跨 provider 同 lrid:0 例。
-- `attempt_index`:**全表恒 0**。尝试(失败重试)**不作为独立行留存**。
+- `attempt_index`:**全表恒 0**。当前留存样本中未观察到同 logical ID 的独立多尝试行;不能据此证明宿主的全部写入/保留策略。
 - `retry_count`:宿主 reported 值,0–10;>0 共 222 行,主要落在 completed 行(成功最终行记录此前重试次数);与 `error_type` 非空(216 completed 行)互证。
 - `turn_usage.model_retry_count` 同为 per-turn reported 摘要(样本全 0,与主会话轮的 model_usage retry_count 和一致)。
 
-**结论**(spec §6.2 门槛):"逻辑请求 → 多尝试行"的分组语义**在留存数据中不存在**——`groupedAttemptRows = 行数`、`retriedLogicalRequestsObserved = 0(观察)`、`additionalAttemptsObserved = 0(观察)`,这些是**留存范围事实**而非重试次数真相;重试信息唯一来源是宿主 reported `retry_count`(单列摘要,不与观察尝试数相加)。不能从 retry_count 推断"丢失的尝试"的 token;失败尝试的用量只可能体现在 turn_usage 差额里(见 §6),不作推断。
+**结论**(spec §6.2 门槛):"逻辑请求 → 多尝试行"的分组语义**在留存数据中不存在**——`groupedAttemptRows = 行数`、`retriedLogicalRequestsObserved = 0(观察)`、`additionalAttemptsObserved = 0(观察)`,这些是**留存范围事实**而非重试次数真相;重试信息唯一来源是宿主 reported `retry_count`(单列摘要,不与观察尝试数相加)。不能从 retry_count 推断"丢失的尝试"的 token;turn_usage 差额的成因未经验证,不能归因为失败尝试用量。跨 session/provider 或域未知的 logical ID 组只报质量标记,不产出准确重试指标;reported 不依赖分组能力。
 
 ## 6. TTFT(已验证)
 
@@ -134,13 +134,13 @@ error_type, error_code, error_message*, raw_usage_json*, provider_metadata_json*
   - status 枚举:completed 1172 / error 84 / cancelled 44 —— **轮级状态**(15/16 请求 completed 的轮可为 error)。
   - computed_total_tokens = input+output(3/3 样本)。
 - **与 model_usage 的对账关系**(同库快照对照):
-  - 主会话轮(3 样本,含 1 个 error 轮):input/output 与「该 (session,turn) 的 model_usage 行聚合」**精确相等**;`model_request_count` = 该键下全部 usage 行数(含非 completed)。
-  - **workflow actor 轮(4 样本):turn_usage 大于 model_usage 行总和**(input +22,901/+51,585/+36,222…,output 同向)。与 §5 互证:turn_usage 计入未留存的尝试用量。**两表不可假设相等;差异如实报 delta,不定性为损坏**(spec §8/U01)。
+  - 主会话轮(3 样本,含 1 个 error 轮):原采样工具的 input/output 仅聚合 completed 行,与 turn_usage 相等;并未证明全部状态行 token 相等;`model_request_count` = 该键下全部 usage 行数(含非 completed)。
+  - **workflow actor 轮(4 样本):turn_usage 大于 model_usage 行总和**(input +22,901/+51,585/+36,222…,output 同向)。差额成因未经独立验证,不能解释为未留存尝试用量。**两表不可假设相等;差异如实报 delta,不定性为损坏**(spec §8/U01)。
   - 键覆盖:1290/1301 键在 model_usage 有同键行;**11 个孤儿键**(该 (session,turn) 无任何 usage 行)。反向:model_usage 的 main_turn 键是否都有 turn_usage 行未全查(以 U01 测试 fixture 为准,不宣称)。
 - 回填时序:`turn_usage.completed_at ≥ 该轮最晚 model_usage.completed_at` 1249 例;**`<` 41 例**(usage 行晚于 turn 行落库)——两表异步写入双向存在,同快照对账必须容忍双向滞后。
 - `user_message_id`:非空 1276,**1276/1276 命中 message.id** —— prompt 消息 ↔ turn 的绑定锚点已验证(供未来"本问"归属使用)。
 
-**对账实现边界**(spec §8):只对同键、整数 token 字段(input/output/reasoning/cache_read/cache_creation)精确比较;duration/time 字段单位与容差未写入本契约(§9 冻结前不比较);workflow actor 轮的已知系统性差额写入 reasonCode 说明,matched 只证明该快照一致。
+**对账实现边界**(spec §8,修复后):采样工具与诊断现均对同键全部状态行求和,但本轮未重新采集真实库证据,历史 3 个 completed 样本不升级为全部状态相等保证。只对同键、整数 token 字段(input/output/reasoning/cache_read/cache_creation)精确比较;duration/time 字段单位与容差未写入本契约(§9 冻结前不比较);workflow actor 轮的已知系统性差额写入 reasonCode 说明,matched 只证明该快照一致。
 
 ## 8. 当前 prompt / hook 输入(spec §3.2 第 8 行)
 
@@ -171,3 +171,9 @@ node tools/data-contract-sample.mjs --out <证据.json> [--window 20000] [--samp
 ```
 
 只读执行;不写宿主库;输出 JSON 含全部计数与脱敏样本。本文数字取自 2026-10-02 采样(多次采样间宿主持续写入,行数自然增长;结论均为全表或窗口聚合,不受个位数漂移影响)。
+
+## 10. 审核修复后的证据边界(2026-10-02)
+
+- 所有采样投影的 *_id、通用 id、resumed_from 与 provider/model 分类值统一脱敏;跨字段同值同别名,请求/重试计数保持数字。合成 sentinel 测试覆盖 run/trace/span/tool_call/resumed 与内容列禁止读取。
+- 能力探测检查实际列及 PK/非部分单列唯一约束;缺 trace 时直接 session/actor 范围仍可读,不能称关联覆盖完整;缺可选 token 字段只返回已知部分。
+- 对账的非法/缺失源值不产出精确 delta;必要比较证据不足或空集合不得 matched。安全整数溢出可由 SQLite 读取错误拒绝,不会生成虚假 matched。

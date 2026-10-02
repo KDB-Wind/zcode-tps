@@ -67,10 +67,10 @@ node "$tps_script" --json --details
 只展示 `diagnostics` 中可用的章节，按顺序渲染；`status` 非 ok 时如实说明降级原因（reasonCode）。以下输出字段说明均为**文档示例格式，不是真实数字**；运行失败时展示错误与 `db` 路径，不得用示例数字替代真实值：
 
 1. **分账（accounting）**：先展示 `observedUsage`（requests/input/output/total），文案为"相关请求已记录用量"，注明它不是 `session.total`、不是全部历史真实消耗、更不是费用账单；失败已记录量不解释为额外收费。再列互斥分桶 `main/workflow/subagent/auxiliary/unclassified`（requests、input、output、total、`quality.tokensComplete=false` 时写"已知部分"并注明存在缺失/非法 token 字段），以及 `ambiguousCandidates`（数量与冲突原因，注明未计入任何 root 总量）。引用 `scope.note` 说明状态范围与留存范围。
-2. **workflow（如 status=ok）**：run 列表（runId 为脱敏显示标识、状态、actors、requests/用量、`associationQuality`）；说明 `reportedSpentTokens` 是宿主上报摘要、不与 usage 相加；`unattributedTraceLinkedRows` 如实展示。`nodeLevelBreakdown.status=unavailable` 时说明节点细分未开放（缺已验证的关联键）。
+2. **workflow（status=ok/partial 且有 data）**：展示 run 列表、唯一行总量、`unallocated` 与 `omittedRunsUsage`。同 root 多 run claim 的行只在总量中计一次，歧义用量不分配到具体 run；截断明细不截断总量。说明 `reportedSpentTokens` 是宿主摘要，不与 usage 相加；节点/嵌套细分未验证时如实注明。
 3. **可靠性（reliability）**：状态计数（未映射 raw status 单列）；`failedRecordedUsage`（失败已记录用量）；`overlappingFlags` 注明 cancelled_by_user/retryable/context_exceeded 是可重叠特征、不是可加的状态桶；`errorTypes` 脱敏统计（不展示 error_message）。`retry.reported` 为宿主上报重试摘要（不与观察尝试数相加）；`retry.attempts` 为库内留存的观察值，附 `retentionNote`。
 4. **等待分布（timing）**：TTFT 的 direct/derived/invalid/missing 计数与 mean/median/p90（请求算术均值与 nearest-rank 分位，非 token 加权）；Decode 有效样本与分子/分母；`byModel` 分组表（provider+model，同名模型不跨 provider 合并，最多 50 组其余为 other）。TTFT 是"首 token 等待"，不是 HTTP TTFB。
-5. **对账（reconciliation）**：展示 result（matched/different/missing-aggregate/invalid/unavailable/no-data）、比较范围、逐字段 delta（= model_usage − turn_usage）；different 只说明"当前快照不一致，可能尚未回填"，不得定性为数据损坏。缺表为 unavailable（属预期，不影响其他章节）。
+5. **对账（reconciliation）**：展示 result（matched/different/missing-aggregate/invalid/incomplete）、全部状态行的比较范围、逐字段 delta（= model_usage − turn_usage）及 skippedFields/sourceQuality。非法或缺失源值的 delta 为 null，incomplete 不得转述为一致；different 只说明当前快照有差异，可能尚未回填。缺表为 unavailable，不影响其他章节。
 6. **降级**：`diagnostics.warnings`、各模块 `warnings` 与 reasonCode（schema-missing/contract-unverified/association-ambiguous/no-session/no-data/invalid-data/timeout/query-error）如实转述；timeout 说明预算内未完成、未输出半个累加桶。
 
 `--details workflow,reliability,timing,reconciliation` 可只请求部分模块；只请求 timing/reconciliation 时没有分账章节，属预期。默认注入行与本命令的基础部分不受影响。

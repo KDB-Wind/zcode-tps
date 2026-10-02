@@ -1,21 +1,32 @@
 // 0.6.0 诊断验收测试(spec §12 矩阵:A01–A04、R01–R03、T01–T02、U01–U02、B01–B02 + C01/C02 兼容)。
 // fixture 仅在临时目录创建;真实用量库只读、不触碰。期望值来自 diagnostics-fixture.mjs 的显式 oracle。
-import test from "node:test";
+import test, { after } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
-import { buildDiagnosticsFixture, turnUsageScenario, createDb, insertRowsHelper } from "./diagnostics-fixture.mjs";
+import { buildDiagnosticsFixture, turnUsageScenario, createDb, insertRowsHelper, row } from "./diagnostics-fixture.mjs";
+import { DatabaseSync } from "node:sqlite";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const CLI = path.join(HERE, "..", "plugins", "zcode-tps", "scripts", "token-rate.mjs");
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const ownedDirs = [];
 function tmpDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), "zcode-tps-diag-"));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-tps-diag-"));
+  ownedDirs.push(dir);
+  return dir;
 }
+after(() => {
+  for (const dir of ownedDirs) {
+    assert.equal(path.dirname(path.resolve(dir)), path.resolve(os.tmpdir()));
+    assert.ok(path.basename(dir).startsWith("zcode-tps-diag-"));
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 async function runCli(args, { env = {}, timeoutMs = 30000 } = {}) {
   return new Promise((resolve) => {
@@ -45,7 +56,7 @@ async function detailed(dbPath, sessionId, opts = {}) {
   return queryDetailed(sessionId, { dbPath, modules: opts.modules, deadline: opts.deadline, moduleGate: opts.moduleGate });
 }
 
-test("A01/A02: 互斥账本守恒 —— trace+dwf 双路径、多 event、嵌套 run 每行只计一次", async () => {
+test("A01/A02: 互斥账本守恒 —— trace+dwf 双路径、多 event、同父 run 每行只计一次", async () => {
   const dir = tmpDir();
   const fx = buildDiagnosticsFixture(dir);
   const r = await detailed(fx.dbPath, fx.root);
@@ -378,4 +389,202 @@ test("C01/C02(诊断侧): 默认行为不变 —— includeSubagents 只影响�
   // currentPrompt 能力:默认关闭且 unsupported(spec §10.3)
   assert.equal(r.diagnostics.capabilities.currentPrompt.status, "unavailable");
   assert.equal(r.diagnostics.capabilities.currentPrompt.reasonCode, "contract-unverified");
+});
+
+function simpleFixture(rows, setup = () => {}) {
+  const file = path.join(tmpDir(), "probe.sqlite");
+  const db = createDb(file);
+  insertRowsHelper(db, rows);
+  setup(db);
+  db.close();
+  return file;
+}
+const rootRow = (extra = {}) => row({ session_id: "S", turn_id: "T", trace_id: "trace-S", input_tokens: 10, output_tokens: 2, time_to_first_token_ms: 100, ...extra });
+const claim = (db, run, parent, session) => {
+  db.prepare("INSERT INTO dwf_run(id,parent_session_id,time_created) VALUES(?,?,?)").run(run, parent, 1);
+  db.prepare("INSERT INTO dwf_actor(run_id,session_id) VALUES(?,?)").run(run, session);
+};
+
+test("D01: NULL/空白/未知来源完整覆盖;所有非主来源双 root claim 均排除", async () => {
+  const rows = [rootRow(), ...[null, "  ", "future_source"].map((source) => ({ ...rootRow(), query_source: source }))];
+  for (const source of ["subagent", "compact", "future_source", "workflow_child"]) {
+    rows.push(rootRow({ session_id: "CH", query_source: source }));
+  }
+  const file = simpleFixture(rows, (db) => { claim(db, "r-S", "S", "CH"); claim(db, "r-X", "X", "CH"); });
+  const d = (await detailed(file, "S")).diagnostics;
+  assert.equal(d.accounting.observedUsage.requests, 4);
+  assert.equal(d.accounting.buckets.unclassified.requests, 3);
+  assert.equal(d.accounting.ambiguousCandidates.requests, 4);
+  assert.deepEqual(d.accounting.coverage, { candidateRows: 8, observedRows: 4, ambiguousRows: 4, foreignRows: 0, complete: true });
+  const nullSession = simpleFixture([rootRow(), rootRow({ session_id: "OTHER" }),
+    { ...rootRow(), session_id: null, query_source: null }]);
+  const nd = (await detailed(nullSession, "S")).diagnostics.accounting;
+  assert.equal(nd.observedUsage.requests, 1);
+  assert.equal(nd.ambiguousCandidates.requests, 2);
+});
+
+test("D02: 可选字段逐项缺失/无唯一行 ID/NULL ID,能力诚实降级", async () => {
+  for (const column of ["trace_id", "cache_creation_input_tokens", "provider_id", "retry_count", "logical_request_id", "attempt_index", "retryable", "error_type"]) {
+    const file = simpleFixture([rootRow()], (db) => {
+      if (column === "trace_id") db.exec("DROP INDEX model_usage_trace_idx");
+      db.exec("ALTER TABLE model_usage DROP COLUMN " + column);
+    });
+    const d = (await detailed(file, "S")).diagnostics;
+    assert.ok(d.accounting, column + ": 不丢基础账本");
+    for (const n of ["workflow", "reliability", "timing", "reconciliation"]) assert.notEqual(d[n].reasonCode, "timeout", column);
+    if (column === "cache_creation_input_tokens") {
+      assert.equal(d.accounting.observedUsage.tokensComplete, false);
+      assert.equal(d.accounting.buckets.main.quality.fields.cacheCreation.missingRows, 1);
+    }
+    if (column === "logical_request_id") {
+      assert.equal(d.reliability.data.retry.reported.rowsWithRetryCount, 0);
+      assert.equal(d.reliability.data.retry.attempts.status, "unavailable");
+    }
+    if (column === "provider_id") {
+      assert.equal(d.timing.status, "partial");
+      assert.equal(d.timing.data.byModel.ttft.groups.length, 1);
+      assert.equal(d.timing.data.byModel.ttft.groups[0].provider, "(unknown)");
+    }
+    if (column === "retry_count") assert.equal(d.reliability.data.retry.reported.rowsWithRetryCount, null);
+    if (column === "retryable") assert.equal(d.reliability.data.overlappingFlags.retryable, null);
+  }
+  for (const noId of [false, true]) {
+    const file = simpleFixture([rootRow()], (db) => {
+      const cols = db.prepare("PRAGMA table_info(model_usage)").all().map((c) => c.name).filter((c) => !noId || c !== "id");
+      db.exec("CREATE TABLE mu_copy AS SELECT " + cols.join(",") + " FROM model_usage; DROP TABLE model_usage; ALTER TABLE mu_copy RENAME TO model_usage");
+    });
+    const d = (await detailed(file, "S")).diagnostics;
+    assert.equal(d.capabilities.rowIdentity.status, "unavailable");
+    assert.equal(d.accounting, null);
+    assert.equal(d.workflow.reasonCode, "schema-missing");
+    assert.equal(d.timing.status, "ok");
+  }
+  const file = simpleFixture([{ ...rootRow(), id: null }]);
+  const d = (await detailed(file, "S")).diagnostics;
+  assert.equal(d.accountingError.reasonCode, "invalid-data");
+  assert.equal(d.timing.status, "ok");
+  const minimalRun = simpleFixture([rootRow()], (db) => {
+    claim(db, "unused", "S", "CH");
+    for (const col of ["status", "spent_tokens", "time_created", "time_updated"]) db.exec("ALTER TABLE dwf_run DROP COLUMN " + col);
+  });
+  const w = (await detailed(minimalRun, "S")).diagnostics.workflow;
+  assert.equal(w.status, "partial");
+  assert.equal(w.data.runs[0].reportedSpentTokens, null);
+});
+
+test("D03: 局部异常不影响后续模块;CLI 无会话终态不伪装 timeout", async () => {
+  const file = simpleFixture([rootRow()]);
+  const { queryDetailed } = await import("../plugins/zcode-tps/scripts/diagnostics.mjs");
+  const r = await queryDetailed("S", { dbPath: file, moduleGate: (n) => {
+    if (n === "workflow") throw new Error("independent injected SQL failure");
+  } });
+  assert.equal(r.diagnostics.workflow.reasonCode, "query-error");
+  assert.match(r.diagnostics.workflow.warnings[0], /independent injected/);
+  assert.equal(r.diagnostics.reliability.status, "ok");
+  assert.equal(r.diagnostics.timing.status, "ok");
+  const empty = simpleFixture([]);
+  const cli = await runCli(["--json", "--details"], { env: { ZCODE_USAGE_DB: empty, ZCODE_SESSION_ID: "", CLAUDE_SESSION_ID: "",
+    ZCODE_TPS_LAST_SESSION: path.join(tmpDir(), "absent.json") } });
+  assert.equal(cli.code, 0);
+  assert.equal(cli.json.diagnostics.status, "unavailable");
+  for (const n of ["workflow", "reliability", "timing", "reconciliation"]) assert.equal(cli.json.diagnostics[n].reasonCode, "no-session");
+});
+
+test("D04: 源行非法/缺失、负数、超安全整数及空比较集合不得 matched", async () => {
+  for (const value of ["bad", null, -1]) {
+    const file = simpleFixture([{ ...rootRow(), input_tokens: value }], (db) =>
+      db.prepare("INSERT INTO turn_usage(session_id,turn_id,model_request_count,input_tokens,output_tokens) VALUES('S','T',1,0,2)").run());
+    const rec = (await detailed(file, "S")).diagnostics.reconciliation;
+    assert.notEqual(rec.data.result, "matched");
+    assert.ok(rec.data.comparedFields.every((f) => f.field !== "input_tokens" || f.delta === null));
+  }
+  const file = simpleFixture([rootRow()], (db) => db.prepare("INSERT INTO turn_usage(session_id,turn_id) VALUES('S','T')").run());
+  const rec = (await detailed(file, "S")).diagnostics.reconciliation;
+  assert.equal(rec.data.result, "incomplete");
+  assert.equal(rec.data.comparedFields.length, 0);
+  const unsafe = simpleFixture([{ ...rootRow(), input_tokens: 9007199254740992 }]);
+  await assert.rejects(detailed(unsafe, "S"), /too large/); // node:sqlite 在基础读取即拒绝不安全整数,不产出 matched。
+  const unsafeTu = simpleFixture([rootRow()], (db) => db.prepare(
+    "INSERT INTO turn_usage(session_id,turn_id,model_request_count,input_tokens,output_tokens) VALUES('S','T',1,9007199254740992,2)").run());
+  const unsafeRec = (await detailed(unsafeTu, "S")).diagnostics.reconciliation;
+  assert.equal(unsafeRec.reasonCode, "query-error");
+  assert.equal(unsafeRec.data, null);
+});
+
+test("D05: 跨 session/provider 的相同 logical ID 不产生准确重试;行用量仍保留", async () => {
+  const file = simpleFixture([rootRow({ logical_request_id: "L", attempt_index: 0 }),
+    rootRow({ session_id: "CH", query_source: "subagent", provider_id: "other", logical_request_id: "L", attempt_index: 1 })]);
+  const d = (await detailed(file, "S")).diagnostics;
+  const a = d.reliability.data.retry.attempts;
+  assert.equal(a.retriedLogicalRequestsObserved, 0);
+  assert.equal(a.additionalAttemptsObserved, 0);
+  assert.equal(a.groupQuality.flaggedGroups, 1);
+  assert.equal(a.groupQuality.multiSessionGroups, 1);
+  assert.equal(a.groupQuality.multiProviderGroups, 1);
+  assert.equal(d.accounting.observedUsage.requests, 2);
+  assert.equal(d.reliability.data.retry.status, "partial");
+});
+
+test("D06: 同 root 多 run claim 总量唯一,歧义行不分配;截断 run 不截断总量", async () => {
+  const file = simpleFixture([rootRow(), rootRow({ session_id: "WF", query_source: "workflow_child" })], (db) => {
+    claim(db, "A", "S", "WF"); claim(db, "B", "S", "WF");
+  });
+  const d = (await detailed(file, "S")).diagnostics;
+  assert.equal(d.workflow.status, "partial");
+  assert.equal(d.workflow.data.totals.requests, 1);
+  assert.equal(d.workflow.data.totals.total, 12);
+  assert.equal(d.workflow.data.unallocated.requests, 1);
+  assert.ok(d.workflow.data.runs.every((r) => r.requests === 0));
+  assert.equal(d.workflow.data.totals.conservationOk, true);
+  const rows = [rootRow(), ...Array.from({ length: 51 }, (_, i) => rootRow({ session_id: "WF" + i, query_source: "workflow_child" }))];
+  const many = simpleFixture(rows, (db) => { for (let i = 0; i < 51; i++) claim(db, "run" + i, "S", "WF" + i); });
+  const w = (await detailed(many, "S")).diagnostics.workflow.data;
+  assert.equal(w.runs.length, 50);
+  assert.equal(w.totals.requests, 51);
+  assert.equal(w.omittedRunsUsage.requests, 1);
+  assert.equal(w.totals.conservationOk, true);
+});
+
+test("D07: current/prompt-key/未知 flag/含等号 details 一律结构化拒绝", async () => {
+  for (const args of [["--current"], ["--prompt-key", "missing"], ["--details", "workflow=invalid"], ["--wat"], ["--session", "S", "--session", "S"]]) {
+    const result = await runCli(["--json", ...args], { env: { ZCODE_USAGE_DB: path.join(tmpDir(), "absent.sqlite") } });
+    assert.equal(result.code, 1);
+    assert.ok(result.json.parameterError);
+    assert.equal(result.json.session, undefined);
+  }
+});
+
+test("D08: 采样工具所有关联 ID 脱敏,跨表同值同别名,内容列不读取", async () => {
+  const dir = tmpDir(), evidence = path.join(dir, "evidence.json");
+  const secret = "PRIVATE_IDENTIFIER_D08";
+  const file = simpleFixture([rootRow({ id: secret, session_id: secret, turn_id: secret, trace_id: secret, provider_id: secret, model_id: secret })], (db) => {
+    db.prepare("INSERT INTO turn_usage(session_id,turn_id,trace_id,user_message_id) VALUES(?,?,?,?)").run(secret, secret, secret, secret);
+    db.prepare("INSERT INTO dwf_run(id,parent_session_id,tool_call_id,resumed_from,script_text) VALUES(?,?,?,?,?)").run(secret, secret, secret, secret, "PRIVATE_CONTENT_D08");
+    db.prepare("INSERT INTO dwf_actor(run_id,session_id,site_id) VALUES(?,?,?)").run(secret, secret, secret);
+    db.prepare("UPDATE model_usage SET span_id=?,assistant_message_id=?,error_message=?").run(secret, secret, "PRIVATE_CONTENT_D08");
+  });
+  const tool = path.join(HERE, "..", "tools", "data-contract-sample.mjs");
+  const result = await new Promise((resolve) => {
+    const child = spawn(process.execPath, [tool, "--out", evidence, "--sample", "3", "--window", "10"],
+      { env: { ...process.env, ZCODE_USAGE_DB: file }, windowsHide: true, stdio: "ignore" });
+    child.on("error", (e) => resolve({ error: e }));
+    child.on("close", (code) => resolve({ code }));
+  });
+  assert.equal(result.code, 0);
+  const raw = fs.readFileSync(evidence, "utf8");
+  assert.ok(!raw.includes(secret));
+  assert.ok(!raw.includes("PRIVATE_CONTENT_D08"));
+  const e = JSON.parse(raw);
+  assert.equal(e.turnUsage.samples[0].session_id, e.turnUsage.samples[0].trace_id);
+  assert.equal(e.dwfTables.dwf_run.samples[0].id, e.turnUsage.samples[0].session_id);
+  assert.equal(e.turnUsage.samples[0].model_request_count, null, "计数不能被误当 ID 哈希");
+});
+
+test("P3: 未映射/进行中用量保留在账本,不冒充失败", async () => {
+  const file = simpleFixture([rootRow(), { ...rootRow(), status: "running", completed_at: null, input_tokens: 100, output_tokens: 20 }]);
+  const d = (await detailed(file, "S")).diagnostics;
+  assert.equal(d.reliability.data.failedRecordedUsage.requests, 0);
+  assert.equal(d.reliability.data.nonFinalOrUnmappedUsage[0].total, 120);
+  assert.equal(d.reliability.data.unterminatedRows.requests, 1);
+  assert.equal(d.accounting.observedUsage.requests, 2);
 });

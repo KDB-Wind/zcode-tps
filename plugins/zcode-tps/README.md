@@ -28,7 +28,7 @@ node doctor.mjs --details                                            # 能力诊
 - `diagnostics.accounting.observedUsage` 是"相关请求已记录用量"（main/workflow/subagent/auxiliary/unclassified 五桶之和，守恒），不是 `session.total`，不是全部历史真实消耗，更不是费用账单；失败已记录用量计入一次，不解释为额外收费。
 - 多 root 命中的行（共享 trace、或被多个 run 的 actor 链同时 claim）进入 `ambiguousCandidates`，不纳入任何 root 总量。
 - workflow 归属只用已验证的权威链 `dwf_run.parent_session_id → dwf_actor.session_id`；`spent_tokens` 为宿主上报摘要，不与 usage 相加。
-- retry 分 `reported`（宿主上报 retry_count）与 `attempts`（库内观察；当前宿主每个逻辑请求仅留存最终行，失败尝试不留行）两层，互不相加。
+- retry 分 `reported`（宿主上报 retry_count）与 `attempts`（库内观察；当前样本 logical ID 唯一、attempt_index 恒 0；跨 session/provider 或域未知的组不产生准确重试指标）两层，互不相加。
 - reconciliation 对最近已观察主轮做整数精确比较；`different` 只代表当前快照不一致（可能尚未回填），不是数据损坏；缺表为 `unavailable`，不影响其他章节。
 - 机器消费方必须读取各模块 `status`/`reasonCode`（ok/partial/unavailable/error；schema-missing/contract-unverified/association-ambiguous/no-session/no-data/invalid-data/timeout/query-error），不能只看进程退出码。
 - **本问快照/收尾采样（wrapUpSample、`--current`）0.6.0 未开放**（默认关闭、unsupported）：宿主身份传递与展示行为未经真实宿主验收。大屏、MCP、daemon 与费用账单不做。

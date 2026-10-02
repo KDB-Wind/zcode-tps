@@ -629,40 +629,40 @@ if (process.argv[1] && process.argv[1].endsWith("token-rate.mjs")) {
     const { runDetailsWorker } = await import("./diagnostics.mjs");
     runDetailsWorker(); // 注册 IPC 监听后顶层代码结束,事件循环由 message 事件维持
   } else {
-    const detailArgIdx = process.argv.indexOf("--details");
-    const sessionFlagIdx = process.argv.indexOf("--session");
     const paramError = (message, extra = {}) => {
       console.log(JSON.stringify({ error: message, db: DB_PATH, parameterError: extra }, null, 2));
       process.exitCode = 1;
     };
-    let explicitSid = null;
-    if (sessionFlagIdx >= 0) {
-      const v = process.argv[sessionFlagIdx + 1];
-      if (v == null || !validId(v) || String(v).startsWith("--")) {
-        paramError("--session 需要非空会话 ID 参数", { parameter: "--session", value: v ?? null });
-        process.exit(process.exitCode || 1);
+    const args = process.argv.slice(2), seen = new Set();
+    let explicitSid = null, details = null;
+    const fail = (message, parameter, value = null) => {
+      paramError(message, { parameter, value });
+      process.exit(1);
+    };
+    for (let i = 0; i < args.length; i++) {
+      const flag = args[i];
+      if (!["--json", "--session", "--details"].includes(flag)) {
+        fail(flag === "--current" || flag === "--prompt-key"
+          ? "0.6.0 尚未开放本问采样参数;不会返回历史数据替代本问结果"
+          : "未知参数: " + flag, flag);
       }
-      explicitSid = v;
-    }
-    let details = null; // null=未请求;数组=请求的模块名单
-    if (detailArgIdx >= 0) {
-      if (!json) {
-        paramError("--details 需要 --json 输出", { parameter: "--details" });
-        process.exit(process.exitCode || 1);
-      }
-      const raw = process.argv[detailArgIdx + 1];
-      const { DETAIL_MODULES, parseDetailModules } = await import("./diagnostics.mjs");
-      if (raw == null || String(raw).startsWith("--")) {
-        details = [...DETAIL_MODULES]; // --details 无值 = 全部四项
-      } else if (raw.includes("=") && detailArgIdx !== process.argv.indexOf(raw)) {
-        details = null; // 不可达,防御
-      } else {
-        const parsed = parseDetailModules(raw);
-        if (!parsed.ok) {
-          paramError(parsed.message, { parameter: "--details", value: raw, unknown: parsed.unknown ?? null });
-          process.exit(process.exitCode || 1);
+      if (seen.has(flag)) fail("重复参数: " + flag, flag);
+      seen.add(flag);
+      if (flag === "--session") {
+        const value = args[++i];
+        if (!validId(value) || value.startsWith("--")) fail("--session 需要非空会话 ID 参数", flag, value);
+        explicitSid = value;
+      } else if (flag === "--details") {
+        if (!json) fail("--details 需要 --json 输出", flag);
+        const { DETAIL_MODULES, parseDetailModules } = await import("./diagnostics.mjs");
+        const raw = args[i + 1];
+        if (raw == null || raw.startsWith("--")) details = [...DETAIL_MODULES];
+        else {
+          i++;
+          const parsed = parseDetailModules(raw);
+          if (!parsed.ok) fail(parsed.message, flag, raw);
+          details = parsed.modules;
         }
-        details = parsed.modules;
       }
     }
     const sid = explicitSid || process.env.ZCODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || null;

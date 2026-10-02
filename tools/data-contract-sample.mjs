@@ -34,16 +34,17 @@ const aliasMap = new Map();
 function alias(kind, value) {
   if (value === null || value === undefined) return null;
   const s = String(value);
-  const key = `${kind}|${s}`;
+  const key = s;
   let a = aliasMap.get(key);
   if (!a) {
-    a = `${kind}-${createHash("sha256").update(s).digest("base64url").slice(0, 8)}`;
+    a = `id-${createHash("sha256").update(s).digest("base64url").slice(0, 8)}`;
     aliasMap.set(key, a);
   }
   return a;
 }
 // 内容类列:按列名过滤采样(名称本身记录在 schema 中,不视为内容泄露)
 const CONTENT_COL = /(payload|json|content|message|prompt|text|body|raw|metadata|desc|note|summary|title|error_message|input$)/i;
+const identifierColumn = (name) => /(^id$|(?:^|_)id$|^resumed_from$)/i.test(name);
 const safeCols = (cols) => cols.filter((c) => !CONTENT_COL.test(c.name));
 const clip = (v, n = 40) => (typeof v === "string" && v.length > n ? v.slice(0, n) + "…" : v);
 
@@ -147,11 +148,11 @@ try {
     `SELECT COALESCE(NULLIF(TRIM(query_source), ''), '(blank)') src, COUNT(*) n FROM ${MU} GROUP BY src ORDER BY n DESC`
   ).all();
   mu.providerDistribution = has("provider_id")
-    ? db.prepare(`SELECT COALESCE(NULLIF(TRIM(provider_id), ''), '(blank)') p, COUNT(*) n FROM ${MU} GROUP BY p ORDER BY n DESC`).all()
+    ? db.prepare(`SELECT COALESCE(NULLIF(TRIM(provider_id), ''), '(blank)') p, COUNT(*) n FROM ${MU} GROUP BY p ORDER BY n DESC`).all().map((r) => ({ ...r, p: alias("provider", r.p) }))
     : null;
   mu.modelDistribution = db.prepare(
     `SELECT COALESCE(NULLIF(TRIM(model_id), ''), '(blank)') m, COUNT(*) n FROM ${MU} GROUP BY m ORDER BY n DESC LIMIT 20`
-  ).all();
+  ).all().map((r) => ({ ...r, m: alias("model", r.m) }));
 
   // 布尔/错误/重试特征列的存在性与取值
   mu.flagColumns = {};
@@ -224,7 +225,7 @@ try {
        FROM (${win}) WHERE ${lrid} IS NOT NULL LIMIT 6`
     ).all().map((r) => ({
       id: alias("uid", r.id), lrid: alias("lrid", r.lrid), attemptIndex: r.attempt_index, retryCount: r.retry_count,
-      status: r.status, querySource: r.query_source, session: alias("sess", r.session_id), provider: r.provider_id,
+      status: r.status, querySource: r.query_source, session: alias("sess", r.session_id), provider: alias("provider", r.provider_id),
       startedAt: r.started_at, completedAt: r.completed_at,
     })).filter((r) => r.id !== null);
   }
@@ -284,7 +285,7 @@ try {
   ).all().map((row) => {
     const o = {};
     for (const [k, v] of Object.entries(row)) {
-      if (/session_id|trace_id|turn_id|logical_request_id|^id$/i.test(k)) o[k] = alias(k === "id" ? "uid" : k.replace(/_id$/, "").replace("logical_request", "lrid"), v);
+      if (identifierColumn(k)) o[k] = alias(k === "id" ? "uid" : k.replace(/_id$/, "").replace("logical_request", "lrid"), v);
       else o[k] = clip(v);
     }
     return o;
@@ -319,7 +320,7 @@ try {
        FROM model_usage WHERE query_source = 'workflow_child' ORDER BY rowid DESC LIMIT 5`
     ).all().map((r) => ({
       id: alias("uid", r.id), session: alias("sess", r.session_id), turn: alias("turn", r.turn_id),
-      trace: alias("tr", r.trace_id), status: r.status, model: r.model_id,
+      trace: alias("tr", r.trace_id), status: r.status, model: alias("model", r.model_id),
       input: r.input_tokens, output: r.output_tokens, startedAt: r.started_at, completedAt: r.completed_at,
     }));
     // workflow_child 的 trace 是否也出现在 main_turn 行上(同 trace 双路径风险)
@@ -354,7 +355,7 @@ try {
           .all().map((row) => {
             const o = {};
             for (const [k, v] of Object.entries(row)) {
-              if (/session|turn|run|request/i.test(k) && (typeof v === "string" || typeof v === "number")) o[k] = alias("tu-" + k, v);
+              if (identifierColumn(k) && (typeof v === "string" || typeof v === "number")) o[k] = alias("tu-" + k, v);
               else o[k] = clip(v);
             }
             return o;
@@ -381,7 +382,7 @@ try {
           ).all(last.s, last.t).map((row) => {
             const o = {};
             for (const [k, v] of Object.entries(row)) {
-              if (/session|turn|run|request/i.test(k) && (typeof v === "string" || typeof v === "number")) o[k] = alias("tu-" + k, v);
+              if (identifierColumn(k) && (typeof v === "string" || typeof v === "number")) o[k] = alias("tu-" + k, v);
               else o[k] = clip(v);
             }
             return o;
@@ -396,13 +397,13 @@ try {
             `SELECT ${JSON.stringify(sessKey)} s, ${JSON.stringify(tk)} t, COUNT(*) n FROM turn_usage GROUP BY s, t ORDER BY n DESC LIMIT 3`
           ).all();
           const comparisons = [];
-          const tuValueCols = tuc.filter((c) => /token|request|retry|status|duration/i.test(c) && !CONTENT_COL.test(c));
+          const tuValueCols = tuc.filter((c) => /token|request|retry|status|duration/i.test(c) && !CONTENT_COL.test(c) && !identifierColumn(c));
           for (const key of cmp) {
             const muAgg = db.prepare(
               `SELECT COUNT(*) n,
                  SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) completed_n,
-                 SUM(CASE WHEN status = 'completed' AND input_tokens IS NOT NULL THEN input_tokens ELSE 0 END) inp,
-                 SUM(CASE WHEN status = 'completed' AND output_tokens IS NOT NULL THEN output_tokens ELSE 0 END) outp
+                 SUM(CASE WHEN input_tokens IS NOT NULL THEN input_tokens ELSE 0 END) inp,
+                 SUM(CASE WHEN output_tokens IS NOT NULL THEN output_tokens ELSE 0 END) outp
                FROM model_usage WHERE session_id = ? AND turn_id = ?`
             ).get(key.s, key.t);
             const tuRow = db.prepare(
@@ -441,7 +442,7 @@ try {
         .all().map((row) => {
           const o = {};
           for (const [k, v] of Object.entries(row)) {
-            if (/session|turn|run|node|actor|usage|request|trace/i.test(k) && (typeof v === "string" || typeof v === "number")) o[k] = alias(t + "." + k, v);
+            if (identifierColumn(k) && (typeof v === "string" || typeof v === "number")) o[k] = alias(t + "." + k, v);
             else o[k] = clip(v, 60);
           }
           return o;
@@ -466,7 +467,7 @@ try {
         .all().map((row) => {
           const o = {};
           for (const [k, v] of Object.entries(row)) {
-            if (/session|turn|run|node|actor|usage|request|trace/i.test(k) && (typeof v === "string" || typeof v === "number")) o[k] = alias(t + "." + k, v);
+            if (identifierColumn(k) && (typeof v === "string" || typeof v === "number")) o[k] = alias(t + "." + k, v);
             else o[k] = clip(v, 60);
           }
           return o;

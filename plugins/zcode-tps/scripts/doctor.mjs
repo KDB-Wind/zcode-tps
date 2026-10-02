@@ -300,6 +300,7 @@ async function capabilityChecks() {
       workflowAssociation: "能力:workflow 归属(actor 链)",
       turnUsageReconciliation: "能力:turn_usage 对账",
       retryAttempts: "能力:retry 尝试分组(lrid)",
+      reportedRetries: "能力:retry 宿主上报值",
       currentPrompt: "能力:本问快照(wrapUpSample)",
     };
     return Object.entries(caps).filter(([k]) => labels[k]).map(([k, v]) => ({

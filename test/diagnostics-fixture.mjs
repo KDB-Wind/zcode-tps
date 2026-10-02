@@ -294,7 +294,7 @@ export function buildDiagnosticsFixture(dir) {
       },
       workflowRuns: { "dwfrun-1": { requests: 2, input: 75, output: 31 }, "dwfrun-2": { requests: 1, input: 10, output: 6 },
         "dwfrun-0": { requests: 0 }, "dwfrun-amb-a": { requests: 0 } },
-      unattributedTraceLinkedRows: 1, // w9(另一 root 的 run,trace 弱命中但不可归属)
+      unattributedTraceLinkedRows: 0, // w9 已有另一 root 的权威 actor 归属,应列 foreign,不是本 root 的 unclassified。
       otherRoot: { observed: { requests: 2 }, workflow: { requests: 1, input: 99, output: 99 }, ambiguous: { requests: 3 } }, // 歧义:amb1+wamb+m18
       compat: { // 0.5.5 兼容口径(completed main_turn,不含子代理):m2/m12 为 error 被排除
         requests: 16, input: 449, output: 453, total: 902,
