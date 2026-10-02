@@ -44,6 +44,7 @@ node "$tps_script" --json
 - 健康记录按 会话+hook 分链路展示（0.5.5）：「注入链路采集(UserPromptSubmit)」是默认显示行的采集；「通知链路(Stop)」是回合结束通知，按本次运行状态渲染——采集成功（附通知命令结果 ok/suppressed/unknown；同会话并发让位时附让位原因：locked=另一回合结束处理中、concurrent=相同内容已被并发通知、stale=已有更新的并发通知）、通知关闭（turnEndLine 未开启，属预期）、未观察到（回合未结束过/插件刚更新未重开会话/宿主未触发 Stop，以记录为准不预设）、采集失败（error，附原因与"随下次回合结束自动重试"提示）、提交失败（notify-failed，下次回合结束自动重试）、采集中/中断。error/running 状态绝不出现"采集成功"或上一轮通知结果的表述（新运行启动时清空上一轮 notified/notifyStatus，lastSuccessAt 保留用于"最后成功"）。提示语按结果区分：只有 notifyStatus=ok 才写"命令执行完成（退出码 0）"；unknown 写"限时内未退出，按已提交处理且不自动重发"；suppressed 写"测试抑制"。保留报告中的 sessionId/runId；其他会话的成功不能替代当前会话。running 表示本次尚未完成，即使有 lastSuccessAt 也不能报正常；进程退出或超过 8 秒时应解释为可能中断/超时。
 - 配置缺失使用默认值，损坏 JSON、非对象配置和非法 TOKEN_RATE_* 环境变量应修正。tokenRateLine=false 是预期关闭，不是故障。
 - Node 22 系列最低为 22.13，23 系列最低为 23.4，24+ 支持无实验启动参数导入 node:sqlite。
+- 加 `--details` 参数（`node "$tpsScript" --json --details`）可附**能力诊断**：逐项列出行身份/trace 归因/workflow 归属/turn_usage 对账/retry 分组/本问快照的可用性（基于只读 schema 探测，不做重查询）。可选能力缺失为 ⚠️ 提示（只影响对应诊断章节），不改变退出码；本问快照（wrapUpSample）默认关闭属预期。
 
 不要仅因状态文件不存在就断言钩子未注册；建议发送新消息重新采集，结合具体错误诊断。
 

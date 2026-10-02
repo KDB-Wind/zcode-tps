@@ -282,6 +282,39 @@ function healthChecks() {
   return [promptCheck, stopCheck];
 }
 
+// ---- 能力诊断(--details,0.6.0):仅 PRAGMA 级 schema 探测,不做重报表/全库关联(§9.3)。
+// 可选能力缺失为提示(warn),不改变退出码;与诊断运行时共用同一 probeCapabilities 口径。
+async function capabilityChecks() {
+  if (!process.argv.includes("--details")) return [];
+  let db = null;
+  try {
+    if (!fs.existsSync(DB_PATH)) return [];
+    const { DatabaseSync } = await import("node:sqlite");
+    db = new DatabaseSync(DB_PATH, { readOnly: true });
+    try { db.exec("PRAGMA busy_timeout = 2000"); } catch {}
+    const { probeCapabilities, CONTRACT_ID } = await import("./diagnostics.mjs");
+    const caps = probeCapabilities(db);
+    const labels = {
+      rowIdentity: "能力:usage 行身份(id 主键)",
+      traceAssociation: "能力:子代理 trace 归因",
+      workflowAssociation: "能力:workflow 归属(actor 链)",
+      turnUsageReconciliation: "能力:turn_usage 对账",
+      retryAttempts: "能力:retry 尝试分组(lrid)",
+      currentPrompt: "能力:本问快照(wrapUpSample)",
+    };
+    return Object.entries(caps).filter(([k]) => labels[k]).map(([k, v]) => ({
+      name: labels[k], level: "warn", ok: v.status === "ok",
+      detail: v.status === "ok" ? `可用(${v.method ?? "已验证"})` : `不可用(${v.reasonCode ?? v.status})${v.note ? ":" + v.note : ""}`,
+      hint: v.status === "ok" ? `契约:${CONTRACT_ID}` : "可选能力缺失只影响对应诊断章节,基础统计不受影响",
+    }));
+  } catch (e) {
+    return [{ name: "能力诊断(--details)", level: "warn", ok: false,
+      detail: `探测失败: ${e.message}`, hint: "不影响基础自检;诊断报表可用性以 /tps 实际输出为准" }];
+  } finally {
+    try { db?.close(); } catch {}
+  }
+}
+
 export async function runDoctor() {
   const results = [];
   results.push(nodeVersionCheck());
@@ -290,6 +323,7 @@ export async function runDoctor() {
   results.push(stateFileCheck());
   results.push(configCheck());
   results.push(...healthChecks());
+  results.push(...(await capabilityChecks()));
   const failed = results.filter((r) => !r.ok && r.level !== "warn").length;
   const warnings = results.filter((r) => !r.ok && r.level === "warn").length;
   return { checks: results, failed, warnings };

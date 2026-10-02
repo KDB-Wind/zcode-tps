@@ -1,5 +1,5 @@
 ---
-description: 查看 token 速率与用量报表：最近请求、最近轮次、留存范围累计和缓存命中率
+description: 查看 token 速率与用量报表：最近请求、最近轮次、留存范围累计和缓存命中率（加"完整报表"执行 details 诊断：分账/可靠性/等待/对账）
 ---
 
 只读查询 ZCode 数据库。优先使用显式 `ZCODE_TPS_SCRIPT`，其次当前 `ZCODE_PLUGIN_ROOT`，最后按修改时间查找默认缓存中的脚本。缓存回退不保证就是当前启用版本；如版本不符，明确指定脚本路径。选择当前可用的 shell 执行一段即可。
@@ -51,5 +51,28 @@ Decode 速度为 `output ÷ (durMs − TTFT)`（纯生成阶段，剔除首字�
 时间显示：JSON 中所有毫秒时间戳仅是机器可读值，报表一律使用随结果返回的预格式化 `*Text` 字段（已按 `timezone` 换算，默认 Asia/Shanghai，附 `utcOffset`），不要自行换算成 UTC。需要 UTC 对照时说明可在配置 `timezone` 设为 `"UTC"`（也支持 `"system"` 与任意 IANA 时区名；环境变量 `ZCODE_TPS_TIMEZONE` 优先）。
 
 `includeSubagents` 默认开启，可在配置文件中关闭。默认简洁行 token/缓存对应 usage 范围，含子代理会话均与它范围不同。不要把输入 token（含缓存）直接解释成实际计费。
+
+## 完整报表（仅当用户要求分账/workflow/可靠性/等待分布/对账等诊断时执行）
+
+在上述脚本定位成功后，追加 `--details` 运行一次（有界子进程，入口预算 5s；超时会保留基础数据并把未完成模块标记为 timeout）。两次运行是各自快照，数字允许略有差异：
+
+```powershell
+node "$tpsScript" --json --details
+```
+
+```bash
+node "$tps_script" --json --details
+```
+
+只展示 `diagnostics` 中可用的章节，按顺序渲染；`status` 非 ok 时如实说明降级原因（reasonCode）。以下输出字段说明均为**文档示例格式，不是真实数字**；运行失败时展示错误与 `db` 路径，不得用示例数字替代真实值：
+
+1. **分账（accounting）**：先展示 `observedUsage`（requests/input/output/total），文案为"相关请求已记录用量"，注明它不是 `session.total`、不是全部历史真实消耗、更不是费用账单；失败已记录量不解释为额外收费。再列互斥分桶 `main/workflow/subagent/auxiliary/unclassified`（requests、input、output、total、`quality.tokensComplete=false` 时写"已知部分"并注明存在缺失/非法 token 字段），以及 `ambiguousCandidates`（数量与冲突原因，注明未计入任何 root 总量）。引用 `scope.note` 说明状态范围与留存范围。
+2. **workflow（如 status=ok）**：run 列表（runId 为脱敏显示标识、状态、actors、requests/用量、`associationQuality`）；说明 `reportedSpentTokens` 是宿主上报摘要、不与 usage 相加；`unattributedTraceLinkedRows` 如实展示。`nodeLevelBreakdown.status=unavailable` 时说明节点细分未开放（缺已验证的关联键）。
+3. **可靠性（reliability）**：状态计数（未映射 raw status 单列）；`failedRecordedUsage`（失败已记录用量）；`overlappingFlags` 注明 cancelled_by_user/retryable/context_exceeded 是可重叠特征、不是可加的状态桶；`errorTypes` 脱敏统计（不展示 error_message）。`retry.reported` 为宿主上报重试摘要（不与观察尝试数相加）；`retry.attempts` 为库内留存的观察值，附 `retentionNote`。
+4. **等待分布（timing）**：TTFT 的 direct/derived/invalid/missing 计数与 mean/median/p90（请求算术均值与 nearest-rank 分位，非 token 加权）；Decode 有效样本与分子/分母；`byModel` 分组表（provider+model，同名模型不跨 provider 合并，最多 50 组其余为 other）。TTFT 是"首 token 等待"，不是 HTTP TTFB。
+5. **对账（reconciliation）**：展示 result（matched/different/missing-aggregate/invalid/unavailable/no-data）、比较范围、逐字段 delta（= model_usage − turn_usage）；different 只说明"当前快照不一致，可能尚未回填"，不得定性为数据损坏。缺表为 unavailable（属预期，不影响其他章节）。
+6. **降级**：`diagnostics.warnings`、各模块 `warnings` 与 reasonCode（schema-missing/contract-unverified/association-ambiguous/no-session/no-data/invalid-data/timeout/query-error）如实转述；timeout 说明预算内未完成、未输出半个累加桶。
+
+`--details workflow,reliability,timing,reconciliation` 可只请求部分模块；只请求 timing/reconciliation 时没有分账章节，属预期。默认注入行与本命令的基础部分不受影响。
 
 用户附加要求：$ARGUMENTS

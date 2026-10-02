@@ -64,7 +64,8 @@ export function parseDetailModules(raw) {
 }
 
 // ---- 能力探测(仅基于 PRAGMA;缺字段/未知映射时能力降级,基础查询不受影响,§3.2) ----
-function probeCapabilities(db) {
+// doctor --details 复用同一探测,保证能力口径与诊断一致(§9.3)
+export function probeCapabilities(db) {
   const mu = tableColumns(db, "model_usage");
   const dwfRun = tableColumns(db, "dwf_run");
   const dwfActor = tableColumns(db, "dwf_actor");

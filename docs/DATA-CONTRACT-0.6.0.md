@@ -108,6 +108,7 @@ error_type, error_code, error_message*, raw_usage_json*, provider_metadata_json*
 4. `auxiliary` = S 的其他来源(不变);
 5. trace 双命中(workflow 与 subagent 路径)不增加总量:先按行 id 求并集再分类。workflow_child 与 subagent 由 query_source 区分,观测无同 ID 跨类冲突。
 6. `unclassified`/`ambiguousCandidates`:trace 命中 ≥2 个 root 的 main_turn、或 actor 链缺失时 trace 弱命中的行——计数并列冲突原因,不计入总量。
+7. **跨 root 的 actor claim(实现细化)**:某会话若同时出现在「parent = 当前 root」与「parent ≠ 当前 root」的 run 的 actor 列表中(双 claim),归属不可判 → 该会话全部行进 `ambiguousCandidates`,两个 root 均不计入;某 workflow_child 行的会话**仅**被其他 root 的 run claim 时,归属被证明属于其他 root,当前 root 的任何桶(含 unclassified)都不纳入。
 
 ## 5. retry / logical_request_id(已验证:尝试不留行)
 

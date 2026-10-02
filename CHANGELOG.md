@@ -1,5 +1,44 @@
 # 更新记录
 
+## 0.6.0
+
+按需求 spec 0.6.0（`docs/SPEC-0.6.0.md`）交付的**按需完整诊断报表**：默认注入行、`/tps` 基础统计与全部 0.5.5 行为保持不变，新能力全部经显式请求触发。数据契约先行验证（`docs/DATA-CONTRACT-0.6.0.md`，采样工具 `tools/data-contract-sample.mjs`），证据不足的能力诚实延后，不以猜测填满字段。
+
+### 新增：`--details` 完整诊断报表
+
+```text
+node token-rate.mjs --json --session <sessionId> --details
+node token-rate.mjs --json --session <sessionId> --details workflow,reliability,timing,reconciliation
+```
+
+- **同一只读快照**：基础结果、分账、状态、等待与对账来自同一连接的同一只读事务；有界子进程执行（入口预算 5s + 清理预留 ≤500ms），基础结果先经 IPC 交付、各模块完成后逐项交付；超时保留已交付部分，未完成模块记 `timeout`，不输出半个累加桶。stdout 仍只有一个 JSON 对象；基础失败沿用 `{error, db}` 与非零退出码，模块失败返回 0 并以模块 `status/reasonCode` 表达——机器调用方必须读模块状态，不能只看退出码。
+- **诊断 JSON 契约（version=1）**：`snapshotId/sampledAt/rootSessionId/scope/status/capabilities/accounting/workflow/reliability/timing/reconciliation/warnings`；reasonCode 区分 schema-missing、contract-unverified、association-ambiguous、no-session、no-data、invalid-data、timeout、query-error。
+- **互斥分账（accounting）**：`observedUsage`（"相关请求已记录用量"，不是 session.total、不是费用账单）= main + workflow + subagent + auxiliary + unclassified 五桶之和；先按 usage 行 id（model_usage 主键）求并集去重再分类；多 root trace 命中与双 run claim 的行进 `ambiguousCandidates`，不纳入任何 root 总量；每桶附状态计数与逐字段 knownRows/missingRows/invalidRows 质量说明。诊断范围含非 completed 状态，与兼容范围（0.5.5 默认行）分别注明。
+- **workflow 归属**：只用已验证的权威链 `dwf_run.parent_session_id → dwf_actor.session_id → model_usage.session_id(query_source=workflow_child)`；trace 仅作交叉验证与歧义检测；run 级聚合与 workflow 桶守恒；被其他 root 的 run 同时 claim 的会话判歧义。`dwf_run.spent_tokens` 仅作宿主上报摘要，不与 usage 相加；节点细分不可用（dwf_node/dwf_event 无指向 usage 行的链接列）。
+- **error/retry 可靠性（reliability）**：状态计数（未映射 raw status 单列）、失败已记录用量（计入一次，不从成功请求推算）、可重叠特征（cancelled_by_user/retryable/context_exceeded）单列、error_type/code 脱敏统计（不输出 error_message）。retry 分两层：`reported`（宿主上报 retry_count 摘要，不与观察尝试数相加、不推测丢失尝试）与 `attempts`（逻辑请求/尝试的库内观察值；重复/缺失/非法 attempt_index 的组被标记且不产出准确重试指标，其 token 行照常计入）。
+- **等待分布（timing）**：TTFT 显式列优先、非法显式值不偷偷回退；direct/derived/invalid/missing 计数、mean/median/p90（请求算术均值 + nearest-rank）；Decode 有效集与 0.5.5 相同并给出原始分子/分母；provider_id+model_id 分组（同名模型不跨 provider 合并、缺 provider 入 unknown 桶，最多 50 组其余合并为 other）。TTFT 是"首 token 等待"，不是 HTTP TTFB。
+- **turn_usage 对账（reconciliation）**：对最近已观察主轮、在同一快照内读取；整数 token 精确比较，`delta = model_usage − turn_usage`；不同只说明"当前快照不一致，可能尚未回填"，不定性数据损坏；缺表为 unavailable，不影响基础查询与 doctor 健康。对账语义以 DATA-CONTRACT §7 为界（workflow actor 轮的 turn_usage 含未留存尝试的用量，差额如实报告）。
+
+### 新增：doctor --details 与 /tps 完整报表
+
+- `node doctor.mjs --details`（或 `/tps-doctor` 要求能力诊断）附**能力诊断**：行身份/trace 归因/workflow 归属/turn_usage 对账/retry 分组/本问快照逐项可用性；可选能力缺失为警告，不改变退出码。
+- `/tps` 说明新增"完整报表"执行方式：`--details` 按需执行并只展示可用章节（分账 → workflow → 可靠性 → 等待 → 对账 → 降级），文档示例明确标注为示例。
+
+### 保持不变（兼容承诺）
+
+- 默认注入行、`/tps` 基础输出、`--json` 无参数行为、`tokenRateLine/turnEndLine/includeSubagents` 语义、Stop 通知与预算、状态文件与 claim 协议全部不变；快速路径不新增诊断 SQL（≤8 SELECT 门禁不变）。
+- 未请求 details 时不做任何额外能力探测或模块查询；基础 JSON 的旧字段范围与语义不变，新账本不悄悄扩大 session/usage 范围。
+
+### 明确延后（unsupported，默认关闭）
+
+- **本问快照与收尾采样（wrapUpSample / `--current`）0.6.0 不开放**：宿主内核源码（3.14.4）显示 hook 事件含 turnId/traceId，但运行时传递、与 model_usage.turn_id 的等值性及展示行为未经真实宿主验收；按 spec §10.3 保持默认关闭、能力状态 unsupported。宿主证据已记入 DATA-CONTRACT §8，开放门槛降为"运行时确认 + 展示 A/B"，留待 0.6.x。
+- 大屏、MCP、daemon、费用账单不做；observedUsage 不是费用账单。
+
+### 测试与证据
+
+- 新增 `test/diagnostics.test.mjs`（纳入 `npm test`，共 6 个测试文件）覆盖验收矩阵 A01–A04（互斥守恒/双路径去重/多 root 与双 claim 歧义/dwf 缺表降级）、R01–R03（失败已记录量一次计入/reported 与观察尝试分层/坏组标记）、T01–T02（TTFT 来源与质量计数/provider 拆分/零样本无组）、U01–U02（matched/different/backfill/invalid/缺表）、B01–B02（持续锁预算退出/模块超时不出半桶/高基数有界/标识符安全/BOM 配置）与 C01/C02 兼容对照。
+- M0 数据契约采样工具 `tools/data-contract-sample.mjs`（只读、脱敏、限行）可随时复现证据。
+
 ## 0.5.5
 
 基于 0.5.4 完整审核（`docs/GPT审核报告-20260930.md`）的可信度补丁：只修缺陷，不改默认采样行为与默认四段行。修复项 F01–F10 对应报告第 5 节；开发后复核发现的 R01–R05（报告第 11 节）同版闭环。
